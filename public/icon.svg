@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="jj-bg" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1E3A8A" />
+      <stop offset="100%" stop-color="#2563EB" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#jj-bg)" />
+  <!-- Soundwave arc -->
+  <path
+    d="M172 178a94 94 0 0 1 168 0"
+    stroke="#FFFFFF"
+    stroke-width="14"
+    stroke-linecap="round"
+  />
+  <path
+    d="M168 196h34l16-36 22 64 26-88 24 84 18-24h36"
+    stroke="#FFFFFF"
+    stroke-width="14"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <!-- Open study book -->
+  <path
+    d="M154 222l92 48v132l-92-48V222zM358 222l-92 48v132l92-48V222z"
+    fill="#FFFFFF"
+  />
+  <path
+    d="M126 244v118l114 58M386 244v118l-114 58"
+    stroke="#FFFFFF"
+    stroke-width="16"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

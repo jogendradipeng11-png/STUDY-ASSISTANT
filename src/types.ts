@@ -67,4 +67,6 @@ export interface LiveTranscriptItem {
   speaker: "user" | "jarvis";
   text: string;
   timestamp: string;
+  isImportant?: boolean;
+  importantManuallySet?: boolean;
 }

@@ -14,6 +14,16 @@ import { AssistantView } from "./components/AssistantView";
 import { LiveVoiceView } from "./components/LiveVoiceView";
 import { StudyNotesView } from "./components/StudyNotesView";
 import { FamilyView } from "./components/FamilyView";
+import { OfflineIndicator } from "./components/OfflineIndicator";
+
+function getInitialTabFromUrl(): AppTab {
+  if (typeof window === "undefined") return "assistant";
+  const tab = new URLSearchParams(window.location.search).get("tab");
+  if (tab === "live" || tab === "notes" || tab === "family" || tab === "assistant") {
+    return tab;
+  }
+  return "assistant";
+}
 
 export default function App() {
   const [profiles, setProfiles] = useState<FamilyProfile[]>(() =>
@@ -23,7 +33,9 @@ export default function App() {
     const initial = loadProfiles();
     return initial[0]?.id || "jogi-parent";
   });
-  const [activeTab, setActiveTab] = useState<AppTab>("assistant");
+  const [activeTab, setActiveTab] = useState<AppTab>(() =>
+    getInitialTabFromUrl()
+  );
   const [activeSubject, setActiveSubject] = useState<string>("All Subjects");
   const [autoNoteEnabled, setAutoNoteEnabled] = useState<boolean>(true);
   const [chatsByProfile, setChatsByProfile] = useState<
@@ -202,6 +214,7 @@ export default function App() {
           )}
         </main>
       </div>
+      <OfflineIndicator />
     </div>
   );
 }

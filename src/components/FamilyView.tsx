@@ -1,8 +1,10 @@
 import { useRef, useState } from "react";
 import {
+  Camera,
   Check,
   Loader2,
   Plus,
+  RotateCcw,
   Trash2,
   UserCheck,
   Volume2,
@@ -14,6 +16,7 @@ import {
   STUDY_DESK_HERO_URL,
   VOICE_OPTIONS,
 } from "../data/defaults";
+import { resizeImageToAvatarDataUrl } from "../utils/image";
 import { LanguagePicker } from "./LanguagePicker";
 import { ProfileAvatar } from "./ProfileAvatar";
 
@@ -52,10 +55,71 @@ export function FamilyView({
   const [newVoice, setNewVoice] = useState<VoiceName>("Zephyr");
   const [newLanguage, setNewLanguage] = useState<string>("Auto-Detect");
   const [newAvatarType, setNewAvatarType] = useState<"son" | "daughter" | "parent">("son");
+  const [newCustomAvatarUrl, setNewCustomAvatarUrl] = useState<string | null>(null);
 
   const [testingVoice, setTestingVoice] = useState<string | null>(null);
   const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [photoError, setPhotoError] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const newPhotoInputRef = useRef<HTMLInputElement | null>(null);
+  const editPhotoInputRef = useRef<HTMLInputElement | null>(null);
+  const quickPhotoInputRef = useRef<HTMLInputElement | null>(null);
+  const quickPhotoTargetIdRef = useRef<string | null>(null);
+
+  const handleUploadNewPhoto = async (file?: File | null) => {
+    if (!file) return;
+    setPhotoError(null);
+    try {
+      const dataUrl = await resizeImageToAvatarDataUrl(file);
+      setNewCustomAvatarUrl(dataUrl);
+    } catch (err) {
+      setPhotoError(
+        err instanceof Error ? err.message : "Could not load selected photo."
+      );
+    }
+  };
+
+  const handleUploadDraftPhoto = async (file?: File | null) => {
+    if (!file || !draft) return;
+    setPhotoError(null);
+    try {
+      const dataUrl = await resizeImageToAvatarDataUrl(file);
+      setDraft({ ...draft, avatarUrl: dataUrl });
+    } catch (err) {
+      setPhotoError(
+        err instanceof Error ? err.message : "Could not load selected photo."
+      );
+    }
+  };
+
+  const handleTriggerQuickPhoto = (profileId: string) => {
+    quickPhotoTargetIdRef.current = profileId;
+    quickPhotoInputRef.current?.click();
+  };
+
+  const handleQuickPhotoChange = async (file?: File | null) => {
+    const targetId = quickPhotoTargetIdRef.current;
+    if (!file || !targetId) return;
+    const target = profiles.find((p) => p.id === targetId);
+    if (!target) return;
+    setPhotoError(null);
+    try {
+      const dataUrl = await resizeImageToAvatarDataUrl(file);
+      onUpdateProfile({ ...target, avatarUrl: dataUrl });
+    } catch (err) {
+      setPhotoError(
+        err instanceof Error ? err.message : "Could not update member photo."
+      );
+    }
+  };
+
+  const getPresetAvatarForProfile = (profile: FamilyProfile) => {
+    if (profile.role === "parent") return AVATAR_PRESETS.parent;
+    if (profile.relation.toLowerCase().includes("daughter")) {
+      return AVATAR_PRESETS.daughter;
+    }
+    return AVATAR_PRESETS.son;
+  };
 
   const handleStartEdit = (profile: FamilyProfile) => {
     setEditingId(profile.id);
@@ -100,13 +164,14 @@ export function FamilyView({
       learningGoal: newGoal.trim(),
       voiceName: newVoice,
       preferredLanguage: newLanguage,
-      avatarUrl: AVATAR_PRESETS[newAvatarType],
+      avatarUrl: newCustomAvatarUrl || AVATAR_PRESETS[newAvatarType],
       initials: initials || "FM",
       accentColor: ACCENT_CHOICES[profiles.length % ACCENT_CHOICES.length],
     };
 
     onAddProfile(created);
     setNewName("");
+    setNewCustomAvatarUrl(null);
     setShowAddForm(false);
   };
 
@@ -200,18 +265,34 @@ export function FamilyView({
           </div>
         </section>
 
-        {voiceError && (
+        {(voiceError || photoError) && (
           <div className="bg-red-50 border border-red-200 rounded-xl px-4 py-3 text-xs text-red-800 flex items-center justify-between">
-            <span>{voiceError}</span>
+            <span>{photoError || voiceError}</span>
             <button
               type="button"
-              onClick={() => setVoiceError(null)}
+              onClick={() => {
+                setVoiceError(null);
+                setPhotoError(null);
+              }}
               className="font-semibold hover:underline"
             >
               Close
             </button>
           </div>
         )}
+
+        {/* Hidden shared file input for 1-click real photo changes on any member card */}
+        <input
+          ref={quickPhotoInputRef}
+          type="file"
+          accept="image/*"
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            e.target.value = "";
+            void handleQuickPhotoChange(file);
+          }}
+        />
 
         {/* Add Family Member Form */}
         {showAddForm && (
@@ -264,21 +345,59 @@ export function FamilyView({
 
               <div className="space-y-1.5">
                 <label className="text-xs font-semibold text-slate-700">
-                  Portrait Style
+                  Real Photo or Portrait
                 </label>
-                <select
-                  value={newAvatarType}
-                  onChange={(e) =>
-                    setNewAvatarType(
-                      e.target.value as "son" | "daughter" | "parent"
-                    )
-                  }
-                  className="w-full px-3 py-2 text-sm bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:bg-white focus:border-blue-600"
-                >
-                  <option value="son">Boy / Son Portrait</option>
-                  <option value="daughter">Girl / Daughter Portrait</option>
-                  <option value="parent">Parent Portrait</option>
-                </select>
+                <div className="flex items-center gap-2.5">
+                  <img
+                    src={newCustomAvatarUrl || AVATAR_PRESETS[newAvatarType]}
+                    alt="Member photo preview"
+                    className="h-10 w-10 rounded-full object-cover border border-slate-200 bg-slate-100 shrink-0"
+                  />
+                  <input
+                    ref={newPhotoInputRef}
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      e.target.value = "";
+                      void handleUploadNewPhoto(file);
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => newPhotoInputRef.current?.click()}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-800 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-lg whitespace-nowrap"
+                  >
+                    <Camera className="h-3.5 w-3.5 text-blue-700" />
+                    <span>{newCustomAvatarUrl ? "Change Photo" : "Add Real Photo"}</span>
+                  </button>
+                  {newCustomAvatarUrl ? (
+                    <button
+                      type="button"
+                      onClick={() => setNewCustomAvatarUrl(null)}
+                      title="Use preset portrait"
+                      className="p-2 text-slate-500 hover:text-slate-800 rounded-lg hover:bg-slate-100"
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" />
+                    </button>
+                  ) : (
+                    <select
+                      aria-label="Fallback portrait style"
+                      value={newAvatarType}
+                      onChange={(e) =>
+                        setNewAvatarType(
+                          e.target.value as "son" | "daughter" | "parent"
+                        )
+                      }
+                      className="min-w-0 flex-1 px-2.5 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:bg-white focus:border-blue-600"
+                    >
+                      <option value="son">Boy Preset</option>
+                      <option value="daughter">Girl Preset</option>
+                      <option value="parent">Parent Preset</option>
+                    </select>
+                  )}
+                </div>
               </div>
 
               <div className="space-y-1.5">
@@ -365,6 +484,47 @@ export function FamilyView({
                     >
                       <X className="h-4 w-4" />
                     </button>
+                  </div>
+
+                  {/* Real Photo Picker inside Edit Form */}
+                  <div className="flex items-center gap-3 pb-1">
+                    <ProfileAvatar profile={draft} size="lg" />
+                    <div className="flex flex-wrap items-center gap-2">
+                      <input
+                        ref={editPhotoInputRef}
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          e.target.value = "";
+                          void handleUploadDraftPhoto(file);
+                        }}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => editPhotoInputRef.current?.click()}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-800 whitespace-nowrap"
+                      >
+                        <Camera className="h-3.5 w-3.5 text-blue-700" />
+                        <span>Upload Real Photo</span>
+                      </button>
+                      {draft.avatarUrl?.startsWith("data:image/") && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setDraft({
+                              ...draft,
+                              avatarUrl: getPresetAvatarForProfile(draft),
+                            })
+                          }
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-600 hover:bg-slate-100 whitespace-nowrap"
+                        >
+                          <RotateCcw className="h-3 w-3" />
+                          <span>Reset</span>
+                        </button>
+                      )}
+                    </div>
                   </div>
 
                   <div className="space-y-1">
@@ -467,7 +627,18 @@ export function FamilyView({
                 <div className="space-y-4">
                   <div className="flex items-start justify-between gap-3">
                     <div className="flex items-center gap-3.5 min-w-0">
-                      <ProfileAvatar profile={profile} size="lg" />
+                      <div className="relative group shrink-0">
+                        <ProfileAvatar profile={profile} size="lg" />
+                        <button
+                          type="button"
+                          onClick={() => handleTriggerQuickPhoto(profile.id)}
+                          title={`Change ${profile.name}'s photo`}
+                          aria-label={`Change ${profile.name}'s photo`}
+                          className="absolute -bottom-1 -right-1 h-6 w-6 rounded-full bg-white border border-slate-200 shadow-xs flex items-center justify-center text-slate-700 hover:text-blue-700 hover:border-blue-300 transition-colors"
+                        >
+                          <Camera className="h-3 w-3" />
+                        </button>
+                      </div>
                       <div className="min-w-0">
                         <h2 className="text-lg font-bold text-slate-900 truncate">
                           {profile.name}

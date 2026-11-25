@@ -93,6 +93,7 @@ function getAiClient(): GoogleGenAI {
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
+      apiVersion: "v1beta",
       headers: {
         "User-Agent": "aistudio-build",
       },
@@ -101,21 +102,7 @@ function getAiClient(): GoogleGenAI {
 }
 
 function getLiveAiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey) {
-    throw new Error(
-      "GEMINI_API_KEY is missing. Please check your API key in Settings > Secrets."
-    );
-  }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      apiVersion: "v1beta",
-      headers: {
-        "User-Agent": "aistudio-build",
-      },
-    },
-  });
+  return getAiClient();
 }
 
 function parseJsonFromText<T = Record<string, unknown>>(raw: string): T {
@@ -927,12 +914,14 @@ async function startServer() {
         subject = "General",
         topicHint,
         language,
+        importantPointsOnly = false,
       } = req.body as {
         content?: string;
         profile?: ProfilePayload;
         subject?: string;
         topicHint?: string;
         language?: string;
+        importantPointsOnly?: boolean;
       };
 
       const sourceMaterial = (content || topicHint || "").trim();
@@ -951,11 +940,13 @@ async function startServer() {
       const prompt = [
         `Create crisp, memorable, high-clarity AI study notes for ${audience}.`,
         `Preferred subject category: ${subject}.`,
-        "Distill the material below into well-organized notes that are genuinely useful for revision, homework, or quick recall.",
+        importantPointsOnly
+          ? "STRICT REVISION FOCUS: The source material below contains ONLY the auto-marked important study points from a live voice study session. Build the revision note strictly around these marked important points without adding unrelated filler."
+          : "Distill the material below into well-organized notes that are genuinely useful for revision, homework, or quick recall.",
         "Include 4 to 7 clear keyPoints, 2 to 5 key definitions/formulas (if applicable), 2 to 4 practiceQuestions with clear answers for self-testing, and 1 warm teacherTip for remembering the topic.",
         langRule,
         "",
-        "Source material:",
+        importantPointsOnly ? "Marked important study points:" : "Source material:",
         sourceMaterial,
       ].join("\n");
 
@@ -1437,17 +1428,34 @@ async function startServer() {
   const wss = new WebSocketServer({ noServer: true });
 
   server.on("upgrade", (request, socket, head) => {
-    const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
-    if (url.pathname === "/api/live") {
-      wss.handleUpgrade(request, socket, head, (ws) => {
-        wss.emit("connection", ws, request);
-      });
+    try {
+      const url = new URL(
+        request.url || "/",
+        `http://${request.headers.host || "localhost"}`
+      );
+      if (url.pathname === "/api/live" || url.pathname === "/api/live/") {
+        wss.handleUpgrade(request, socket, head, (ws) => {
+          wss.emit("connection", ws, request);
+        });
+      }
+    } catch {
+      socket.destroy();
     }
   });
 
   wss.on("connection", (clientWs: WebSocket) => {
     let liveSession: Awaited<ReturnType<GoogleGenAI["live"]["connect"]>> | null = null;
     let isClosing = false;
+
+    const heartbeat = setInterval(() => {
+      if (clientWs.readyState === WebSocket.OPEN) {
+        try {
+          clientWs.ping();
+        } catch {
+          // ignore
+        }
+      }
+    }, 20000);
 
     const sendSafe = (payload: Record<string, unknown>) => {
       if (clientWs.readyState === WebSocket.OPEN) {
@@ -1614,6 +1622,7 @@ async function startServer() {
 
     clientWs.on("close", () => {
       isClosing = true;
+      clearInterval(heartbeat);
       if (liveSession) {
         try {
           liveSession.close();
@@ -1635,7 +1644,19 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(__dirname, "dist");
-    app.use(express.static(distDir));
+    app.use(
+      express.static(distDir, {
+        setHeaders: (res, filePath) => {
+          if (
+            filePath.endsWith("sw.js") ||
+            filePath.endsWith("registerSW.js") ||
+            filePath.endsWith("manifest.webmanifest")
+          ) {
+            res.setHeader("Cache-Control", "no-cache");
+          }
+        },
+      })
+    );
     app.get("*", (_req, res) => {
       res.sendFile(path.join(distDir, "index.html"));
     });

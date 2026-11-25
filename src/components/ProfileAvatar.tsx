@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { FamilyProfile } from "../types";
 
 interface ProfileAvatarProps {
@@ -14,6 +14,10 @@ const SIZE_CLASSES: Record<"sm" | "md" | "lg", string> = {
 
 export function ProfileAvatar({ profile, size = "md" }: ProfileAvatarProps) {
   const [imgFailed, setImgFailed] = useState(false);
+
+  useEffect(() => {
+    setImgFailed(false);
+  }, [profile.avatarUrl]);
 
   if (profile.avatarUrl && !imgFailed) {
     return (

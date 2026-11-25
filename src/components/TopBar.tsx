@@ -1,5 +1,6 @@
 import { Menu, Mic } from "lucide-react";
 import type { AppTab } from "../types";
+import { PWAInstallButton } from "./PWAInstallButton";
 
 interface TopBarProps {
   activeTab: AppTab;
@@ -22,7 +23,7 @@ export function TopBar({
   onToggleMobileMenu,
 }: TopBarProps) {
   return (
-    <header className="no-print sticky top-0 z-30 h-16 bg-white/95 backdrop-blur-sm border-b border-slate-200 px-4 sm:px-6 flex items-center justify-between gap-8">
+    <header className="no-print sticky top-0 z-30 h-16 bg-white/95 backdrop-blur-sm border-b border-slate-200 px-4 sm:px-6 flex items-center justify-between gap-4 sm:gap-8">
       {/* Zone 1: Brand wordmark (single text element) */}
       <div className="flex items-center gap-3 shrink-0">
         <button
@@ -69,8 +70,9 @@ export function TopBar({
         })}
       </nav>
 
-      {/* Zone 3: 1 primary action */}
-      <div className="shrink-0">
+      {/* Zone 3: Install App + primary Talk Now action */}
+      <div className="flex items-center gap-2 shrink-0">
+        <PWAInstallButton />
         <button
           type="button"
           onClick={onStartQuickVoice}
