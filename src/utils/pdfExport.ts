@@ -1,4 +1,3 @@
-import { jsPDF } from "jspdf";
 import type { StudyNote } from "../types";
 
 // A4 geometry in pixels at 150 DPI equivalent for crisp printing & fast generation
@@ -431,7 +430,8 @@ class UnicodePdfBuilder {
     }
   }
 
-  public finalizeAndSave(filename: string) {
+  public async finalizeAndSave(filename: string): Promise<void> {
+    const { jsPDF } = await import("jspdf");
     const totalPages = this.pages.length;
     const printDate = new Date().toLocaleDateString([], {
       month: "short",
@@ -524,5 +524,5 @@ export async function exportStudyNotesToPdf(
       ? toSafePdfFilename(notes[0].title)
       : `jogi-jarvis-study-notes-${notes.length}.pdf`);
 
-  builder.finalizeAndSave(filename);
+  await builder.finalizeAndSave(filename);
 }
