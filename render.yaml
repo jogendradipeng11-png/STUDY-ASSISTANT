@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: jogi-jarvis
+    runtime: node
+    plan: free
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: 22.18.0
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: NVIDIA_MODEL
+        value: google/gemma-3-12b-it
+      - key: NVIDIA_MATH_MODEL
+        value: google/gemma-3-12b-it

@@ -33,6 +33,28 @@ interface IncomingMessage {
 
 const NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
 
+const NVIDIA_FAST_FALLBACKS = [
+  "google/gemma-3-12b-it",
+  "nvidia/nemotron-3.5-lightning-30b-a3b",
+  "meta/llama-3.3-70b-instruct",
+  "nvidia/nemotron-3.5-bolt-e4b",
+  "z-ai/glm-5.3-flash",
+];
+
+const NVIDIA_MATH_FALLBACKS = [
+  "google/gemma-3-12b-it",
+  "nvidia/nemotron-3.5-lightning-30b-a3b",
+  "meta/llama-3.3-70b-instruct",
+  "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+  "nvidia/nemotron-3.5-bolt-e4b",
+];
+
+function isNonChatModelId(modelId: string): boolean {
+  return /embed|rerank|nvclip|whisper|parakeet|riva|flux|stable-diffusion|ocr|parse|guard|safety|detector/i.test(
+    modelId
+  );
+}
+
 function hasGeminiKey(): boolean {
   return Boolean(process.env.GEMINI_API_KEY?.trim());
 }
@@ -41,15 +63,24 @@ function hasNvidiaKey(): boolean {
   return Boolean(process.env.NVIDIA_API_KEY?.trim());
 }
 
+function getNvidiaCandidateModels(speedMode: "fast" | "detailed" = "fast"): string[] {
+  const envCustom =
+    speedMode === "detailed"
+      ? [process.env.NVIDIA_MATH_MODEL?.trim(), process.env.NVIDIA_MODEL?.trim()]
+      : [process.env.NVIDIA_MODEL?.trim()];
+
+  const validEnvModels = envCustom.filter(
+    (m): m is string => Boolean(m && m.includes("/") && !isNonChatModelId(m))
+  );
+
+  const defaults =
+    speedMode === "detailed" ? NVIDIA_MATH_FALLBACKS : NVIDIA_FAST_FALLBACKS;
+
+  return Array.from(new Set([...validEnvModels, ...defaults]));
+}
+
 function getNvidiaModel(speedMode: "fast" | "detailed" = "fast"): string {
-  if (speedMode === "detailed") {
-    return (
-      process.env.NVIDIA_MATH_MODEL?.trim() ||
-      process.env.NVIDIA_MODEL?.trim() ||
-      "qwen/qwen2.5-72b-instruct"
-    );
-  }
-  return process.env.NVIDIA_MODEL?.trim() || "meta/llama-3.3-70b-instruct";
+  return getNvidiaCandidateModels(speedMode)[0];
 }
 
 function getAiClient(): GoogleGenAI {
@@ -87,11 +118,15 @@ function parseJsonFromText<T = Record<string, unknown>>(raw: string): T {
   }
 }
 
-async function callNvidiaChat(
-  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
-  model: string,
-  options?: { temperature?: number; maxTokens?: number }
-): Promise<string> {
+function isUnavailableNvidiaModelStatus(status: number): boolean {
+  return status === 404 || status === 410 || status === 422;
+}
+
+async function fetchNvidiaWithModelFallback(
+  candidates: string[],
+  bodyBuilder: (model: string) => Record<string, unknown>,
+  acceptHeader?: string
+): Promise<globalThis.Response> {
   const apiKey = process.env.NVIDIA_API_KEY?.trim();
   if (!apiKey) {
     throw new Error(
@@ -99,30 +134,69 @@ async function callNvidiaChat(
     );
   }
 
-  const upstream = await withRetry(async () => {
-    const response = await fetch(NVIDIA_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature: options?.temperature ?? 0.35,
-        max_tokens: options?.maxTokens ?? 2048,
-        stream: false,
-      }),
-    });
+  let lastError: Error | null = null;
+  for (const model of candidates) {
+    try {
+      const response = await withRetry(async () => {
+        const res = await fetch(NVIDIA_API_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(acceptHeader ? { Accept: acceptHeader } : {}),
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify(bodyBuilder(model)),
+          signal: AbortSignal.timeout(25000),
+        });
 
-    if (!response.ok) {
+        // Do not retry 401/403/404/410/422 with exponential backoff; fail fast or fall back to next model
+        if (res.status === 429 || res.status >= 500) {
+          const errText = await res.text().catch(() => "");
+          throw new Error(
+            `NVIDIA NIM error (${res.status}): ${errText.slice(0, 240) || res.statusText}`
+          );
+        }
+        return res;
+      });
+
+      if (response.ok) {
+        return response;
+      }
+
       const errText = await response.text().catch(() => "");
-      throw new Error(
+      lastError = new Error(
         `NVIDIA NIM error (${response.status}): ${errText.slice(0, 240) || response.statusText}`
       );
+
+      if (isUnavailableNvidiaModelStatus(response.status)) {
+        continue;
+      }
+      throw lastError;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      const msg = lastError.message;
+      if (msg.includes("(401)") || msg.includes("(403)")) {
+        throw lastError;
+      }
     }
-    return response;
-  });
+  }
+
+  throw lastError || new Error("No NVIDIA NIM chat model responded.");
+}
+
+async function callNvidiaChat(
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+  speedMode: "fast" | "detailed" = "fast",
+  options?: { temperature?: number; maxTokens?: number }
+): Promise<string> {
+  const candidates = getNvidiaCandidateModels(speedMode);
+  const upstream = await fetchNvidiaWithModelFallback(candidates, (model) => ({
+    model,
+    messages,
+    temperature: options?.temperature ?? 0.35,
+    max_tokens: options?.maxTokens ?? 2048,
+    stream: false,
+  }));
 
   const data = (await upstream.json()) as {
     choices?: Array<{ message?: { content?: string } }>;
@@ -132,48 +206,32 @@ async function callNvidiaChat(
 
 async function streamNvidiaChat(
   messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
-  model: string,
+  speedMode: "fast" | "detailed",
   res: express.Response
 ): Promise<void> {
-  const apiKey = process.env.NVIDIA_API_KEY?.trim();
-  if (!apiKey) {
-    throw new Error(
-      "NVIDIA_API_KEY is missing. Add it in Settings > Secrets to use NVIDIA NIM."
-    );
+  const candidates = getNvidiaCandidateModels(speedMode);
+  const upstream = await fetchNvidiaWithModelFallback(
+    candidates,
+    (model) => ({
+      model,
+      messages,
+      temperature: 0.35,
+      max_tokens: 2048,
+      stream: true,
+    }),
+    "text/event-stream"
+  );
+
+  if (!upstream.body) {
+    throw new Error("NVIDIA NIM returned an empty response stream.");
   }
-
-  const upstream = await withRetry(async () => {
-    const response = await fetch(NVIDIA_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "text/event-stream",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature: 0.35,
-        max_tokens: 2048,
-        stream: true,
-      }),
-    });
-
-    if (!response.ok || !response.body) {
-      const errText = await response.text().catch(() => "");
-      throw new Error(
-        `NVIDIA NIM error (${response.status}): ${errText.slice(0, 240) || response.statusText}`
-      );
-    }
-    return response;
-  });
 
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders?.();
 
-  const reader = upstream.body!.getReader();
+  const reader = upstream.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
 
@@ -220,7 +278,7 @@ async function callNvidiaJson<T>(
       },
       { role: "user", content: userPrompt },
     ],
-    getNvidiaModel("fast"),
+    "fast",
     { temperature: 0.2, maxTokens: 2048 }
   );
   return parseJsonFromText<T>(content);
@@ -458,14 +516,13 @@ async function startServer() {
     ];
 
     const respondWithNvidia = async () => {
-      const nvidiaModel = getNvidiaModel(safeSpeedMode);
       const nvidiaMessages = buildNvidiaHistory();
       if (stream) {
-        await streamNvidiaChat(nvidiaMessages, nvidiaModel, res);
+        await streamNvidiaChat(nvidiaMessages, safeSpeedMode, res);
         return;
       }
       const reply =
-        (await callNvidiaChat(nvidiaMessages, nvidiaModel)) ||
+        (await callNvidiaChat(nvidiaMessages, safeSpeedMode)) ||
         "I heard you, but I could not form a response. Please try asking again.";
       res.json({ reply, sources: [], provider: "nvidia" });
     };
@@ -1414,7 +1471,7 @@ async function startServer() {
   } else {
     const distDir = path.resolve(__dirname, "dist");
     app.use(express.static(distDir));
-    app.get("/{*path}", (_req, res) => {
+    app.get("*", (_req, res) => {
       res.sendFile(path.join(distDir, "index.html"));
     });
   }
