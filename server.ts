@@ -122,9 +122,68 @@ function isUnavailableNvidiaModelStatus(status: number): boolean {
   return status === 404 || status === 410 || status === 422;
 }
 
-async function fetchNvidiaWithModelFallback(
-  candidates: string[],
-  bodyBuilder: (model: string) => Record<string, unknown>,
+function normalizePromptText(text: string): string {
+  return text.replace(/[\u00A0\u2000-\u200B\u202F\u205F\u3000]/g, " ");
+}
+
+function formatNvidiaMessagesForModel(
+  model: string,
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>
+): Array<{ role: "system" | "user" | "assistant"; content: string }> {
+  const cleaned = messages.map((m) => ({
+    role: m.role,
+    content: normalizePromptText(m.content),
+  }));
+
+  // Gemma chat templates work most reliably when system instructions are folded into the first user turn
+  if (/^google\/gemma/i.test(model)) {
+    const systemParts = cleaned
+      .filter((m) => m.role === "system")
+      .map((m) => m.content)
+      .join("\n\n");
+    const nonSystem = cleaned.filter((m) => m.role !== "system");
+    if (systemParts && nonSystem.length > 0 && nonSystem[0].role === "user") {
+      nonSystem[0] = {
+        role: "user",
+        content: `Instructions:\n${systemParts}\n\nUser Request:\n${nonSystem[0].content}`,
+      };
+      return nonSystem;
+    }
+    if (systemParts) {
+      return [{ role: "user", content: systemParts }, ...nonSystem];
+    }
+    return nonSystem;
+  }
+
+  return cleaned;
+}
+
+function buildNvidiaRequestBody(
+  model: string,
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+  speedMode: "fast" | "detailed",
+  stream: boolean,
+  options?: { temperature?: number; maxTokens?: number }
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    model,
+    messages: formatNvidiaMessagesForModel(model, messages),
+    temperature: options?.temperature ?? 0.35,
+    max_tokens: options?.maxTokens ?? 4096,
+    stream,
+  };
+
+  // Prevent reasoning-capable Nemotron models from exhausting max_tokens in hidden thinking
+  if (speedMode === "fast" && /nemotron/i.test(model)) {
+    body.chat_template_kwargs = { enable_thinking: false };
+  }
+
+  return body;
+}
+
+async function fetchSingleNvidiaModel(
+  model: string,
+  body: Record<string, unknown>,
   acceptHeader?: string
 ): Promise<globalThis.Response> {
   const apiKey = process.env.NVIDIA_API_KEY?.trim();
@@ -134,54 +193,26 @@ async function fetchNvidiaWithModelFallback(
     );
   }
 
-  let lastError: Error | null = null;
-  for (const model of candidates) {
-    try {
-      const response = await withRetry(async () => {
-        const res = await fetch(NVIDIA_API_URL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...(acceptHeader ? { Accept: acceptHeader } : {}),
-            Authorization: `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify(bodyBuilder(model)),
-          signal: AbortSignal.timeout(25000),
-        });
+  return withRetry(async () => {
+    const res = await fetch(NVIDIA_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(acceptHeader ? { Accept: acceptHeader } : {}),
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(25000),
+    });
 
-        // Do not retry 401/403/404/410/422 with exponential backoff; fail fast or fall back to next model
-        if (res.status === 429 || res.status >= 500) {
-          const errText = await res.text().catch(() => "");
-          throw new Error(
-            `NVIDIA NIM error (${res.status}): ${errText.slice(0, 240) || res.statusText}`
-          );
-        }
-        return res;
-      });
-
-      if (response.ok) {
-        return response;
-      }
-
-      const errText = await response.text().catch(() => "");
-      lastError = new Error(
-        `NVIDIA NIM error (${response.status}): ${errText.slice(0, 240) || response.statusText}`
+    if (res.status === 429 || res.status >= 500) {
+      const errText = await res.text().catch(() => "");
+      throw new Error(
+        `NVIDIA NIM error (${res.status}): ${errText.slice(0, 240) || res.statusText}`
       );
-
-      if (isUnavailableNvidiaModelStatus(response.status)) {
-        continue;
-      }
-      throw lastError;
-    } catch (err) {
-      lastError = err instanceof Error ? err : new Error(String(err));
-      const msg = lastError.message;
-      if (msg.includes("(401)") || msg.includes("(403)")) {
-        throw lastError;
-      }
     }
-  }
-
-  throw lastError || new Error("No NVIDIA NIM chat model responded.");
+    return res;
+  });
 }
 
 async function callNvidiaChat(
@@ -190,18 +221,49 @@ async function callNvidiaChat(
   options?: { temperature?: number; maxTokens?: number }
 ): Promise<string> {
   const candidates = getNvidiaCandidateModels(speedMode);
-  const upstream = await fetchNvidiaWithModelFallback(candidates, (model) => ({
-    model,
-    messages,
-    temperature: options?.temperature ?? 0.35,
-    max_tokens: options?.maxTokens ?? 2048,
-    stream: false,
-  }));
+  let lastError: Error | null = null;
 
-  const data = (await upstream.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
-  return (data.choices?.[0]?.message?.content || "").trim();
+  for (const model of candidates) {
+    try {
+      const response = await fetchSingleNvidiaModel(
+        model,
+        buildNvidiaRequestBody(model, messages, speedMode, false, options)
+      );
+
+      if (!response.ok) {
+        const errText = await response.text().catch(() => "");
+        lastError = new Error(
+          `NVIDIA NIM error (${response.status}): ${errText.slice(0, 240) || response.statusText}`
+        );
+        if (response.status === 401 || response.status === 403) {
+          throw lastError;
+        }
+        if (isUnavailableNvidiaModelStatus(response.status)) {
+          continue;
+        }
+        continue;
+      }
+
+      const data = (await response.json()) as {
+        choices?: Array<{
+          message?: { content?: string | null; reasoning_content?: string | null };
+        }>;
+      };
+      const text = (data.choices?.[0]?.message?.content || "").trim();
+      if (text) {
+        return text;
+      }
+      // Empty content (e.g., hidden thinking exhausted max_tokens) -> try next live model
+      lastError = new Error(`NVIDIA model ${model} returned an empty response.`);
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (lastError.message.includes("(401)") || lastError.message.includes("(403)")) {
+        throw lastError;
+      }
+    }
+  }
+
+  throw lastError || new Error("No NVIDIA NIM chat model returned an answer.");
 }
 
 async function streamNvidiaChat(
@@ -210,59 +272,85 @@ async function streamNvidiaChat(
   res: express.Response
 ): Promise<void> {
   const candidates = getNvidiaCandidateModels(speedMode);
-  const upstream = await fetchNvidiaWithModelFallback(
-    candidates,
-    (model) => ({
-      model,
-      messages,
-      temperature: 0.35,
-      max_tokens: 2048,
-      stream: true,
-    }),
-    "text/event-stream"
-  );
+  let lastError: Error | null = null;
 
-  if (!upstream.body) {
-    throw new Error("NVIDIA NIM returned an empty response stream.");
-  }
+  for (const model of candidates) {
+    let emittedAnyText = false;
+    try {
+      const upstream = await fetchSingleNvidiaModel(
+        model,
+        buildNvidiaRequestBody(model, messages, speedMode, true),
+        "text/event-stream"
+      );
 
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders?.();
-
-  const reader = upstream.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line.startsWith("data:")) continue;
-      const payloadStr = line.slice(5).trim();
-      if (!payloadStr || payloadStr === "[DONE]") continue;
-      try {
-        const parsed = JSON.parse(payloadStr) as {
-          choices?: Array<{ delta?: { content?: string } }>;
-        };
-        const delta = parsed.choices?.[0]?.delta?.content;
-        if (delta) {
-          res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+      if (!upstream.ok || !upstream.body) {
+        const errText = await upstream.text().catch(() => "");
+        lastError = new Error(
+          `NVIDIA NIM error (${upstream.status}): ${errText.slice(0, 240) || upstream.statusText}`
+        );
+        if (upstream.status === 401 || upstream.status === 403) {
+          throw lastError;
         }
-      } catch {
-        // ignore partial or malformed SSE metadata frames
+        continue;
+      }
+
+      const reader = upstream.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line.startsWith("data:")) continue;
+          const payloadStr = line.slice(5).trim();
+          if (!payloadStr || payloadStr === "[DONE]") continue;
+          try {
+            const parsed = JSON.parse(payloadStr) as {
+              choices?: Array<{ delta?: { content?: string | null } }>;
+            };
+            const delta = parsed.choices?.[0]?.delta?.content;
+            if (delta) {
+              if (!emittedAnyText) {
+                emittedAnyText = true;
+                res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+                res.setHeader("Cache-Control", "no-cache, no-transform");
+                res.setHeader("Connection", "keep-alive");
+                res.flushHeaders?.();
+              }
+              res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+            }
+          } catch {
+            // ignore partial or malformed SSE metadata frames
+          }
+        }
+      }
+
+      if (emittedAnyText) {
+        res.write(`data: ${JSON.stringify({ done: true, sources: [] })}\n\n`);
+        res.end();
+        return;
+      }
+
+      // Stream completed with zero visible text tokens -> try next candidate model
+      lastError = new Error(`NVIDIA model ${model} returned an empty stream.`);
+    } catch (err) {
+      if (emittedAnyText) {
+        throw err;
+      }
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (lastError.message.includes("(401)") || lastError.message.includes("(403)")) {
+        throw lastError;
       }
     }
   }
 
-  res.write(`data: ${JSON.stringify({ done: true, sources: [] })}\n\n`);
-  res.end();
+  throw lastError || new Error("No NVIDIA NIM chat model returned an answer.");
 }
 
 async function callNvidiaJson<T>(
@@ -567,7 +655,7 @@ async function startServer() {
         }
         parts.push({
           text:
-            msg.content?.trim() ||
+            normalizePromptText(msg.content?.trim() || "") ||
             "Please examine this study photo and explain it step-by-step.",
         });
         return {
@@ -579,80 +667,117 @@ async function startServer() {
       const thinkingLevel =
         safeSpeedMode === "detailed" ? ThinkingLevel.HIGH : ThinkingLevel.LOW;
 
-      const modelConfig = {
-        systemInstruction,
-        thinkingConfig: { thinkingLevel },
-        ...(useSearch ? { tools: [{ googleSearch: {} }] } : {}),
-      };
+      const geminiModels: Array<{
+        name: string;
+        config: Record<string, unknown>;
+      }> = [
+        {
+          name: "gemini-4-hydrogen",
+          config: {
+            systemInstruction,
+            thinkingConfig: { thinkingLevel },
+            ...(useSearch ? { tools: [{ googleSearch: {} }] } : {}),
+          },
+        },
+        {
+          name: "gemini-3.1-flash-lite",
+          config: {
+            systemInstruction,
+            ...(useSearch ? { tools: [{ googleSearch: {} }] } : {}),
+          },
+        },
+      ];
 
       if (stream) {
-        let streamResponse;
-        try {
-          streamResponse = await withRetry(() =>
-            ai.models.generateContentStream({
-              model: "gemini-4-hydrogen",
-              contents,
-              config: modelConfig,
-            })
-          );
-        } catch (geminiErr) {
-          if (safeEngine === "auto" && hasNvidiaKey() && !hasImage) {
-            await respondWithNvidia();
-            return;
+        let lastGeminiErr: unknown = null;
+        for (const candidate of geminiModels) {
+          let emittedAnyText = false;
+          try {
+            const streamResponse = await withRetry(() =>
+              ai.models.generateContentStream({
+                model: candidate.name,
+                contents,
+                config: candidate.config,
+              })
+            );
+
+            const allChunks: unknown[] = [];
+            for await (const chunk of streamResponse) {
+              if (chunk.text) {
+                if (!emittedAnyText) {
+                  emittedAnyText = true;
+                  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+                  res.setHeader("Cache-Control", "no-cache, no-transform");
+                  res.setHeader("Connection", "keep-alive");
+                  res.flushHeaders?.();
+                }
+                res.write(`data: ${JSON.stringify({ delta: chunk.text })}\n\n`);
+              }
+              const gChunks =
+                chunk.candidates?.[0]?.groundingMetadata?.groundingChunks;
+              if (Array.isArray(gChunks) && gChunks.length > 0) {
+                allChunks.push(...gChunks);
+              }
+            }
+
+            if (emittedAnyText) {
+              const uniqueSources = extractSources(allChunks);
+              res.write(
+                `data: ${JSON.stringify({ done: true, sources: uniqueSources })}\n\n`
+              );
+              return res.end();
+            }
+
+            lastGeminiErr = new Error(
+              `Gemini model ${candidate.name} returned an empty stream.`
+            );
+          } catch (geminiErr) {
+            if (emittedAnyText) {
+              throw geminiErr;
+            }
+            lastGeminiErr = geminiErr;
           }
-          throw geminiErr;
         }
 
-        res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-        res.setHeader("Cache-Control", "no-cache, no-transform");
-        res.setHeader("Connection", "keep-alive");
-        res.flushHeaders?.();
-
-        const allChunks: unknown[] = [];
-        for await (const chunk of streamResponse) {
-          if (chunk.text) {
-            res.write(`data: ${JSON.stringify({ delta: chunk.text })}\n\n`);
-          }
-          const gChunks =
-            chunk.candidates?.[0]?.groundingMetadata?.groundingChunks;
-          if (Array.isArray(gChunks) && gChunks.length > 0) {
-            allChunks.push(...gChunks);
-          }
-        }
-
-        const uniqueSources = extractSources(allChunks);
-        res.write(
-          `data: ${JSON.stringify({ done: true, sources: uniqueSources })}\n\n`
-        );
-        return res.end();
-      }
-
-      let response;
-      try {
-        response = await withRetry(() =>
-          ai.models.generateContent({
-            model: "gemini-4-hydrogen",
-            contents,
-            config: modelConfig,
-          })
-        );
-      } catch (geminiErr) {
         if (safeEngine === "auto" && hasNvidiaKey() && !hasImage) {
           await respondWithNvidia();
           return;
         }
-        throw geminiErr;
+        throw lastGeminiErr || new Error("Gemini could not generate a response.");
       }
 
-      const reply =
-        response.text?.trim() ||
-        "I heard you, but I could not form a response. Please try asking again.";
+      let lastGeminiErr: unknown = null;
+      for (const candidate of geminiModels) {
+        try {
+          const response = await withRetry(() =>
+            ai.models.generateContent({
+              model: candidate.name,
+              contents,
+              config: candidate.config,
+            })
+          );
 
-      const uniqueSources = extractSources(
-        response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? []
-      );
+          const reply = response.text?.trim() || "";
+          if (reply) {
+            const uniqueSources = extractSources(
+              response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? []
+            );
+            return res.json({ reply, sources: uniqueSources, provider: "gemini" });
+          }
 
-      return res.json({ reply, sources: uniqueSources, provider: "gemini" });
+          lastGeminiErr = new Error(
+            `Gemini model ${candidate.name} returned an empty response.`
+          );
+        } catch (geminiErr) {
+          lastGeminiErr = geminiErr;
+        }
+      }
+
+      if (safeEngine === "auto" && hasNvidiaKey() && !hasImage) {
+        await respondWithNvidia();
+        return;
+      }
+      throw lastGeminiErr || new Error("Gemini could not generate a response.");
     } catch (err) {
       const formatted = formatApiError(err);
       if (stream && res.headersSent) {
