@@ -1,0 +1,6 @@
+{
+  "name": "Jogi Jarvis",
+  "description": "Personal voice-enabled AI assistant for you, patient AI study teacher for your sons and daughter, and automatic AI study note-taker.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
