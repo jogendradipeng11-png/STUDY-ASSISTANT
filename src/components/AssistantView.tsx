@@ -5,6 +5,7 @@ import {
   BookMarked,
   Check,
   Copy,
+  Cpu,
   ExternalLink,
   FileText,
   Globe,
@@ -57,6 +58,8 @@ export function AssistantView({
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [speedMode, setSpeedMode] = useState<"fast" | "detailed">("fast");
+  const [engine, setEngine] = useState<"auto" | "gemini" | "nvidia">("auto");
+  const [nvidiaAvailable, setNvidiaAvailable] = useState(false);
   const [useSearch, setUseSearch] = useState(profile.role === "parent");
   const [autoSpeak, setAutoSpeak] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -97,6 +100,23 @@ export function AssistantView({
     setUseSearch(profile.role === "parent");
     setErrorMsg(null);
   }, [profile.id, profile.role]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/providers")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { nvidiaConfigured?: boolean } | null) => {
+        if (!cancelled && data) {
+          setNvidiaAvailable(Boolean(data.nvidiaConfigured));
+        }
+      })
+      .catch(() => {
+        // non-blocking provider check
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -285,6 +305,7 @@ export function AssistantView({
           useSearch,
           language: activeLanguage,
           speedMode,
+          engine,
           stream: true,
         }),
       });
@@ -627,6 +648,27 @@ export function AssistantView({
             <Zap className="h-3.5 w-3.5" />
             <span>{speedMode === "fast" ? "Fast Mode" : "Deep Math"}</span>
           </button>
+
+          {nvidiaAvailable && (
+            <label
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium bg-white border border-slate-200 text-slate-700 whitespace-nowrap shrink-0"
+              title="Choose AI Engine (Auto falls back to NVIDIA NIM if Gemini hits a rate limit)"
+            >
+              <Cpu className="h-3.5 w-3.5 text-emerald-700 shrink-0" />
+              <select
+                aria-label="AI Engine"
+                value={engine}
+                onChange={(e) =>
+                  setEngine(e.target.value as "auto" | "gemini" | "nvidia")
+                }
+                className="bg-transparent text-xs font-medium text-slate-800 focus:outline-none cursor-pointer"
+              >
+                <option value="auto">Auto (Gemini + NVIDIA)</option>
+                <option value="gemini">Gemini</option>
+                <option value="nvidia">NVIDIA NIM</option>
+              </select>
+            </label>
+          )}
 
           <button
             type="button"

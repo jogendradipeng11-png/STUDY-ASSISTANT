@@ -31,8 +31,29 @@ interface IncomingMessage {
   imageMimeType?: string;
 }
 
+const NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
+
+function hasGeminiKey(): boolean {
+  return Boolean(process.env.GEMINI_API_KEY?.trim());
+}
+
+function hasNvidiaKey(): boolean {
+  return Boolean(process.env.NVIDIA_API_KEY?.trim());
+}
+
+function getNvidiaModel(speedMode: "fast" | "detailed" = "fast"): string {
+  if (speedMode === "detailed") {
+    return (
+      process.env.NVIDIA_MATH_MODEL?.trim() ||
+      process.env.NVIDIA_MODEL?.trim() ||
+      "qwen/qwen2.5-72b-instruct"
+    );
+  }
+  return process.env.NVIDIA_MODEL?.trim() || "meta/llama-3.3-70b-instruct";
+}
+
 function getAiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey) {
     throw new Error(
       "GEMINI_API_KEY is missing. Please check your API key in Settings > Secrets."
@@ -46,6 +67,163 @@ function getAiClient(): GoogleGenAI {
       },
     },
   });
+}
+
+function parseJsonFromText<T = Record<string, unknown>>(raw: string): T {
+  const cleaned = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  try {
+    return JSON.parse(cleaned) as T;
+  } catch {
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+    if (start !== -1 && end > start) {
+      return JSON.parse(cleaned.slice(start, end + 1)) as T;
+    }
+    throw new Error("Could not parse structured JSON response from AI model.");
+  }
+}
+
+async function callNvidiaChat(
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+  model: string,
+  options?: { temperature?: number; maxTokens?: number }
+): Promise<string> {
+  const apiKey = process.env.NVIDIA_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error(
+      "NVIDIA_API_KEY is missing. Add it in Settings > Secrets to use NVIDIA NIM."
+    );
+  }
+
+  const upstream = await withRetry(async () => {
+    const response = await fetch(NVIDIA_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        temperature: options?.temperature ?? 0.35,
+        max_tokens: options?.maxTokens ?? 2048,
+        stream: false,
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "");
+      throw new Error(
+        `NVIDIA NIM error (${response.status}): ${errText.slice(0, 240) || response.statusText}`
+      );
+    }
+    return response;
+  });
+
+  const data = (await upstream.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  return (data.choices?.[0]?.message?.content || "").trim();
+}
+
+async function streamNvidiaChat(
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+  model: string,
+  res: express.Response
+): Promise<void> {
+  const apiKey = process.env.NVIDIA_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error(
+      "NVIDIA_API_KEY is missing. Add it in Settings > Secrets to use NVIDIA NIM."
+    );
+  }
+
+  const upstream = await withRetry(async () => {
+    const response = await fetch(NVIDIA_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        temperature: 0.35,
+        max_tokens: 2048,
+        stream: true,
+      }),
+    });
+
+    if (!response.ok || !response.body) {
+      const errText = await response.text().catch(() => "");
+      throw new Error(
+        `NVIDIA NIM error (${response.status}): ${errText.slice(0, 240) || response.statusText}`
+      );
+    }
+    return response;
+  });
+
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  const reader = upstream.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line.startsWith("data:")) continue;
+      const payloadStr = line.slice(5).trim();
+      if (!payloadStr || payloadStr === "[DONE]") continue;
+      try {
+        const parsed = JSON.parse(payloadStr) as {
+          choices?: Array<{ delta?: { content?: string } }>;
+        };
+        const delta = parsed.choices?.[0]?.delta?.content;
+        if (delta) {
+          res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+        }
+      } catch {
+        // ignore partial or malformed SSE metadata frames
+      }
+    }
+  }
+
+  res.write(`data: ${JSON.stringify({ done: true, sources: [] })}\n\n`);
+  res.end();
+}
+
+async function callNvidiaJson<T>(
+  systemInstruction: string,
+  userPrompt: string,
+  schemaDescription: string
+): Promise<T> {
+  const content = await callNvidiaChat(
+    [
+      {
+        role: "system",
+        content: `${systemInstruction} Return ONLY valid JSON matching this schema with no markdown fences or commentary:\n${schemaDescription}`,
+      },
+      { role: "user", content: userPrompt },
+    ],
+    getNvidiaModel("fast"),
+    { temperature: 0.2, maxTokens: 2048 }
+  );
+  return parseJsonFromText<T>(content);
 }
 
 function isTransientError(err: unknown): boolean {
@@ -163,8 +341,15 @@ function stripMarkdownForSpeech(input: string): string {
 
 function formatApiError(err: unknown): { status: number; message: string } {
   const raw = err instanceof Error ? err.message : String(err);
-  if (raw.includes("GEMINI_API_KEY")) {
+  if (raw.includes("GEMINI_API_KEY") || raw.includes("NVIDIA_API_KEY")) {
     return { status: 500, message: raw };
+  }
+  if (raw.includes("NVIDIA NIM error (401)") || raw.includes("NVIDIA NIM error (403)")) {
+    return {
+      status: 403,
+      message:
+        "Your NVIDIA_API_KEY could not be verified. Please check your nvapi- key in Settings > Secrets.",
+    };
   }
   if (raw.includes("PERMISSION_DENIED") || raw.includes("API_KEY_INVALID") || raw.includes("403")) {
     return {
@@ -177,7 +362,7 @@ function formatApiError(err: unknown): { status: number; message: string } {
     return {
       status: 429,
       message:
-        "Your Gemini API key reached its temporary rate limit. For uninterrupted high-volume answers, attach a billing-enabled API key in Settings > Secrets, or try again in a few seconds.",
+        "The AI API key reached its temporary rate limit. Add a billing-enabled Gemini key or an optional NVIDIA_API_KEY in Settings > Secrets, or try again in a few seconds.",
     };
   }
   return {
@@ -195,7 +380,17 @@ async function startServer() {
     res.json({ ok: true, name: "Jogi Jarvis" });
   });
 
-  // 1. Conversational Ask & Study Tutor Endpoint (supports fast SSE streaming, text + homework photo + Google Search)
+  // Configured server-side AI providers (booleans only, never exposes keys)
+  app.get("/api/providers", (_req, res) => {
+    res.json({
+      geminiConfigured: hasGeminiKey(),
+      nvidiaConfigured: hasNvidiaKey(),
+      nvidiaModel: getNvidiaModel("fast"),
+      nvidiaMathModel: getNvidiaModel("detailed"),
+    });
+  });
+
+  // 1. Conversational Ask & Study Tutor Endpoint (supports fast SSE streaming, Gemini + optional NVIDIA NIM fallback/routing)
   app.post("/api/chat", async (req, res) => {
     const {
       messages = [],
@@ -205,6 +400,7 @@ async function startServer() {
       language,
       speedMode = "fast",
       stream = false,
+      engine = "auto",
     } = req.body as {
       messages: IncomingMessage[];
       profile?: ProfilePayload;
@@ -213,11 +409,17 @@ async function startServer() {
       language?: string;
       speedMode?: "fast" | "detailed";
       stream?: boolean;
+      engine?: "auto" | "gemini" | "nvidia";
     };
 
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: "Please provide a message to Jogi Jarvis." });
     }
+
+    const safeEngine: "auto" | "gemini" | "nvidia" =
+      engine === "gemini" || engine === "nvidia" ? engine : "auto";
+    const safeSpeedMode: "fast" | "detailed" =
+      speedMode === "detailed" ? "detailed" : "fast";
 
     const extractSources = (groundingChunks: unknown[]) => {
       const sources = groundingChunks
@@ -232,16 +434,68 @@ async function startServer() {
       return Array.from(new Map(sources.map((s) => [s.uri, s])).values()).slice(0, 6);
     };
 
-    try {
-      const ai = getAiClient();
-      const systemInstruction = buildSystemInstruction(
-        profile,
-        subject,
-        "chat",
-        language
-      );
+    const systemInstruction = buildSystemInstruction(
+      profile,
+      subject,
+      "chat",
+      language
+    );
+    const recentMessages = messages.slice(-18);
+    const hasImage = recentMessages.some((m) =>
+      Boolean(m.imageBase64 && m.imageMimeType)
+    );
 
-      const recentMessages = messages.slice(-18);
+    const buildNvidiaHistory = () => [
+      { role: "system" as const, content: systemInstruction },
+      ...recentMessages.map((msg) => ({
+        role: (msg.role === "assistant" ? "assistant" : "user") as
+          | "user"
+          | "assistant",
+        content:
+          msg.content?.trim() ||
+          "Please explain this study topic clearly step-by-step.",
+      })),
+    ];
+
+    const respondWithNvidia = async () => {
+      const nvidiaModel = getNvidiaModel(safeSpeedMode);
+      const nvidiaMessages = buildNvidiaHistory();
+      if (stream) {
+        await streamNvidiaChat(nvidiaMessages, nvidiaModel, res);
+        return;
+      }
+      const reply =
+        (await callNvidiaChat(nvidiaMessages, nvidiaModel)) ||
+        "I heard you, but I could not form a response. Please try asking again.";
+      res.json({ reply, sources: [], provider: "nvidia" });
+    };
+
+    try {
+      // Explicit NVIDIA NIM selection
+      if (safeEngine === "nvidia") {
+        if (!hasNvidiaKey()) {
+          return res.status(400).json({
+            error:
+              "NVIDIA_API_KEY is not configured yet. Add your NVIDIA key in Settings > Secrets.",
+          });
+        }
+        if (hasImage) {
+          return res.status(400).json({
+            error:
+              "Homework photo reading uses Gemini vision. Switch Engine to Auto or Gemini to analyze images.",
+          });
+        }
+        await respondWithNvidia();
+        return;
+      }
+
+      // Auto mode when Gemini key is absent but NVIDIA key is configured (text-only)
+      if (safeEngine === "auto" && !hasGeminiKey() && hasNvidiaKey() && !hasImage) {
+        await respondWithNvidia();
+        return;
+      }
+
+      const ai = getAiClient();
       const contents = recentMessages.map((msg) => {
         const parts: Array<
           { text: string } | { inlineData: { mimeType: string; data: string } }
@@ -266,7 +520,7 @@ async function startServer() {
       });
 
       const thinkingLevel =
-        speedMode === "detailed" ? ThinkingLevel.HIGH : ThinkingLevel.LOW;
+        safeSpeedMode === "detailed" ? ThinkingLevel.HIGH : ThinkingLevel.LOW;
 
       const modelConfig = {
         systemInstruction,
@@ -275,18 +529,27 @@ async function startServer() {
       };
 
       if (stream) {
+        let streamResponse;
+        try {
+          streamResponse = await withRetry(() =>
+            ai.models.generateContentStream({
+              model: "gemini-4-hydrogen",
+              contents,
+              config: modelConfig,
+            })
+          );
+        } catch (geminiErr) {
+          if (safeEngine === "auto" && hasNvidiaKey() && !hasImage) {
+            await respondWithNvidia();
+            return;
+          }
+          throw geminiErr;
+        }
+
         res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
         res.setHeader("Cache-Control", "no-cache, no-transform");
         res.setHeader("Connection", "keep-alive");
         res.flushHeaders?.();
-
-        const streamResponse = await withRetry(() =>
-          ai.models.generateContentStream({
-            model: "gemini-4-hydrogen",
-            contents,
-            config: modelConfig,
-          })
-        );
 
         const allChunks: unknown[] = [];
         for await (const chunk of streamResponse) {
@@ -307,13 +570,22 @@ async function startServer() {
         return res.end();
       }
 
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: "gemini-4-hydrogen",
-          contents,
-          config: modelConfig,
-        })
-      );
+      let response;
+      try {
+        response = await withRetry(() =>
+          ai.models.generateContent({
+            model: "gemini-4-hydrogen",
+            contents,
+            config: modelConfig,
+          })
+        );
+      } catch (geminiErr) {
+        if (safeEngine === "auto" && hasNvidiaKey() && !hasImage) {
+          await respondWithNvidia();
+          return;
+        }
+        throw geminiErr;
+      }
 
       const reply =
         response.text?.trim() ||
@@ -323,7 +595,7 @@ async function startServer() {
         response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? []
       );
 
-      return res.json({ reply, sources: uniqueSources });
+      return res.json({ reply, sources: uniqueSources, provider: "gemini" });
     } catch (err) {
       const formatted = formatApiError(err);
       if (stream && res.headersSent) {
@@ -468,7 +740,6 @@ async function startServer() {
         return res.status(400).json({ error: "Please provide a topic or study conversation to turn into notes." });
       }
 
-      const ai = getAiClient();
       const isStudent = profile?.role === "student";
       const audience = isStudent
         ? `${profile?.name || "a student"} (${profile?.grade || "school level"})`
@@ -488,81 +759,107 @@ async function startServer() {
         sourceMaterial,
       ].join("\n");
 
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: "gemini-4-hydrogen",
-          contents: prompt,
-          config: {
-            systemInstruction:
-              "You are Jogi Jarvis, an expert educator and executive note-taker who writes crystal-clear, structured revision notes in any requested language (including Odia, Hindi, English, and Math notation).",
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            responseMimeType: "application/json",
-            responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              title: {
-                type: Type.STRING,
-                description: "Concise, clear study note title (3 to 9 words).",
-              },
-              subject: {
-                type: Type.STRING,
-                description:
-                  "Best matching subject name such as Mathematics, Science, English, History, Geography, Computer Science, Languages, or Personal.",
-              },
-              summary: {
-                type: Type.STRING,
-                description: "2 to 3 sentence Big Idea summary of the topic.",
-              },
-              keyPoints: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: "4 to 7 clear, self-contained bullet points.",
-              },
-              definitions: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    term: { type: Type.STRING },
-                    meaning: { type: Type.STRING },
+      const noteSystemInstruction =
+        "You are Jogi Jarvis, an expert educator and executive note-taker who writes crystal-clear, structured revision notes in any requested language (including Odia, Hindi, English, and Math notation).";
+      const noteJsonSchemaHint =
+        '{"title":"string","subject":"string","summary":"string","keyPoints":["string"],"definitions":[{"term":"string","meaning":"string"}],"practiceQuestions":[{"question":"string","answer":"string"}],"teacherTip":"string"}';
+
+      if (!hasGeminiKey() && hasNvidiaKey()) {
+        const parsed = await callNvidiaJson(
+          noteSystemInstruction,
+          prompt,
+          noteJsonSchemaHint
+        );
+        return res.json({ note: parsed });
+      }
+
+      try {
+        const ai = getAiClient();
+        const response = await withRetry(() =>
+          ai.models.generateContent({
+            model: "gemini-4-hydrogen",
+            contents: prompt,
+            config: {
+              systemInstruction: noteSystemInstruction,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  title: {
+                    type: Type.STRING,
+                    description: "Concise, clear study note title (3 to 9 words).",
                   },
-                  required: ["term", "meaning"],
-                },
-                description: "Important vocabulary terms, rules, or formulas.",
-              },
-              practiceQuestions: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    question: { type: Type.STRING },
-                    answer: { type: Type.STRING },
+                  subject: {
+                    type: Type.STRING,
+                    description:
+                      "Best matching subject name such as Mathematics, Science, English, History, Geography, Computer Science, Languages, or Personal.",
                   },
-                  required: ["question", "answer"],
+                  summary: {
+                    type: Type.STRING,
+                    description: "2 to 3 sentence Big Idea summary of the topic.",
+                  },
+                  keyPoints: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description: "4 to 7 clear, self-contained bullet points.",
+                  },
+                  definitions: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        term: { type: Type.STRING },
+                        meaning: { type: Type.STRING },
+                      },
+                      required: ["term", "meaning"],
+                    },
+                    description: "Important vocabulary terms, rules, or formulas.",
+                  },
+                  practiceQuestions: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        question: { type: Type.STRING },
+                        answer: { type: Type.STRING },
+                      },
+                      required: ["question", "answer"],
+                    },
+                    description: "2 to 4 self-check questions with clear answers.",
+                  },
+                  teacherTip: {
+                    type: Type.STRING,
+                    description: "One practical, encouraging memory tip or study takeaway.",
+                  },
                 },
-                description: "2 to 4 self-check questions with clear answers.",
-              },
-              teacherTip: {
-                type: Type.STRING,
-                description: "One practical, encouraging memory tip or study takeaway.",
+                required: [
+                  "title",
+                  "subject",
+                  "summary",
+                  "keyPoints",
+                  "definitions",
+                  "practiceQuestions",
+                  "teacherTip",
+                ],
               },
             },
-            required: [
-              "title",
-              "subject",
-              "summary",
-              "keyPoints",
-              "definitions",
-              "practiceQuestions",
-              "teacherTip",
-            ],
-          },
-        },
-      })
-      );
+          })
+        );
 
-      const parsed = JSON.parse((response.text || "{}").trim());
-      return res.json({ note: parsed });
+        const parsed = JSON.parse((response.text || "{}").trim());
+        return res.json({ note: parsed });
+      } catch (geminiErr) {
+        if (hasNvidiaKey()) {
+          const parsed = await callNvidiaJson(
+            noteSystemInstruction,
+            prompt,
+            noteJsonSchemaHint
+          );
+          return res.json({ note: parsed });
+        }
+        throw geminiErr;
+      }
     } catch (err) {
       const formatted = formatApiError(err);
       return res.status(formatted.status).json({ error: formatted.message });
@@ -593,7 +890,6 @@ async function startServer() {
         });
       }
 
-      const ai = getAiClient();
       const isStudent = profile?.role === "student";
       const audience = isStudent
         ? `${profile?.name || "a student"} (${profile?.grade || "school level"})`
@@ -620,82 +916,108 @@ async function startServer() {
         cleanTranscript,
       ].join("\n");
 
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: "gemini-4-hydrogen",
-          contents: prompt,
-          config: {
-            systemInstruction:
-              "You are Jogi Jarvis, an expert educator who condenses long study conversations into ultra-concise, crystal-clear Study Summaries in any requested language.",
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            responseMimeType: "application/json",
-            responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              title: {
-                type: Type.STRING,
-                description:
-                  "Concise title starting with 'Study Summary:' (e.g. 'Study Summary: Linear Equations & Slope').",
-              },
-              subject: {
-                type: Type.STRING,
-                description:
-                  "Best matching subject name such as Mathematics, Science, English, History, Geography, Computer Science, Languages, or Personal.",
-              },
-              summary: {
-                type: Type.STRING,
-                description: "Concise 2 to 3 sentence synthesis of the entire session.",
-              },
-              keyPoints: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: "3 to 5 brief, high-signal bullet takeaways.",
-              },
-              definitions: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    term: { type: Type.STRING },
-                    meaning: { type: Type.STRING },
+      const summarySystemInstruction =
+        "You are Jogi Jarvis, an expert educator who condenses long study conversations into ultra-concise, crystal-clear Study Summaries in any requested language.";
+      const summaryJsonSchemaHint =
+        '{"title":"string","subject":"string","summary":"string","keyPoints":["string"],"definitions":[{"term":"string","meaning":"string"}],"practiceQuestions":[{"question":"string","answer":"string"}],"teacherTip":"string"}';
+
+      if (!hasGeminiKey() && hasNvidiaKey()) {
+        const parsed = await callNvidiaJson(
+          summarySystemInstruction,
+          prompt,
+          summaryJsonSchemaHint
+        );
+        return res.json({ note: parsed });
+      }
+
+      try {
+        const ai = getAiClient();
+        const response = await withRetry(() =>
+          ai.models.generateContent({
+            model: "gemini-4-hydrogen",
+            contents: prompt,
+            config: {
+              systemInstruction: summarySystemInstruction,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  title: {
+                    type: Type.STRING,
+                    description:
+                      "Concise title starting with 'Study Summary:' (e.g. 'Study Summary: Linear Equations & Slope').",
                   },
-                  required: ["term", "meaning"],
-                },
-                description: "Essential terms, rules, or formulas from the session.",
-              },
-              practiceQuestions: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    question: { type: Type.STRING },
-                    answer: { type: Type.STRING },
+                  subject: {
+                    type: Type.STRING,
+                    description:
+                      "Best matching subject name such as Mathematics, Science, English, History, Geography, Computer Science, Languages, or Personal.",
                   },
-                  required: ["question", "answer"],
+                  summary: {
+                    type: Type.STRING,
+                    description: "Concise 2 to 3 sentence synthesis of the entire session.",
+                  },
+                  keyPoints: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description: "3 to 5 brief, high-signal bullet takeaways.",
+                  },
+                  definitions: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        term: { type: Type.STRING },
+                        meaning: { type: Type.STRING },
+                      },
+                      required: ["term", "meaning"],
+                    },
+                    description: "Essential terms, rules, or formulas from the session.",
+                  },
+                  practiceQuestions: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        question: { type: Type.STRING },
+                        answer: { type: Type.STRING },
+                      },
+                      required: ["question", "answer"],
+                    },
+                    description: "2 to 3 quick self-check revision questions.",
+                  },
+                  teacherTip: {
+                    type: Type.STRING,
+                    description: "One short sentence on what to remember or practice next.",
+                  },
                 },
-                description: "2 to 3 quick self-check revision questions.",
-              },
-              teacherTip: {
-                type: Type.STRING,
-                description: "One short sentence on what to remember or practice next.",
+                required: [
+                  "title",
+                  "subject",
+                  "summary",
+                  "keyPoints",
+                  "definitions",
+                  "practiceQuestions",
+                  "teacherTip",
+                ],
               },
             },
-            required: [
-              "title",
-              "subject",
-              "summary",
-              "keyPoints",
-              "definitions",
-              "practiceQuestions",
-              "teacherTip",
-            ],
-          },
-        },
-      })
-      );
+          })
+        );
 
-      const parsed = JSON.parse((response.text || "{}").trim());
-      return res.json({ note: parsed });
+        const parsed = JSON.parse((response.text || "{}").trim());
+        return res.json({ note: parsed });
+      } catch (geminiErr) {
+        if (hasNvidiaKey()) {
+          const parsed = await callNvidiaJson(
+            summarySystemInstruction,
+            prompt,
+            summaryJsonSchemaHint
+          );
+          return res.json({ note: parsed });
+        }
+        throw geminiErr;
+      }
     } catch (err) {
       const formatted = formatApiError(err);
       return res.status(formatted.status).json({ error: formatted.message });
@@ -724,7 +1046,6 @@ async function startServer() {
         });
       }
 
-      const ai = getAiClient();
       const prompt = [
         `Translate this structured study note naturally and accurately into ${targetLanguage.trim()} (using its authentic native script, e.g., ଓଡ଼ିଆ for Odia, हिन्दी for Hindi).`,
         "Keep mathematical formulas, equations, chemical symbols (like H2O, CO2, x = 5), and scientific notation clear and intact.",
@@ -733,65 +1054,91 @@ async function startServer() {
         JSON.stringify(note),
       ].join("\n");
 
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: "gemini-4-hydrogen",
-          contents: prompt,
-          config: {
-            systemInstruction:
-              "You are an expert multilingual teacher translating study notes accurately while preserving formulas and educational clarity.",
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                title: { type: Type.STRING },
-                subject: { type: Type.STRING },
-                summary: { type: Type.STRING },
-                keyPoints: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                },
-                definitions: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      term: { type: Type.STRING },
-                      meaning: { type: Type.STRING },
-                    },
-                    required: ["term", "meaning"],
-                  },
-                },
-                practiceQuestions: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      question: { type: Type.STRING },
-                      answer: { type: Type.STRING },
-                    },
-                    required: ["question", "answer"],
-                  },
-                },
-                teacherTip: { type: Type.STRING },
-              },
-              required: [
-                "title",
-                "subject",
-                "summary",
-                "keyPoints",
-                "definitions",
-                "practiceQuestions",
-                "teacherTip",
-              ],
-            },
-          },
-        })
-      );
+      const translateSystemInstruction =
+        "You are an expert multilingual teacher translating study notes accurately while preserving formulas and educational clarity.";
+      const translateJsonSchemaHint =
+        '{"title":"string","subject":"string","summary":"string","keyPoints":["string"],"definitions":[{"term":"string","meaning":"string"}],"practiceQuestions":[{"question":"string","answer":"string"}],"teacherTip":"string"}';
 
-      const translated = JSON.parse((response.text || "{}").trim());
-      return res.json({ note: translated });
+      if (!hasGeminiKey() && hasNvidiaKey()) {
+        const translated = await callNvidiaJson(
+          translateSystemInstruction,
+          prompt,
+          translateJsonSchemaHint
+        );
+        return res.json({ note: translated });
+      }
+
+      try {
+        const ai = getAiClient();
+        const response = await withRetry(() =>
+          ai.models.generateContent({
+            model: "gemini-4-hydrogen",
+            contents: prompt,
+            config: {
+              systemInstruction: translateSystemInstruction,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  title: { type: Type.STRING },
+                  subject: { type: Type.STRING },
+                  summary: { type: Type.STRING },
+                  keyPoints: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                  },
+                  definitions: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        term: { type: Type.STRING },
+                        meaning: { type: Type.STRING },
+                      },
+                      required: ["term", "meaning"],
+                    },
+                  },
+                  practiceQuestions: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        question: { type: Type.STRING },
+                        answer: { type: Type.STRING },
+                      },
+                      required: ["question", "answer"],
+                    },
+                  },
+                  teacherTip: { type: Type.STRING },
+                },
+                required: [
+                  "title",
+                  "subject",
+                  "summary",
+                  "keyPoints",
+                  "definitions",
+                  "practiceQuestions",
+                  "teacherTip",
+                ],
+              },
+            },
+          })
+        );
+
+        const translated = JSON.parse((response.text || "{}").trim());
+        return res.json({ note: translated });
+      } catch (geminiErr) {
+        if (hasNvidiaKey()) {
+          const translated = await callNvidiaJson(
+            translateSystemInstruction,
+            prompt,
+            translateJsonSchemaHint
+          );
+          return res.json({ note: translated });
+        }
+        throw geminiErr;
+      }
     } catch (err) {
       const formatted = formatApiError(err);
       return res.status(formatted.status).json({ error: formatted.message });
@@ -813,43 +1160,72 @@ async function startServer() {
         return res.status(400).json({ error: "Please write an answer first." });
       }
 
-      const ai = getAiClient();
       const studentName = profile?.name || "student";
       const langRule = buildLanguageGuidance(
         language || profile?.preferredLanguage
       );
-      const response = await ai.models.generateContent({
-        model: "gemini-4-hydrogen",
-        contents: [
-          `Student: ${studentName} (${profile?.grade || "General"})`,
-          `Question: ${question}`,
-          `Reference answer: ${expectedAnswer || "Evaluate logically."}`,
-          `Student's answer: ${studentAnswer}`,
-          "Evaluate whether the student's answer demonstrates understanding even if written in a different language than the question. Respond kindly like a supportive personal teacher.",
-          langRule,
-        ].join("\n"),
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              isCorrect: { type: Type.BOOLEAN },
-              feedback: {
-                type: Type.STRING,
-                description: "1 to 2 warm, encouraging sentences explaining what was right or what to refine.",
-              },
-              hint: {
-                type: Type.STRING,
-                description: "Optional short next-step tip or memory cue.",
+      const quizPrompt = [
+        `Student: ${studentName} (${profile?.grade || "General"})`,
+        `Question: ${question}`,
+        `Reference answer: ${expectedAnswer || "Evaluate logically."}`,
+        `Student's answer: ${studentAnswer}`,
+        "Evaluate whether the student's answer demonstrates understanding even if written in a different language than the question. Respond kindly like a supportive personal teacher.",
+        langRule,
+      ].join("\n");
+      const quizSystemInstruction =
+        "You are Jogi Jarvis, a supportive personal teacher checking a student's practice quiz answer.";
+      const quizSchemaHint =
+        '{"isCorrect":true,"feedback":"1 to 2 warm encouraging sentences","hint":"Optional short next-step tip"}';
+
+      if (!hasGeminiKey() && hasNvidiaKey()) {
+        const result = await callNvidiaJson(
+          quizSystemInstruction,
+          quizPrompt,
+          quizSchemaHint
+        );
+        return res.json(result);
+      }
+
+      try {
+        const ai = getAiClient();
+        const response = await withRetry(() =>
+          ai.models.generateContent({
+            model: "gemini-4-hydrogen",
+            contents: quizPrompt,
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  isCorrect: { type: Type.BOOLEAN },
+                  feedback: {
+                    type: Type.STRING,
+                    description: "1 to 2 warm, encouraging sentences explaining what was right or what to refine.",
+                  },
+                  hint: {
+                    type: Type.STRING,
+                    description: "Optional short next-step tip or memory cue.",
+                  },
+                },
+                required: ["isCorrect", "feedback"],
               },
             },
-            required: ["isCorrect", "feedback"],
-          },
-        },
-      });
+          })
+        );
 
-      const result = JSON.parse((response.text || "{}").trim());
-      return res.json(result);
+        const result = JSON.parse((response.text || "{}").trim());
+        return res.json(result);
+      } catch (geminiErr) {
+        if (hasNvidiaKey()) {
+          const result = await callNvidiaJson(
+            quizSystemInstruction,
+            quizPrompt,
+            quizSchemaHint
+          );
+          return res.json(result);
+        }
+        throw geminiErr;
+      }
     } catch (err) {
       const formatted = formatApiError(err);
       return res.status(formatted.status).json({ error: formatted.message });
