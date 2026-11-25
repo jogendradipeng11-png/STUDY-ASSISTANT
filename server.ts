@@ -100,6 +100,24 @@ function getAiClient(): GoogleGenAI {
   });
 }
 
+function getLiveAiClient(): GoogleGenAI {
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error(
+      "GEMINI_API_KEY is missing. Please check your API key in Settings > Secrets."
+    );
+  }
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      apiVersion: "v1beta",
+      headers: {
+        "User-Agent": "aistudio-build",
+      },
+    },
+  });
+}
+
 function parseJsonFromText<T = Record<string, unknown>>(raw: string): T {
   const cleaned = raw
     .trim()
@@ -1459,7 +1477,7 @@ async function startServer() {
             liveSession = null;
           }
 
-          const ai = getAiClient();
+          const ai = getLiveAiClient();
           const allowedVoices = new Set(["Puck", "Charon", "Kore", "Fenrir", "Zephyr"]);
           const safeVoice =
             msg.voiceName && allowedVoices.has(msg.voiceName)
@@ -1490,7 +1508,7 @@ async function startServer() {
             },
             callbacks: {
               onopen: () => {
-                sendSafe({ type: "ready", voiceName: safeVoice });
+                // Wait until ai.live.connect resolves (setupComplete) before notifying client
               },
               onmessage: (message: LiveServerMessage) => {
                 const content = message.serverContent;
@@ -1528,19 +1546,41 @@ async function startServer() {
                 }
               },
               onerror: (e: unknown) => {
-                const errMsg =
+                const ev = e as {
+                  message?: string;
+                  error?: { message?: string };
+                };
+                const rawErr =
                   e instanceof Error
                     ? e.message
-                    : "Live voice connection encountered an error.";
-                sendSafe({ type: "error", message: errMsg });
+                    : ev?.error?.message ||
+                      ev?.message ||
+                      "Live voice connection encountered an error.";
+                console.error("[Live API error]", rawErr, e);
+                const formatted = formatApiError(new Error(rawErr));
+                sendSafe({ type: "error", message: formatted.message });
               },
-              onclose: () => {
+              onclose: (closeEv: unknown) => {
+                const ev = closeEv as { code?: number; reason?: string };
+                if (ev?.reason) {
+                  console.error("[Live API close]", ev.code, ev.reason);
+                }
                 if (!isClosing) {
-                  sendSafe({ type: "closed" });
+                  if (ev?.code && ev.code !== 1000 && ev.reason) {
+                    sendSafe({
+                      type: "error",
+                      message: `Live voice closed (${ev.code}): ${ev.reason}`,
+                    });
+                  } else {
+                    sendSafe({ type: "closed" });
+                  }
                 }
               },
             },
           });
+
+          // Session is now assigned and setupComplete has finished
+          sendSafe({ type: "ready", voiceName: safeVoice });
           return;
         }
 
