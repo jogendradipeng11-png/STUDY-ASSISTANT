@@ -1716,6 +1716,252 @@ async function startServer() {
     }
   });
 
+  // 3c. Live Voice & Face-to-Face Conversation Translator (Any Language / Any Country + Same-Language Reply Mode)
+  app.post("/api/translate/conversation", async (req, res) => {
+    try {
+      const {
+        audioBase64,
+        audioMimeType = "audio/webm",
+        text = "",
+        myLanguage = "English",
+        otherLanguage = "Hindi",
+        direction = "auto_conversation",
+        sameLanguageAnswer = false,
+        recentContext = [],
+      } = req.body as {
+        audioBase64?: string;
+        audioMimeType?: string;
+        text?: string;
+        myLanguage?: string;
+        otherLanguage?: string;
+        direction?: "me_to_them" | "them_to_me" | "auto_conversation" | "listen_any";
+        sameLanguageAnswer?: boolean;
+        recentContext?: Array<{ originalText: string; translatedText: string }>;
+      };
+
+      const cleanMyLang = (myLanguage || "English").trim() || "English";
+      const cleanOtherLang = (otherLanguage || "Hindi").trim() || "Hindi";
+      const isSameLanguageSelected =
+        cleanMyLang.toLowerCase() === cleanOtherLang.toLowerCase();
+      const useSameLangReply =
+        direction !== "listen_any" &&
+        (Boolean(sameLanguageAnswer) || isSameLanguageSelected);
+
+      let spokenText = (text || "").trim();
+
+      // Step 1: Transcribe live voice audio accurately across ANY language/country
+      if (!spokenText && audioBase64) {
+        const ai = getAiClient();
+        const transcribeParts = [
+          {
+            inlineData: {
+              mimeType: audioMimeType,
+              data: audioBase64,
+            },
+          },
+          {
+            text: "Automatically detect the exact spoken language (any world language, regional Indian language, or dialect) and transcribe this audio faithfully in its natural native script without translating. Return ONLY the clean spoken transcript. If there is only silence or background noise with no speech, return an empty string.",
+          },
+        ];
+
+        try {
+          const transcribeRes = await withRetry(
+            () =>
+              ai.models.generateContent({
+                model: "gemini-3.5-transcribe",
+                contents: { parts: transcribeParts },
+              }),
+            2
+          );
+          spokenText = (transcribeRes.text || "").trim();
+        } catch {
+          const { response: fallbackAudioRes } =
+            await generateGeminiTextWithFallback(
+              ai,
+              [{ role: "user", parts: transcribeParts }],
+              () => ({
+                systemInstruction:
+                  "You are an accurate multilingual speech transcriber. Output only the clean spoken words in their original language.",
+              })
+            );
+          spokenText = (fallbackAudioRes.text || "").trim();
+        }
+      }
+
+      if (!spokenText) {
+        return res.status(400).json({
+          error:
+            "I could not hear clear speech. Please hold the microphone a little closer and try speaking again.",
+        });
+      }
+
+      const contextLines = Array.isArray(recentContext)
+        ? recentContext
+            .slice(-4)
+            .map(
+              (c, i) =>
+                `Turn ${i + 1}: "${(c.originalText || "").slice(0, 140)}" -> "${(c.translatedText || "").slice(0, 140)}"`
+            )
+            .join("\n")
+        : "";
+
+      const systemInstruction =
+        "You are Jogi Jarvis, an elite real-time human interpreter and multilingual conversation companion supporting every country and language on Earth (including Odia, Hindi, English, Arabic, Spanish, French, German, Chinese, Japanese, Korean, Tamil, Telugu, Bengali, Russian, Thai, Swahili, and all dialects). Always sound natural, warm, polite, and idiomatic like a real human speaking face-to-face—never stiff or literal.";
+
+      let taskInstructions = "";
+      if (useSameLangReply) {
+        taskInstructions = [
+          `SAME-LANGUAGE CONVERSATION MODE: Both sides are speaking ${cleanMyLang}.`,
+          `1. Detect the language of the input (detectedLanguage).`,
+          `2. Set targetLanguage to "${cleanMyLang}".`,
+          `3. Write a warm, natural, helpful conversational answer in ${cleanMyLang} inside translatedText (2 to 4 natural spoken sentences that directly reply to what was just said, ready to be spoken aloud like a real human).`,
+          `4. Set speakerSide to "${direction === "them_to_me" ? "them" : "me"}".`,
+          `5. Provide 2 short natural follow-up phrases in ${cleanMyLang} inside suggestedReplies.`,
+          `6. Leave pronunciation as an empty string.`,
+        ].join("\n");
+      } else if (direction === "listen_any") {
+        taskInstructions = [
+          `LISTEN ANY VOICE MODE: Auto-detect whatever world language was just spoken, and translate it clearly and naturally into ${cleanMyLang}.`,
+          `1. Identify the exact spoken language in detectedLanguage (e.g. "Japanese", "Arabic", "Spanish", "Hindi").`,
+          `2. Set targetLanguage to "${cleanMyLang}".`,
+          `3. Put the natural, idiomatic translation in ${cleanMyLang} (using its authentic native script) inside translatedText.`,
+          `4. Set speakerSide to "them".`,
+          `5. Provide 2 helpful short reply options in ${cleanMyLang} (what the user might say back) inside suggestedReplies.`,
+          `6. If ${cleanMyLang} uses a non-Latin script, include a simple phonetic pronunciation hint in pronunciation; otherwise "".`,
+        ].join("\n");
+      } else if (direction === "me_to_them") {
+        taskInstructions = [
+          `DIRECT INTERPRETATION (MY SIDE -> OTHER PERSON): The user is speaking in ${cleanMyLang} (or similar) and wants to speak to someone who understands ${cleanOtherLang}.`,
+          `1. Identify the spoken language in detectedLanguage.`,
+          `2. Set targetLanguage to "${cleanOtherLang}".`,
+          `3. Translate naturally and politely into ${cleanOtherLang} (native script) in translatedText so it sounds like a native human speaker.`,
+          `4. Set speakerSide to "me".`,
+          `5. Provide 2 short follow-up phrases in ${cleanMyLang} that the user might want to say next inside suggestedReplies.`,
+          `6. If ${cleanOtherLang} uses a non-Latin script, provide an easy readable pronunciation guide in Latin letters inside pronunciation; otherwise "".`,
+        ].join("\n");
+      } else if (direction === "them_to_me") {
+        taskInstructions = [
+          `DIRECT INTERPRETATION (OTHER PERSON -> MY SIDE): The other person is speaking in ${cleanOtherLang} (or any foreign language) and the user understands ${cleanMyLang}.`,
+          `1. Identify the spoken language in detectedLanguage.`,
+          `2. Set targetLanguage to "${cleanMyLang}".`,
+          `3. Translate clearly and naturally into ${cleanMyLang} (native script) in translatedText.`,
+          `4. Set speakerSide to "them".`,
+          `5. Provide 2 short, helpful reply suggestions in ${cleanMyLang} that the user can tap to answer the other person inside suggestedReplies.`,
+          `6. Leave pronunciation as "" unless helpful.`,
+        ].join("\n");
+      } else {
+        taskInstructions = [
+          `AUTO TWO-WAY CONVERSATION MODE between Person A ("me", language: ${cleanMyLang}) and Person B ("them", language: ${cleanOtherLang}).`,
+          `1. Detect which language the input is spoken in (detectedLanguage).`,
+          `2. If the spoken input is in ${cleanMyLang}, set speakerSide="me", targetLanguage="${cleanOtherLang}", and translate naturally into ${cleanOtherLang} (native script).`,
+          `3. Otherwise (if spoken in ${cleanOtherLang} or any other foreign language), set speakerSide="them", targetLanguage="${cleanMyLang}", and translate naturally into ${cleanMyLang} (native script).`,
+          `4. Provide 2 short natural reply suggestions in ${cleanMyLang} inside suggestedReplies.`,
+          `5. If targetLanguage uses a non-Latin script and differs from ${cleanMyLang}, include an easy Latin-letter pronunciation guide in pronunciation; otherwise "".`,
+        ].join("\n");
+      }
+
+      const userPrompt = [
+        taskInstructions,
+        contextLines ? `\nRecent conversation context:\n${contextLines}` : "",
+        `\nSpoken input to process:\n"${spokenText}"`,
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      const schemaHint =
+        '{"detectedLanguage":"string","targetLanguage":"string","translatedText":"string","pronunciation":"string","speakerSide":"me|them","suggestedReplies":["string","string"]}';
+
+      const responseSchema = {
+        type: Type.OBJECT,
+        properties: {
+          detectedLanguage: { type: Type.STRING },
+          targetLanguage: { type: Type.STRING },
+          translatedText: { type: Type.STRING },
+          pronunciation: { type: Type.STRING },
+          speakerSide: { type: Type.STRING },
+          suggestedReplies: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+          },
+        },
+        required: [
+          "detectedLanguage",
+          "targetLanguage",
+          "translatedText",
+          "speakerSide",
+        ],
+      };
+
+      type TranslationResult = {
+        detectedLanguage?: string;
+        targetLanguage?: string;
+        translatedText?: string;
+        pronunciation?: string;
+        speakerSide?: string;
+        suggestedReplies?: string[];
+      };
+
+      let parsed: TranslationResult;
+      if (!hasGeminiKey() && hasAnyFallbackProvider()) {
+        parsed = await callFallbackPoolJson<TranslationResult>(
+          systemInstruction,
+          userPrompt,
+          schemaHint
+        );
+      } else {
+        try {
+          const ai = getAiClient();
+          const { response } = await generateGeminiTextWithFallback(
+            ai,
+            userPrompt,
+            (model) => ({
+              systemInstruction,
+              ...(model === "gemini-4-hydrogen"
+                ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                : {}),
+              responseMimeType: "application/json",
+              responseSchema,
+            })
+          );
+          parsed = parseJsonFromText<TranslationResult>(response.text || "{}");
+        } catch (geminiErr) {
+          if (hasAnyFallbackProvider()) {
+            parsed = await callFallbackPoolJson<TranslationResult>(
+              systemInstruction,
+              userPrompt,
+              schemaHint
+            );
+          } else {
+            throw geminiErr;
+          }
+        }
+      }
+
+      const safeSide = parsed.speakerSide === "them" ? "them" : "me";
+      const safeTarget =
+        (parsed.targetLanguage || "").trim() ||
+        (safeSide === "me" ? cleanOtherLang : cleanMyLang);
+
+      return res.json({
+        originalText: spokenText,
+        detectedLanguage: (parsed.detectedLanguage || cleanMyLang).trim(),
+        targetLanguage: safeTarget,
+        translatedText: (parsed.translatedText || spokenText).trim(),
+        pronunciation: (parsed.pronunciation || "").trim(),
+        speakerSide: safeSide,
+        suggestedReplies: Array.isArray(parsed.suggestedReplies)
+          ? parsed.suggestedReplies
+              .filter((r): r is string => typeof r === "string" && Boolean(r.trim()))
+              .slice(0, 3)
+          : [],
+        modeUsed: useSameLangReply ? "same_language_reply" : "translate",
+      });
+    } catch (err) {
+      const formatted = formatApiError(err);
+      return res.status(formatted.status).json({ error: formatted.message });
+    }
+  });
+
   // 4. Structured AI Study Note Generator (gemini-4-hydrogen + JSON responseSchema)
   app.post("/api/notes/generate", async (req, res) => {
     try {

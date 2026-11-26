@@ -1,4 +1,4 @@
-export type AppTab = "assistant" | "live" | "read" | "notes" | "family";
+export type AppTab = "assistant" | "live" | "translate" | "read" | "notes" | "family";
 
 export type VoiceName = "Zephyr" | "Kore" | "Puck" | "Charon" | "Fenrir";
 

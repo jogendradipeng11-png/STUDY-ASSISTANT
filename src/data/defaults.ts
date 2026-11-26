@@ -58,6 +58,57 @@ export const LANGUAGE_OPTIONS: Array<{ id: string; label: string }> = [
   { id: "Korean", label: "한국어 (Korean)" },
 ];
 
+export const WORLD_TRANSLATION_LANGUAGES: Array<{
+  id: string;
+  label: string;
+  region: string;
+  bcp47: string;
+}> = [
+  { id: "Odia", label: "ଓଡ଼ିଆ (Odia)", region: "India", bcp47: "or-IN" },
+  { id: "English", label: "English", region: "Global", bcp47: "en-US" },
+  { id: "Hindi", label: "हिन्दी (Hindi)", region: "India", bcp47: "hi-IN" },
+  { id: "Bengali", label: "বাংলা (Bengali)", region: "India / Bangladesh", bcp47: "bn-IN" },
+  { id: "Tamil", label: "தமிழ் (Tamil)", region: "India / Sri Lanka / Singapore", bcp47: "ta-IN" },
+  { id: "Telugu", label: "తెలుగు (Telugu)", region: "India", bcp47: "te-IN" },
+  { id: "Marathi", label: "मराठी (Marathi)", region: "India", bcp47: "mr-IN" },
+  { id: "Gujarati", label: "ગુજરાતી (Gujarati)", region: "India", bcp47: "gu-IN" },
+  { id: "Punjabi", label: "ਪੰਜਾਬੀ (Punjabi)", region: "India / Pakistan", bcp47: "pa-IN" },
+  { id: "Kannada", label: "ಕನ್ನಡ (Kannada)", region: "India", bcp47: "kn-IN" },
+  { id: "Malayalam", label: "മലയാളം (Malayalam)", region: "India", bcp47: "ml-IN" },
+  { id: "Assamese", label: "অসমীয়া (Assamese)", region: "India", bcp47: "as-IN" },
+  { id: "Urdu", label: "اردو (Urdu)", region: "India / Pakistan", bcp47: "ur-PK" },
+  { id: "Nepali", label: "नेपाली (Nepali)", region: "Nepal / India", bcp47: "ne-NP" },
+  { id: "Sinhala", label: "සිංහල (Sinhala)", region: "Sri Lanka", bcp47: "si-LK" },
+  { id: "Arabic", label: "العربية (Arabic)", region: "UAE / Saudi / Middle East", bcp47: "ar-SA" },
+  { id: "Spanish", label: "Español (Spanish)", region: "Spain / Latin America / USA", bcp47: "es-ES" },
+  { id: "French", label: "Français (French)", region: "France / Canada / Africa", bcp47: "fr-FR" },
+  { id: "German", label: "Deutsch (German)", region: "Germany / Austria / Switzerland", bcp47: "de-DE" },
+  { id: "Italian", label: "Italiano (Italian)", region: "Italy", bcp47: "it-IT" },
+  { id: "Portuguese", label: "Português (Portuguese)", region: "Brazil / Portugal", bcp47: "pt-BR" },
+  { id: "Russian", label: "Русский (Russian)", region: "Russia / Eastern Europe", bcp47: "ru-RU" },
+  { id: "Chinese (Mandarin)", label: "中文 普通话 (Chinese Mandarin)", region: "China / Taiwan / Singapore", bcp47: "zh-CN" },
+  { id: "Chinese (Cantonese)", label: "粵語 (Cantonese)", region: "Hong Kong / Macau", bcp47: "zh-HK" },
+  { id: "Japanese", label: "日本語 (Japanese)", region: "Japan", bcp47: "ja-JP" },
+  { id: "Korean", label: "한국어 (Korean)", region: "South Korea", bcp47: "ko-KR" },
+  { id: "Thai", label: "ไทย (Thai)", region: "Thailand", bcp47: "th-TH" },
+  { id: "Vietnamese", label: "Tiếng Việt (Vietnamese)", region: "Vietnam", bcp47: "vi-VN" },
+  { id: "Indonesian", label: "Bahasa Indonesia", region: "Indonesia", bcp47: "id-ID" },
+  { id: "Malay", label: "Bahasa Melayu (Malay)", region: "Malaysia / Brunei", bcp47: "ms-MY" },
+  { id: "Filipino (Tagalog)", label: "Filipino (Tagalog)", region: "Philippines", bcp47: "fil-PH" },
+  { id: "Turkish", label: "Türkçe (Turkish)", region: "Turkey", bcp47: "tr-TR" },
+  { id: "Persian (Farsi)", label: "فارسی (Persian / Farsi)", region: "Iran / Afghanistan", bcp47: "fa-IR" },
+  { id: "Dutch", label: "Nederlands (Dutch)", region: "Netherlands / Belgium", bcp47: "nl-NL" },
+  { id: "Polish", label: "Polski (Polish)", region: "Poland", bcp47: "pl-PL" },
+  { id: "Ukrainian", label: "Українська (Ukrainian)", region: "Ukraine", bcp47: "uk-UA" },
+  { id: "Greek", label: "Ελληνικά (Greek)", region: "Greece", bcp47: "el-GR" },
+  { id: "Swedish", label: "Svenska (Swedish)", region: "Sweden", bcp47: "sv-SE" },
+  { id: "Norwegian", label: "Norsk (Norwegian)", region: "Norway", bcp47: "nb-NO" },
+  { id: "Hebrew", label: "עברית (Hebrew)", region: "Israel", bcp47: "he-IL" },
+  { id: "Swahili", label: "Kiswahili (Swahili)", region: "Kenya / Tanzania / East Africa", bcp47: "sw-KE" },
+  { id: "Amharic", label: "አማርኛ (Amharic)", region: "Ethiopia", bcp47: "am-ET" },
+  { id: "Burmese", label: "မြန်မာ (Burmese)", region: "Myanmar", bcp47: "my-MM" },
+];
+
 export const DEFAULT_PROFILES: FamilyProfile[] = [
   {
     id: "jogi-parent",

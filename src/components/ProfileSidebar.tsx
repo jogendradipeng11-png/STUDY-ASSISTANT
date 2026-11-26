@@ -22,6 +22,7 @@ interface ProfileSidebarProps {
 const MOBILE_NAV: Array<{ id: AppTab; label: string }> = [
   { id: "assistant", label: "Assistant" },
   { id: "live", label: "Live Voice" },
+  { id: "translate", label: "Translate" },
   { id: "read", label: "Read Aloud" },
   { id: "notes", label: "Study Notes" },
   { id: "family", label: "Family" },

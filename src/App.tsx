@@ -43,6 +43,7 @@ import { OfflineIndicator } from "./components/OfflineIndicator";
 import { WatchModeView } from "./components/WatchModeView";
 import { AlarmTray } from "./components/AlarmTray";
 import { ReadAloudView } from "./components/ReadAloudView";
+import { TranslateView } from "./components/TranslateView";
 import { CloudSyncButton } from "./components/CloudSyncButton";
 import type { AppCommand } from "./utils/mobileActions";
 
@@ -463,6 +464,7 @@ export default function App() {
       const labels: Record<AppTab, string> = {
         assistant: "Assistant",
         live: "Live Voice",
+        translate: "Live Voice Translator & Conversation",
         read: "Read Aloud Studio",
         notes: "Study Notes",
         family: "Family Profiles",
@@ -610,6 +612,10 @@ export default function App() {
               onSaveNote={handleAddNote}
               onOpenNote={handleOpenNote}
             />
+          )}
+
+          {activeTab === "translate" && (
+            <TranslateView profile={activeProfile} />
           )}
 
           {activeTab === "read" && (

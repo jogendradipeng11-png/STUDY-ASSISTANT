@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { BookOpen, Menu, Mic, Watch } from "lucide-react";
+import { BookOpen, Languages, Menu, Mic, Watch } from "lucide-react";
 import type { AppTab } from "../types";
 import { PWAInstallButton } from "./PWAInstallButton";
 
@@ -15,6 +15,7 @@ interface TopBarProps {
 const NAV_ITEMS: Array<{ id: AppTab; label: string }> = [
   { id: "assistant", label: "Assistant" },
   { id: "live", label: "Live Voice" },
+  { id: "translate", label: "Translate" },
   { id: "read", label: "Read" },
   { id: "notes", label: "Study Notes" },
   { id: "family", label: "Family" },
@@ -76,8 +77,21 @@ export function TopBar({
         })}
       </nav>
 
-      {/* Zone 3: Mobile Read shortcut, Cloud Sync, Watch Mode, Install App & primary Talk Now action */}
-      <div className="flex items-center gap-2 shrink-0">
+      {/* Zone 3: Mobile Translate/Read shortcuts, Cloud Sync, Watch Mode, Install App & primary Talk Now action */}
+      <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+        <button
+          type="button"
+          onClick={() => onSelectTab("translate")}
+          title="Open Live Voice Translator & Conversation Mode"
+          className={`md:hidden inline-flex items-center gap-1.5 px-2.5 py-2 text-xs font-semibold rounded-lg border transition-colors whitespace-nowrap shrink-0 min-h-[40px] ${
+            activeTab === "translate"
+              ? "bg-blue-50 border-blue-300 text-blue-800"
+              : "bg-white border-slate-200 text-slate-700 hover:bg-slate-50"
+          }`}
+        >
+          <Languages className="h-4 w-4 text-blue-700 shrink-0" />
+          <span>Translate</span>
+        </button>
         <button
           type="button"
           onClick={() => onSelectTab("read")}
@@ -89,7 +103,7 @@ export function TopBar({
           }`}
         >
           <BookOpen className="h-4 w-4 text-blue-700 shrink-0" />
-          <span>Read</span>
+          <span className="hidden sm:inline">Read</span>
         </button>
         {cloudSyncControl}
         <button

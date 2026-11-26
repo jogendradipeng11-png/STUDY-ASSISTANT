@@ -158,6 +158,12 @@ export function parseMobileActions(
     ) {
       appCommand = { type: "tab", tab: "live", autoStartVoice: true };
     } else if (
+      /\b(?:open|go\s+to|start|launch|use)\s+(?:the\s+)?(?:translate|translator|voice\s+translate|conversation(?:\s+mode|\s+translate|\s+translator)?|interpreter|listen\s+and\s+translate)\b/i.test(
+        lower
+      )
+    ) {
+      appCommand = { type: "tab", tab: "translate" };
+    } else if (
       /\b(?:open|go\s+to|show)\s+(?:the\s+)?family(?:\s+profiles?)?\b/i.test(
         lower
       )
