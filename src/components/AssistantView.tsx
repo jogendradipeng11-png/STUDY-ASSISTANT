@@ -44,6 +44,13 @@ import type {
 import { STARTER_PROMPTS } from "../data/defaults";
 import { blobToBase64 } from "../utils/audio";
 import {
+  base64ToAudioBlobUrl,
+  getSilentKeepAliveWavUrl,
+  requestAudioWakeLock,
+  updateJarvisMediaSession,
+  type WakeLockHandle,
+} from "../utils/backgroundAudio";
+import {
   downloadGeneratedScript,
   formatAlarmTime,
   parseMobileActions,
@@ -156,10 +163,12 @@ export function AssistantView({
   } | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // TTS audio playback state
+  // TTS audio playback state (DOM <audio> + MediaSession + WakeLock for background/lock-screen playback)
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
   const [loadingTtsId, setLoadingTtsId] = useState<string | null>(null);
   const audioElRef = useRef<HTMLAudioElement | null>(null);
+  const activeAudioBlobUrlRef = useRef<string | null>(null);
+  const wakeLockRef = useRef<WakeLockHandle | null>(null);
   const ttsAbortRef = useRef<AbortController | null>(null);
   const playbackTokenRef = useRef(0);
 
@@ -241,16 +250,102 @@ export function AssistantView({
     }, 5500);
   };
 
-  // Tiny 1-sample silent WAV used to unlock HTMLAudioElement inside a user click gesture on mobile Chrome/Safari
+  const releaseWakeLock = () => {
+    if (wakeLockRef.current) {
+      void wakeLockRef.current.release().catch(() => {});
+      wakeLockRef.current = null;
+    }
+  };
+
+  const acquireWakeLock = async () => {
+    if (wakeLockRef.current) return;
+    wakeLockRef.current = await requestAudioWakeLock();
+  };
+
+  const revokeActiveBlobUrl = () => {
+    if (activeAudioBlobUrlRef.current) {
+      URL.revokeObjectURL(activeAudioBlobUrlRef.current);
+      activeAudioBlobUrlRef.current = null;
+    }
+  };
+
+  const getAudioElement = (): HTMLAudioElement => {
+    if (!audioElRef.current) {
+      audioElRef.current = new Audio();
+    }
+    return audioElRef.current;
+  };
+
+  const bindLockScreenControls = (title: string, playbackState: "playing" | "paused") => {
+    updateJarvisMediaSession({
+      title,
+      artist: `Jogi Jarvis (${profile.name})`,
+      album: "Human Voice Assistant",
+      playbackState,
+      handlers: {
+        onPlay: () => {
+          const el = audioElRef.current;
+          if (el && el.src) {
+            void el.play().catch(() => {});
+            updateJarvisMediaSession({
+              title,
+              artist: `Jogi Jarvis (${profile.name})`,
+              album: "Human Voice Assistant",
+              playbackState: "playing",
+            });
+          }
+        },
+        onPause: () => {
+          const el = audioElRef.current;
+          if (el && !el.paused) {
+            el.pause();
+            updateJarvisMediaSession({
+              title,
+              artist: `Jogi Jarvis (${profile.name})`,
+              album: "Human Voice Assistant",
+              playbackState: "paused",
+            });
+          }
+        },
+        onStop: () => {
+          stopPlayback();
+        },
+      },
+    });
+  };
+
+  // Keeps mobile Chrome/Safari audio session alive while thinking so Jogi Jarvis still speaks if screen locks or app minimizes
+  const startBackgroundAudioKeepAlive = (statusTitle = "Jogi Jarvis is replying…") => {
+    try {
+      const el = getAudioElement();
+      revokeActiveBlobUrl();
+      el.onended = null;
+      el.onerror = null;
+      el.loop = true;
+      el.muted = false;
+      el.volume = 0.01;
+      el.src = getSilentKeepAliveWavUrl();
+      void el
+        .play()
+        .then(() => {
+          bindLockScreenControls(statusTitle, "playing");
+        })
+        .catch(() => {
+          // Non-fatal if browser hasn't unlocked audio yet
+        });
+      void acquireWakeLock();
+    } catch {
+      // ignore unlock errors
+    }
+  };
+
+  // Unlock HTMLAudioElement inside a user click gesture on mobile Chrome/Safari
   const unlockAudioElement = () => {
     try {
-      if (!audioElRef.current) {
-        audioElRef.current = new Audio();
-      }
-      const el = audioElRef.current;
+      const el = getAudioElement();
       if (el.paused && !el.src) {
-        el.src =
-          "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
+        el.src = getSilentKeepAliveWavUrl();
+        el.loop = false;
         el.muted = true;
         void el
           .play()
@@ -277,10 +372,14 @@ export function AssistantView({
     if (audioElRef.current) {
       audioElRef.current.onended = null;
       audioElRef.current.onerror = null;
+      audioElRef.current.loop = false;
       audioElRef.current.pause();
       audioElRef.current.removeAttribute("src");
       audioElRef.current.load();
     }
+    revokeActiveBlobUrl();
+    updateJarvisMediaSession({ title: "Jogi Jarvis", playbackState: "none" });
+    releaseWakeLock();
     if (typeof window !== "undefined" && "speechSynthesis" in window) {
       try {
         window.speechSynthesis.cancel();
@@ -303,12 +402,15 @@ export function AssistantView({
     try {
       const clean = rawText
         .replace(/```[\s\S]*?```/g, " ")
+        .replace(/https?:\/\/\S+/gi, "")
         .replace(/[#*_>`~[\]()]/g, " ")
         .replace(/\s+/g, " ")
         .trim();
       if (!clean || playbackTokenRef.current !== token) return false;
       window.speechSynthesis.cancel();
       const utter = new SpeechSynthesisUtterance(clean);
+      utter.rate = 0.98;
+      utter.pitch = 1.02;
       const langMap: Record<string, string> = {
         English: "en-IN",
         Hindi: "hi-IN",
@@ -324,11 +426,15 @@ export function AssistantView({
       utter.onend = () => {
         if (playbackTokenRef.current === token) {
           setSpeakingMessageId(null);
+          updateJarvisMediaSession({ title: "Jogi Jarvis", playbackState: "none" });
+          releaseWakeLock();
         }
       };
       utter.onerror = () => {
         if (playbackTokenRef.current === token) {
           setSpeakingMessageId(null);
+          updateJarvisMediaSession({ title: "Jogi Jarvis", playbackState: "none" });
+          releaseWakeLock();
         }
       };
       setSpeakingMessageId(messageId);
@@ -339,12 +445,24 @@ export function AssistantView({
     }
   };
 
-  const speakText = async (messageId: string, text: string) => {
+  const speakText = async (
+    messageId: string,
+    text: string,
+    preserveKeepAlive = false
+  ) => {
     if (speakingMessageId === messageId || loadingTtsId === messageId) {
       stopPlayback();
       return;
     }
-    stopPlayback();
+    if (preserveKeepAlive) {
+      playbackTokenRef.current += 1;
+      if (ttsAbortRef.current) {
+        ttsAbortRef.current.abort();
+        ttsAbortRef.current = null;
+      }
+    } else {
+      stopPlayback();
+    }
     const myToken = playbackTokenRef.current;
     const controller = new AbortController();
     ttsAbortRef.current = controller;
@@ -361,6 +479,7 @@ export function AssistantView({
           voiceName: profile.voiceName,
           role: profile.role,
           language: activeLanguage,
+          conversational: true,
         }),
       });
       const data = await res.json();
@@ -369,23 +488,44 @@ export function AssistantView({
         throw new Error(data.error || "Could not generate speech audio.");
       }
 
-      if (!audioElRef.current) {
-        audioElRef.current = new Audio();
-      }
-      const audio = audioElRef.current;
+      const audio = getAudioElement();
+      revokeActiveBlobUrl();
+      const blobUrl = base64ToAudioBlobUrl(
+        data.audioBase64,
+        data.mimeType || "audio/wav"
+      );
+      activeAudioBlobUrlRef.current = blobUrl;
+
+      audio.loop = false;
       audio.muted = false;
-      audio.src = `data:audio/wav;base64,${data.audioBase64}`;
+      audio.volume = 1.0;
+      audio.src = blobUrl;
       setSpeakingMessageId(messageId);
       setLoadingTtsId(null);
+
+      const lockTitle =
+        text
+          .replace(/[#*_>`~[\]()]/g, " ")
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 68) || "Jogi Jarvis Voice Reply";
+      bindLockScreenControls(lockTitle, "playing");
+      void acquireWakeLock();
 
       audio.onended = () => {
         if (playbackTokenRef.current === myToken) {
           setSpeakingMessageId(null);
+          revokeActiveBlobUrl();
+          updateJarvisMediaSession({ title: "Jogi Jarvis", playbackState: "none" });
+          releaseWakeLock();
         }
       };
       audio.onerror = () => {
         if (playbackTokenRef.current === myToken) {
           setSpeakingMessageId(null);
+          revokeActiveBlobUrl();
+          updateJarvisMediaSession({ title: "Jogi Jarvis", playbackState: "none" });
+          releaseWakeLock();
         }
       };
 
@@ -394,10 +534,16 @@ export function AssistantView({
       if (playbackTokenRef.current !== myToken) return;
       // Ignore intentional aborts
       if (err instanceof DOMException && err.name === "AbortError") return;
-      // Graceful fallback to browser speech synthesis (handles transient TTS errors or mobile autoplay restrictions)
+      // Stop silent keep-alive before falling back to browser speech synthesis
+      if (audioElRef.current) {
+        audioElRef.current.loop = false;
+        audioElRef.current.pause();
+      }
       const fellBack = speakWithBrowserFallback(messageId, text, myToken);
       if (!fellBack) {
         setSpeakingMessageId(null);
+        updateJarvisMediaSession({ title: "Jogi Jarvis", playbackState: "none" });
+        releaseWakeLock();
         setErrorMsg(
           err instanceof Error ? err.message : "Audio playback failed."
         );
@@ -489,7 +635,9 @@ export function AssistantView({
     if ((!promptText && !attachedImage) || isSending) return;
 
     if (autoSpeakRef.current) {
-      unlockAudioElement();
+      startBackgroundAudioKeepAlive(
+        promptText ? `Replying to: ${promptText.slice(0, 48)}` : "Jogi Jarvis is replying…"
+      );
     }
 
     setErrorMsg(null);
@@ -526,6 +674,7 @@ export function AssistantView({
       autoFeedbackLines.push(navConfirm);
       setInput("");
       if (parsedMobile.isDirectCommandOnly) {
+        stopPlayback();
         return;
       }
     }
@@ -583,7 +732,7 @@ export function AssistantView({
       };
       onUpdateMessages(profile.id, [...nextMessages, instantReply]);
       if (autoSpeakRef.current) {
-        void speakText(instantReply.id, autoFeedbackLines.join(" "));
+        void speakText(instantReply.id, autoFeedbackLines.join(" "), true);
       }
       return;
     }
@@ -608,6 +757,7 @@ export function AssistantView({
           speedMode,
           engine,
           stream: true,
+          spokenMode: autoSpeakRef.current,
         }),
       });
 
@@ -695,7 +845,7 @@ export function AssistantView({
       onUpdateMessages(profile.id, updatedMessages);
 
       if (autoSpeakRef.current) {
-        void speakText(assistantMsg.id, assistantMsg.content);
+        void speakText(assistantMsg.id, assistantMsg.content, true);
       }
 
       // If student has Auto-Take AI Notes enabled, automatically distill substantial study explanations
@@ -758,6 +908,9 @@ export function AssistantView({
         }
       }
     } catch (err) {
+      if (autoSpeakRef.current) {
+        stopPlayback();
+      }
       setErrorMsg(
         err instanceof Error
           ? err.message
@@ -1026,14 +1179,14 @@ export function AssistantView({
               } else {
                 unlockAudioElement();
                 showToast(
-                  "Auto-Speak enabled — replies will now be spoken automatically."
+                  "Human Auto-Speak enabled — replies stay natural and continue playing when minimized or screen-locked."
                 );
               }
             }}
             title={
               autoSpeak
-                ? "Auto-Speak is ON — click to turn off and stop voice"
-                : "Auto-Speak is OFF — click to automatically read every reply aloud"
+                ? "Human Auto-Speak is ON (supports minimized & lock-screen playback) — click to turn off"
+                : "Auto-Speak is OFF — click for natural human voice replies with lock-screen playback"
             }
             className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border transition-colors whitespace-nowrap shrink-0 ${
               autoSpeak
@@ -1726,6 +1879,7 @@ export function AssistantView({
           }}
         />
       )}
+      <audio ref={audioElRef} playsInline preload="auto" className="hidden" />
     </div>
   );
 }

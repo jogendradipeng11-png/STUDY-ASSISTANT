@@ -896,12 +896,21 @@ function buildSystemInstruction(
 
 function stripMarkdownForSpeech(input: string): string {
   return input
-    .replace(/```[\s\S]*?```/g, " Code block omitted. ")
+    .replace(/```[\s\S]*?```/g, " I have included the code on your screen. ")
     .replace(/`([^`]+)`/g, "$1")
     .replace(/!\[[^\]]*\]\([^)]+\)/g, "")
     .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/https?:\/\/\S+/gi, "")
     .replace(/^#{1,6}\s+/gm, "")
-    .replace(/[*_~>-]{1,3}/g, " ")
+    .replace(/^\s*[-*•]\s+/gm, "")
+    .replace(/(\d+)\s*°\s*C\b/gi, "$1 degrees Celsius")
+    .replace(/(\d+)\s*°\s*F\b/gi, "$1 degrees Fahrenheit")
+    .replace(/(\d+)\s*%/g, "$1 percent")
+    .replace(/[*_~>]+/g, " ")
+    .replace(/\n{2,}/g, ". ")
+    .replace(/\n/g, " ")
+    .replace(/\s+([,.;!?])/g, "$1")
+    .replace(/\.{2,}/g, ".")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 2600);
@@ -964,6 +973,7 @@ async function startServer() {
       speedMode = "fast",
       stream = false,
       engine = "auto",
+      spokenMode = false,
     } = req.body as {
       messages: IncomingMessage[];
       profile?: ProfilePayload;
@@ -973,6 +983,7 @@ async function startServer() {
       speedMode?: "fast" | "detailed";
       stream?: boolean;
       engine?: "auto" | "gemini" | "nvidia";
+      spokenMode?: boolean;
     };
 
     if (!Array.isArray(messages) || messages.length === 0) {
@@ -1016,9 +1027,13 @@ async function startServer() {
       "chat",
       language
     );
-    const systemInstruction = effectiveUseSearch
-      ? `${baseSystemInstruction}\n\nLIVE WEB DATA ACCESS ENABLED (Current UTC time: ${new Date().toUTCString()}): Use Google Search grounding to answer questions about live news, sports scores, weather, current events, prices, or any real-time information accurately and up-to-date. Mention dates/scores clearly when relevant.`
-      : baseSystemInstruction;
+    const spokenGuidance = spokenMode
+      ? "\n\nHUMAN VOICE CONVERSATION MODE ACTIVE: Your reply will be spoken aloud automatically like a real, caring human friend and mentor talking face-to-face. Use natural everyday phrasing, smooth conversational transitions, and warm human rhythm. Avoid reading out raw markdown symbols, long URLs, or stiff robotic bullet formatting; keep everyday replies warm, clear, and easy to listen to even with the phone screen locked."
+      : "";
+    const liveSearchGuidance = effectiveUseSearch
+      ? `\n\nLIVE WEB DATA ACCESS ENABLED (Current UTC time: ${new Date().toUTCString()}): Use Google Search grounding to answer questions about live news, sports scores, weather, current events, prices, or any real-time information accurately and up-to-date. Mention dates/scores clearly when relevant.`
+      : "";
+    const systemInstruction = `${baseSystemInstruction}${spokenGuidance}${liveSearchGuidance}`;
     const recentMessages = messages.slice(-18);
     const hasImage = recentMessages.some((m) =>
       Boolean(m.imageBase64 && m.imageMimeType)
@@ -1480,12 +1495,14 @@ async function startServer() {
         role = "parent",
         language,
         readingStyle = "normal",
+        conversational = false,
       } = req.body as {
         text?: string;
         voiceName?: string;
         role?: "parent" | "student";
         language?: string;
         readingStyle?: "normal" | "slow" | "explain";
+        conversational?: boolean;
       };
 
       const cleanText = stripMarkdownForSpeech(text || "");
@@ -1508,8 +1525,11 @@ async function startServer() {
             ? " like a warm classroom teacher explaining clearly to a student"
             : "";
 
-      const style =
-        role === "student"
+      const style = conversational
+        ? role === "student"
+          ? `Warm, expressive, lifelike human mentor speaking naturally face-to-face with genuine warmth, natural breathing rhythm, friendly intonation, and clear pacing${langCue}${paceCue}`
+          : `Warm, natural, lifelike human companion speaking conversationally like a trusted family member, with genuine human inflection, relaxed natural pauses, and effortless clarity${langCue}${paceCue}`
+        : role === "student"
           ? `Warm, patient, encouraging personal teacher${langCue}${paceCue}`
           : `Calm, articulate, helpful personal assistant${langCue}${paceCue}`;
 
