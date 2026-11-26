@@ -212,8 +212,9 @@ export function speakWithChunkedBrowserTts(options: {
         idx += 1;
         speakNext();
       };
-      utter.onerror = () => {
+      utter.onerror = (ev) => {
         if (!options.isStillCurrent()) return;
+        if (ev.error === "canceled" || ev.error === "interrupted") return;
         options.onError?.();
       };
 

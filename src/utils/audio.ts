@@ -58,6 +58,10 @@ export class LiveAudioPlayer {
     return this.ctx;
   }
 
+  public unlock(): void {
+    this.ensureContext();
+  }
+
   public enqueuePcmBase64(base64: string): void {
     const ctx = this.ensureContext();
     const floatData = base64ToPcm16Float32(base64);

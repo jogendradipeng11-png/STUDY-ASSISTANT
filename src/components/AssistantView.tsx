@@ -148,14 +148,18 @@ export function AssistantView({
     }
   });
   const autoSpeakRef = useRef(autoSpeak);
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
   const [autoRunActions, setAutoRunActions] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  // Voice dictation state
+  // Voice dictation state (+ lightweight silence auto-stop when Auto-Speak is ON)
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
+  const micVadIntervalRef = useRef<number | null>(null);
+  const micVadCtxRef = useRef<AudioContext | null>(null);
 
   // Photo / homework attachment state
   const [attachedImage, setAttachedImage] = useState<{
@@ -240,6 +244,14 @@ export function AssistantView({
   useEffect(() => {
     return () => {
       stopPlayback();
+      if (micVadIntervalRef.current !== null) {
+        window.clearInterval(micVadIntervalRef.current);
+        micVadIntervalRef.current = null;
+      }
+      if (micVadCtxRef.current) {
+        void micVadCtxRef.current.close().catch(() => {});
+        micVadCtxRef.current = null;
+      }
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
         mediaRecorderRef.current.stop();
       }
@@ -652,9 +664,10 @@ export function AssistantView({
       );
     }
 
+    const currentMessages = messagesRef.current;
     setErrorMsg(null);
     const parsedMobile = parseMobileActions(promptText, profiles);
-    const lastAssistantReply = [...messages]
+    const lastAssistantReply = [...currentMessages]
       .reverse()
       .find((m) => m.role === "assistant")?.content;
 
@@ -717,7 +730,8 @@ export function AssistantView({
       imageMimeType: attachedImage?.mimeType,
     };
 
-    const nextMessages = [...messages, userMsg];
+    const nextMessages = [...currentMessages, userMsg];
+    messagesRef.current = nextMessages;
     onUpdateMessages(profile.id, nextMessages);
     setInput("");
     setAttachedImage(null);
@@ -933,24 +947,45 @@ export function AssistantView({
     }
   };
 
+  const cleanupMicVad = () => {
+    if (micVadIntervalRef.current !== null) {
+      window.clearInterval(micVadIntervalRef.current);
+      micVadIntervalRef.current = null;
+    }
+    if (micVadCtxRef.current) {
+      void micVadCtxRef.current.close().catch(() => {});
+      micVadCtxRef.current = null;
+    }
+  };
+
   const handleToggleVoiceDictation = async () => {
     setErrorMsg(null);
 
     if (isRecording) {
+      cleanupMicVad();
       if (autoSpeakRef.current) {
         unlockAudioElement();
       }
-      mediaRecorderRef.current?.stop();
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        mediaRecorderRef.current.stop();
+      }
       setIsRecording(false);
       return;
     }
 
+    stopPlayback();
     if (autoSpeakRef.current) {
       unlockAudioElement();
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
       const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
         ? "audio/webm;codecs=opus"
         : MediaRecorder.isTypeSupported("audio/webm")
@@ -967,9 +1002,11 @@ export function AssistantView({
       };
 
       recorder.onstop = async () => {
+        cleanupMicVad();
         stream.getTracks().forEach((t) => t.stop());
+        setIsRecording(false);
         const blob = new Blob(recordedChunksRef.current, { type: mimeType });
-        if (blob.size < 200) return;
+        if (blob.size < 250) return;
 
         setIsTranscribing(true);
         try {
@@ -986,12 +1023,15 @@ export function AssistantView({
           }
           if (data.transcript) {
             const spoken = String(data.transcript).trim();
+            if (!spoken) return;
             const parsedSpoken = parseMobileActions(spoken, profiles);
+            // When Auto-Speak is ON, automatically ask Jogi Jarvis and speak the reply aloud right away!
             if (
-              autoRunActions &&
-              (parsedSpoken.appCommand ||
-                parsedSpoken.autoAlarm ||
-                parsedSpoken.actions.length > 0)
+              autoSpeakRef.current ||
+              (autoRunActions &&
+                (parsedSpoken.appCommand ||
+                  parsedSpoken.autoAlarm ||
+                  parsedSpoken.actions.length > 0))
             ) {
               void handleSend(spoken);
             } else {
@@ -1011,6 +1051,57 @@ export function AssistantView({
       mediaRecorderRef.current = recorder;
       recorder.start();
       setIsRecording(true);
+
+      // When Auto-Speak is ON, auto-detect natural pause after user speaks so Jogi Jarvis replies automatically
+      if (autoSpeakRef.current) {
+        try {
+          const vadCtx = new AudioContext();
+          micVadCtxRef.current = vadCtx;
+          const src = vadCtx.createMediaStreamSource(stream);
+          const analyser = vadCtx.createAnalyser();
+          analyser.fftSize = 1024;
+          src.connect(analyser);
+          const samples = new Float32Array(analyser.fftSize);
+
+          let voiceFrames = 0;
+          let heardSpeech = false;
+          let lastSpeechAt = Date.now();
+          const startedAt = Date.now();
+
+          micVadIntervalRef.current = window.setInterval(() => {
+            if (!mediaRecorderRef.current || mediaRecorderRef.current.state !== "recording") {
+              cleanupMicVad();
+              return;
+            }
+            analyser.getFloatTimeDomainData(samples);
+            let sum = 0;
+            for (let i = 0; i < samples.length; i += 1) {
+              sum += samples[i] * samples[i];
+            }
+            const rms = Math.sqrt(sum / samples.length);
+            const now = Date.now();
+            if (rms > 0.018) {
+              voiceFrames += 1;
+              lastSpeechAt = now;
+              if (voiceFrames >= 3) {
+                heardSpeech = true;
+              }
+            }
+            // Auto-send after 1.7s pause once user finished speaking (or 22s cap)
+            if (
+              (heardSpeech && now - lastSpeechAt >= 1700) ||
+              now - startedAt >= 22000
+            ) {
+              cleanupMicVad();
+              if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
+                mediaRecorderRef.current.stop();
+              }
+            }
+          }, 90);
+        } catch {
+          // If AudioContext VAD isn't available, manual tap-to-stop still works seamlessly
+        }
+      }
     } catch {
       setErrorMsg(
         "Microphone permission was denied. Please allow microphone access in your browser to speak to Jogi Jarvis."
