@@ -128,7 +128,14 @@ export function AssistantView({
   const [engine, setEngine] = useState<"auto" | "gemini" | "nvidia">("auto");
   const [nvidiaAvailable, setNvidiaAvailable] = useState(false);
   const [useSearch, setUseSearch] = useState(true);
-  const [autoSpeak, setAutoSpeak] = useState(false);
+  const [autoSpeak, setAutoSpeak] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("jogi_jarvis_autospeak_v1") === "true";
+    } catch {
+      return false;
+    }
+  });
+  const autoSpeakRef = useRef(autoSpeak);
   const [autoRunActions, setAutoRunActions] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -151,6 +158,17 @@ export function AssistantView({
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
   const [loadingTtsId, setLoadingTtsId] = useState<string | null>(null);
   const audioElRef = useRef<HTMLAudioElement | null>(null);
+  const ttsAbortRef = useRef<AbortController | null>(null);
+  const playbackTokenRef = useRef(0);
+
+  useEffect(() => {
+    autoSpeakRef.current = autoSpeak;
+    try {
+      localStorage.setItem("jogi_jarvis_autospeak_v1", String(autoSpeak));
+    } catch {
+      // ignore storage errors
+    }
+  }, [autoSpeak]);
 
   // Study note creation state
   const [savingNoteForId, setSavingNoteForId] = useState<string | null>(null);
@@ -207,20 +225,113 @@ export function AssistantView({
     }, 5500);
   };
 
-  const stopPlayback = () => {
-    if (audioElRef.current) {
-      audioElRef.current.pause();
-      audioElRef.current = null;
+  // Tiny 1-sample silent WAV used to unlock HTMLAudioElement inside a user click gesture on mobile Chrome/Safari
+  const unlockAudioElement = () => {
+    try {
+      if (!audioElRef.current) {
+        audioElRef.current = new Audio();
+      }
+      const el = audioElRef.current;
+      if (el.paused && !el.src) {
+        el.src =
+          "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
+        el.muted = true;
+        void el
+          .play()
+          .then(() => {
+            el.pause();
+            el.muted = false;
+            el.currentTime = 0;
+          })
+          .catch(() => {
+            el.muted = false;
+          });
+      }
+    } catch {
+      // ignore unlock errors
     }
+  };
+
+  const stopPlayback = () => {
+    playbackTokenRef.current += 1;
+    if (ttsAbortRef.current) {
+      ttsAbortRef.current.abort();
+      ttsAbortRef.current = null;
+    }
+    if (audioElRef.current) {
+      audioElRef.current.onended = null;
+      audioElRef.current.onerror = null;
+      audioElRef.current.pause();
+      audioElRef.current.removeAttribute("src");
+      audioElRef.current.load();
+    }
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        // ignore
+      }
+    }
+    setLoadingTtsId(null);
     setSpeakingMessageId(null);
   };
 
+  const speakWithBrowserFallback = (
+    messageId: string,
+    rawText: string,
+    token: number
+  ): boolean => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+      return false;
+    }
+    try {
+      const clean = rawText
+        .replace(/```[\s\S]*?```/g, " ")
+        .replace(/[#*_>`~[\]()]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!clean || playbackTokenRef.current !== token) return false;
+      window.speechSynthesis.cancel();
+      const utter = new SpeechSynthesisUtterance(clean);
+      const langMap: Record<string, string> = {
+        English: "en-IN",
+        Hindi: "hi-IN",
+        Odia: "or-IN",
+        Bengali: "bn-IN",
+        Tamil: "ta-IN",
+        Telugu: "te-IN",
+        Marathi: "mr-IN",
+      };
+      if (langMap[activeLanguage]) {
+        utter.lang = langMap[activeLanguage];
+      }
+      utter.onend = () => {
+        if (playbackTokenRef.current === token) {
+          setSpeakingMessageId(null);
+        }
+      };
+      utter.onerror = () => {
+        if (playbackTokenRef.current === token) {
+          setSpeakingMessageId(null);
+        }
+      };
+      setSpeakingMessageId(messageId);
+      window.speechSynthesis.speak(utter);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   const speakText = async (messageId: string, text: string) => {
-    if (speakingMessageId === messageId) {
+    if (speakingMessageId === messageId || loadingTtsId === messageId) {
       stopPlayback();
       return;
     }
     stopPlayback();
+    const myToken = playbackTokenRef.current;
+    const controller = new AbortController();
+    ttsAbortRef.current = controller;
     setLoadingTtsId(messageId);
     setErrorMsg(null);
 
@@ -228,6 +339,7 @@ export function AssistantView({
       const res = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
           text,
           voiceName: profile.voiceName,
@@ -236,26 +348,48 @@ export function AssistantView({
         }),
       });
       const data = await res.json();
-      if (!res.ok) {
+      if (playbackTokenRef.current !== myToken) return;
+      if (!res.ok || !data.audioBase64) {
         throw new Error(data.error || "Could not generate speech audio.");
       }
 
-      const audio = new Audio(`data:audio/wav;base64,${data.audioBase64}`);
-      audioElRef.current = audio;
+      if (!audioElRef.current) {
+        audioElRef.current = new Audio();
+      }
+      const audio = audioElRef.current;
+      audio.muted = false;
+      audio.src = `data:audio/wav;base64,${data.audioBase64}`;
       setSpeakingMessageId(messageId);
+      setLoadingTtsId(null);
+
       audio.onended = () => {
-        setSpeakingMessageId(null);
-        audioElRef.current = null;
+        if (playbackTokenRef.current === myToken) {
+          setSpeakingMessageId(null);
+        }
       };
       audio.onerror = () => {
-        setSpeakingMessageId(null);
-        audioElRef.current = null;
+        if (playbackTokenRef.current === myToken) {
+          setSpeakingMessageId(null);
+        }
       };
+
       await audio.play();
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Audio playback failed.");
+      if (playbackTokenRef.current !== myToken) return;
+      // Ignore intentional aborts
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      // Graceful fallback to browser speech synthesis (handles transient TTS errors or mobile autoplay restrictions)
+      const fellBack = speakWithBrowserFallback(messageId, text, myToken);
+      if (!fellBack) {
+        setSpeakingMessageId(null);
+        setErrorMsg(
+          err instanceof Error ? err.message : "Audio playback failed."
+        );
+      }
     } finally {
-      setLoadingTtsId(null);
+      if (playbackTokenRef.current === myToken) {
+        setLoadingTtsId(null);
+      }
     }
   };
 
@@ -337,6 +471,10 @@ export function AssistantView({
   const handleSend = async (overrideText?: string, forceLiveSearch = false) => {
     const promptText = (overrideText ?? input).trim();
     if ((!promptText && !attachedImage) || isSending) return;
+
+    if (autoSpeakRef.current) {
+      unlockAudioElement();
+    }
 
     setErrorMsg(null);
     const parsedMobile = parseMobileActions(promptText, profiles);
@@ -428,7 +566,7 @@ export function AssistantView({
           parsedMobile.actions.length > 0 ? parsedMobile.actions : undefined,
       };
       onUpdateMessages(profile.id, [...nextMessages, instantReply]);
-      if (autoSpeak) {
+      if (autoSpeakRef.current) {
         void speakText(instantReply.id, autoFeedbackLines.join(" "));
       }
       return;
@@ -540,7 +678,7 @@ export function AssistantView({
       const updatedMessages = [...nextMessages, assistantMsg];
       onUpdateMessages(profile.id, updatedMessages);
 
-      if (autoSpeak) {
+      if (autoSpeakRef.current) {
         void speakText(assistantMsg.id, assistantMsg.content);
       }
 
@@ -859,9 +997,24 @@ export function AssistantView({
           <button
             type="button"
             onClick={() => {
-              if (autoSpeak) stopPlayback();
-              setAutoSpeak((v) => !v);
+              const nextVal = !autoSpeak;
+              autoSpeakRef.current = nextVal;
+              setAutoSpeak(nextVal);
+              if (!nextVal) {
+                stopPlayback();
+                showToast("Auto-Speak turned off.");
+              } else {
+                unlockAudioElement();
+                showToast(
+                  "Auto-Speak enabled — replies will now be spoken automatically."
+                );
+              }
             }}
+            title={
+              autoSpeak
+                ? "Auto-Speak is ON — click to turn off and stop voice"
+                : "Auto-Speak is OFF — click to automatically read every reply aloud"
+            }
             className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border transition-colors whitespace-nowrap shrink-0 ${
               autoSpeak
                 ? "bg-blue-50 border-blue-200 text-blue-800"
