@@ -46,7 +46,10 @@ import { blobToBase64 } from "../utils/audio";
 import {
   base64ToAudioBlobUrl,
   getSilentKeepAliveWavUrl,
+  playAudioBlobReliably,
   requestAudioWakeLock,
+  speakWithChunkedBrowserTts,
+  unlockBrowserSpeech,
   updateJarvisMediaSession,
   type WakeLockHandle,
 } from "../utils/backgroundAudio";
@@ -317,6 +320,7 @@ export function AssistantView({
   // Keeps mobile Chrome/Safari audio session alive while thinking so Jogi Jarvis still speaks if screen locks or app minimizes
   const startBackgroundAudioKeepAlive = (statusTitle = "Jogi Jarvis is replying…") => {
     try {
+      unlockBrowserSpeech();
       const el = getAudioElement();
       revokeActiveBlobUrl();
       el.onended = null;
@@ -339,9 +343,10 @@ export function AssistantView({
     }
   };
 
-  // Unlock HTMLAudioElement inside a user click gesture on mobile Chrome/Safari
+  // Unlock HTMLAudioElement + Web Speech inside a user click gesture on mobile Chrome/Safari
   const unlockAudioElement = () => {
     try {
+      unlockBrowserSpeech();
       const el = getAudioElement();
       if (el.paused && !el.src) {
         el.src = getSilentKeepAliveWavUrl();
@@ -396,53 +401,47 @@ export function AssistantView({
     rawText: string,
     token: number
   ): boolean => {
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
-      return false;
-    }
-    try {
-      const clean = rawText
-        .replace(/```[\s\S]*?```/g, " ")
-        .replace(/https?:\/\/\S+/gi, "")
-        .replace(/[#*_>`~[\]()]/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
-      if (!clean || playbackTokenRef.current !== token) return false;
-      window.speechSynthesis.cancel();
-      const utter = new SpeechSynthesisUtterance(clean);
-      utter.rate = 0.98;
-      utter.pitch = 1.02;
-      const langMap: Record<string, string> = {
-        English: "en-IN",
-        Hindi: "hi-IN",
-        Odia: "or-IN",
-        Bengali: "bn-IN",
-        Tamil: "ta-IN",
-        Telugu: "te-IN",
-        Marathi: "mr-IN",
-      };
-      if (langMap[activeLanguage]) {
-        utter.lang = langMap[activeLanguage];
-      }
-      utter.onend = () => {
-        if (playbackTokenRef.current === token) {
-          setSpeakingMessageId(null);
-          updateJarvisMediaSession({ title: "Jogi Jarvis", playbackState: "none" });
-          releaseWakeLock();
-        }
-      };
-      utter.onerror = () => {
-        if (playbackTokenRef.current === token) {
-          setSpeakingMessageId(null);
-          updateJarvisMediaSession({ title: "Jogi Jarvis", playbackState: "none" });
-          releaseWakeLock();
-        }
-      };
-      setSpeakingMessageId(messageId);
-      window.speechSynthesis.speak(utter);
-      return true;
-    } catch {
-      return false;
-    }
+    const langMap: Record<string, string> = {
+      English: "en-IN",
+      Hindi: "hi-IN",
+      Odia: "or-IN",
+      Bengali: "bn-IN",
+      Tamil: "ta-IN",
+      Telugu: "te-IN",
+      Marathi: "mr-IN",
+      Gujarati: "gu-IN",
+      Punjabi: "pa-IN",
+      Kannada: "kn-IN",
+      Malayalam: "ml-IN",
+      Urdu: "ur-PK",
+      Spanish: "es-ES",
+      French: "fr-FR",
+      German: "de-DE",
+      Arabic: "ar-SA",
+      Japanese: "ja-JP",
+      Korean: "ko-KR",
+      Chinese: "zh-CN",
+    };
+
+    return speakWithChunkedBrowserTts({
+      text: rawText,
+      bcp47: langMap[activeLanguage] || "en-IN",
+      isStillCurrent: () => playbackTokenRef.current === token,
+      onStart: () => {
+        setSpeakingMessageId(messageId);
+        setLoadingTtsId(null);
+      },
+      onEnd: () => {
+        setSpeakingMessageId(null);
+        updateJarvisMediaSession({ title: "Jogi Jarvis", playbackState: "none" });
+        releaseWakeLock();
+      },
+      onError: () => {
+        setSpeakingMessageId(null);
+        updateJarvisMediaSession({ title: "Jogi Jarvis", playbackState: "none" });
+        releaseWakeLock();
+      },
+    });
   };
 
   const speakText = async (
@@ -462,10 +461,17 @@ export function AssistantView({
       }
     } else {
       stopPlayback();
+      unlockBrowserSpeech();
     }
     const myToken = playbackTokenRef.current;
     const controller = new AbortController();
     ttsAbortRef.current = controller;
+    let timedOut = false;
+    const timeoutId = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 15000);
+
     setLoadingTtsId(messageId);
     setErrorMsg(null);
 
@@ -482,6 +488,7 @@ export function AssistantView({
           conversational: true,
         }),
       });
+      window.clearTimeout(timeoutId);
       const data = await res.json();
       if (playbackTokenRef.current !== myToken) return;
       if (!res.ok || !data.audioBase64) {
@@ -496,10 +503,12 @@ export function AssistantView({
       );
       activeAudioBlobUrlRef.current = blobUrl;
 
-      audio.loop = false;
-      audio.muted = false;
-      audio.volume = 1.0;
-      audio.src = blobUrl;
+      await playAudioBlobReliably(audio, blobUrl);
+      if (playbackTokenRef.current !== myToken) {
+        audio.pause();
+        return;
+      }
+
       setSpeakingMessageId(messageId);
       setLoadingTtsId(null);
 
@@ -528,14 +537,16 @@ export function AssistantView({
           releaseWakeLock();
         }
       };
-
-      await audio.play();
     } catch (err) {
+      window.clearTimeout(timeoutId);
+      // Only stop silently if user explicitly cancelled/replaced playback (token changed)
       if (playbackTokenRef.current !== myToken) return;
-      // Ignore intentional aborts
-      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (controller.signal.aborted && !timedOut) return;
+
       // Stop silent keep-alive before falling back to browser speech synthesis
       if (audioElRef.current) {
+        audioElRef.current.onended = null;
+        audioElRef.current.onerror = null;
         audioElRef.current.loop = false;
         audioElRef.current.pause();
       }
@@ -549,6 +560,7 @@ export function AssistantView({
         );
       }
     } finally {
+      window.clearTimeout(timeoutId);
       if (playbackTokenRef.current === myToken) {
         setLoadingTtsId(null);
       }
@@ -925,9 +937,16 @@ export function AssistantView({
     setErrorMsg(null);
 
     if (isRecording) {
+      if (autoSpeakRef.current) {
+        unlockAudioElement();
+      }
       mediaRecorderRef.current?.stop();
       setIsRecording(false);
       return;
+    }
+
+    if (autoSpeakRef.current) {
+      unlockAudioElement();
     }
 
     try {

@@ -1,4 +1,4 @@
-// Background & lock-screen audio continuity helpers (MediaSession + Blob WAV + silent keep-alive + WakeLock)
+// Background & lock-screen audio continuity helpers (MediaSession + Blob WAV + silent keep-alive + WakeLock + reliable playback)
 
 let cachedSilentWavUrl: string | null = null;
 
@@ -35,7 +35,6 @@ export function getSilentKeepAliveWavUrl(): string {
   view.setUint16(34, 16, true); // Bits per sample
   writeStr(36, "data");
   view.setUint32(40, dataSize, true);
-  // PCM samples remain 0 (silent)
 
   const blob = new Blob([buffer], { type: "audio/wav" });
   cachedSilentWavUrl = URL.createObjectURL(blob);
@@ -56,6 +55,182 @@ export function base64ToAudioBlobUrl(
   }
   const blob = new Blob([bytes], { type: mimeType });
   return URL.createObjectURL(blob);
+}
+
+/**
+ * Safely switches an unlocked HTMLAudioElement to a new Blob URL and starts playback
+ * without hitting Chrome/Safari's "AbortError: play() interrupted by a new load request" race.
+ */
+export async function playAudioBlobReliably(
+  audio: HTMLAudioElement,
+  blobUrl: string
+): Promise<void> {
+  // Cleanly stop any prior silent keep-alive loop before loading new source
+  audio.onended = null;
+  audio.onerror = null;
+  audio.loop = false;
+  try {
+    audio.pause();
+  } catch {
+    // ignore pause errors
+  }
+  audio.muted = false;
+  audio.volume = 1.0;
+  audio.src = blobUrl;
+
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      audio.removeEventListener("canplay", finish);
+      audio.removeEventListener("loadeddata", finish);
+      audio.removeEventListener("error", finish);
+      window.clearTimeout(timer);
+      resolve();
+    };
+    const timer = window.setTimeout(finish, 1200);
+    audio.addEventListener("canplay", finish, { once: true });
+    audio.addEventListener("loadeddata", finish, { once: true });
+    audio.addEventListener("error", finish, { once: true });
+    audio.load();
+  });
+
+  try {
+    await audio.play();
+  } catch (err) {
+    // Retry once if interrupted by media load timing
+    if (err instanceof DOMException && err.name === "AbortError") {
+      await new Promise((r) => window.setTimeout(r, 150));
+      await audio.play();
+      return;
+    }
+    throw err;
+  }
+}
+
+/**
+ * Unlocks browser speechSynthesis inside a user gesture so fallback voice works on mobile Chrome/Safari.
+ */
+export function unlockBrowserSpeech(): void {
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+  try {
+    window.speechSynthesis.getVoices();
+    const u = new SpeechSynthesisUtterance("");
+    u.volume = 0;
+    window.speechSynthesis.speak(u);
+    window.speechSynthesis.cancel();
+  } catch {
+    // ignore
+  }
+}
+
+function splitSpeechChunks(text: string, maxLen = 190): string[] {
+  const sentences = text
+    .split(/(?<=[.!?।॥\n])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const chunks: string[] = [];
+  let current = "";
+  for (const s of sentences) {
+    if (s.length > maxLen) {
+      if (current) {
+        chunks.push(current);
+        current = "";
+      }
+      const words = s.split(/\s+/);
+      let part = "";
+      for (const w of words) {
+        if ((part + " " + w).trim().length > maxLen) {
+          if (part) chunks.push(part);
+          part = w;
+        } else {
+          part = (part + " " + w).trim();
+        }
+      }
+      if (part) chunks.push(part);
+    } else if ((current + " " + s).trim().length > maxLen) {
+      if (current) chunks.push(current);
+      current = s;
+    } else {
+      current = (current + " " + s).trim();
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks.length > 0 ? chunks : [text.slice(0, maxLen)];
+}
+
+/**
+ * Reliable chunked Web Speech fallback (avoids Chrome's 15-second long-utterance silence bug).
+ */
+export function speakWithChunkedBrowserTts(options: {
+  text: string;
+  bcp47?: string;
+  isStillCurrent: () => boolean;
+  onStart?: () => void;
+  onEnd?: () => void;
+  onError?: () => void;
+}): boolean {
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+    return false;
+  }
+  try {
+    const clean = options.text
+      .replace(/```[\s\S]*?```/g, " ")
+      .replace(/https?:\/\/\S+/gi, "")
+      .replace(/[#*_>`~[\]()]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!clean || !options.isStillCurrent()) return false;
+
+    window.speechSynthesis.cancel();
+    const voices = window.speechSynthesis.getVoices();
+    const targetLang = options.bcp47 || "en-IN";
+    const langPrefix = targetLang.split("-")[0].toLowerCase();
+    const preferredVoice =
+      voices.find((v) => v.lang.toLowerCase() === targetLang.toLowerCase()) ||
+      voices.find((v) => v.lang.toLowerCase().startsWith(langPrefix)) ||
+      null;
+
+    const chunks = splitSpeechChunks(clean);
+    let idx = 0;
+
+    const speakNext = () => {
+      if (!options.isStillCurrent()) return;
+      if (idx >= chunks.length) {
+        options.onEnd?.();
+        return;
+      }
+      const utter = new SpeechSynthesisUtterance(chunks[idx]);
+      utter.lang = preferredVoice?.lang || targetLang;
+      if (preferredVoice) utter.voice = preferredVoice;
+      utter.rate = 0.98;
+      utter.pitch = 1.0;
+
+      utter.onend = () => {
+        if (!options.isStillCurrent()) return;
+        idx += 1;
+        speakNext();
+      };
+      utter.onerror = () => {
+        if (!options.isStillCurrent()) return;
+        options.onError?.();
+      };
+
+      window.speechSynthesis.speak(utter);
+      try {
+        window.speechSynthesis.resume();
+      } catch {
+        // ignore
+      }
+    };
+
+    options.onStart?.();
+    speakNext();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export interface MediaSessionHandlers {
