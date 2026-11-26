@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { BookOpen, Menu, Mic, Watch } from "lucide-react";
 import type { AppTab } from "../types";
 import { PWAInstallButton } from "./PWAInstallButton";
@@ -8,6 +9,7 @@ interface TopBarProps {
   onStartQuickVoice: () => void;
   onOpenWatchMode: () => void;
   onToggleMobileMenu: () => void;
+  cloudSyncControl?: ReactNode;
 }
 
 const NAV_ITEMS: Array<{ id: AppTab; label: string }> = [
@@ -24,6 +26,7 @@ export function TopBar({
   onStartQuickVoice,
   onOpenWatchMode,
   onToggleMobileMenu,
+  cloudSyncControl,
 }: TopBarProps) {
   return (
     <header className="no-print sticky top-0 z-30 h-16 bg-white/95 backdrop-blur-sm border-b border-slate-200 px-4 sm:px-6 flex items-center justify-between gap-3 sm:gap-6">
@@ -73,7 +76,7 @@ export function TopBar({
         })}
       </nav>
 
-      {/* Zone 3: Mobile Read shortcut, Watch Mode, Install App & primary Talk Now action */}
+      {/* Zone 3: Mobile Read shortcut, Cloud Sync, Watch Mode, Install App & primary Talk Now action */}
       <div className="flex items-center gap-2 shrink-0">
         <button
           type="button"
@@ -88,6 +91,7 @@ export function TopBar({
           <BookOpen className="h-4 w-4 text-blue-700 shrink-0" />
           <span>Read</span>
         </button>
+        {cloudSyncControl}
         <button
           type="button"
           onClick={onOpenWatchMode}

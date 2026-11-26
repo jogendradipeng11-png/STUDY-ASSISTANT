@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  onAuthStateChanged,
+  signInWithPopup,
+  signOut,
+  type User,
+} from "firebase/auth";
 import type {
   ActiveAlarm,
   AppTab,
@@ -6,6 +12,19 @@ import type {
   FamilyProfile,
   StudyNote,
 } from "./types";
+import { auth, googleProvider } from "./firebase";
+import {
+  deleteCloudAlarm,
+  deleteCloudNote,
+  deleteCloudProfile,
+  ensureUserAccount,
+  saveCloudAlarm,
+  saveCloudChatThread,
+  saveCloudNote,
+  saveCloudProfile,
+  subscribeToFamilyCloud,
+  syncLocalWorkspaceToCloud,
+} from "./services/cloudSync";
 import {
   loadChats,
   loadNotes,
@@ -24,6 +43,7 @@ import { OfflineIndicator } from "./components/OfflineIndicator";
 import { WatchModeView } from "./components/WatchModeView";
 import { AlarmTray } from "./components/AlarmTray";
 import { ReadAloudView } from "./components/ReadAloudView";
+import { CloudSyncButton } from "./components/CloudSyncButton";
 import type { AppCommand } from "./utils/mobileActions";
 
 const ALARMS_STORAGE_KEY = "jogi_jarvis_alarms_v1";
@@ -91,11 +111,161 @@ export default function App() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [voiceStartSignal, setVoiceStartSignal] = useState(0);
   const [readDraftText, setReadDraftText] = useState("");
-  const [readDraftLanguage, setReadDraftLanguage] = useState<string | undefined>(
-    undefined
-  );
+  const [readDraftLanguage, setReadDraftLanguage] = useState<
+    string | undefined
+  >(undefined);
   const [readAutoStartSignal, setReadAutoStartSignal] = useState(0);
   const [alarms, setAlarms] = useState<ActiveAlarm[]>(() => loadStoredAlarms());
+
+  // Firebase Auth & Cloud Sync state
+  const [cloudUser, setCloudUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<
+    "idle" | "syncing" | "synced" | "error"
+  >("idle");
+  const [syncError, setSyncError] = useState<string | null>(null);
+
+  const cloudUidRef = useRef<string | null>(null);
+  const chatSyncTimersRef = useRef<Record<string, number>>({});
+  const latestLocalStateRef = useRef({
+    profiles,
+    notes,
+    chatsByProfile,
+    alarms,
+  });
+
+  useEffect(() => {
+    latestLocalStateRef.current = {
+      profiles,
+      notes,
+      chatsByProfile,
+      alarms,
+    };
+  }, [profiles, notes, chatsByProfile, alarms]);
+
+  // Listen to Firebase Auth state
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setCloudUser(user);
+      cloudUidRef.current = user && user.emailVerified ? user.uid : null;
+      setAuthReady(true);
+      if (!user) {
+        setSyncStatus("idle");
+        setSyncError(null);
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Connect real-time Firestore cloud sync once authenticated and verified
+  useEffect(() => {
+    if (!authReady || !cloudUser) return;
+    if (!cloudUser.emailVerified) {
+      setSyncStatus("error");
+      setSyncError("Please verify your Google email address to enable cloud sync.");
+      return;
+    }
+
+    let cancelled = false;
+    let unsubscribeCloud: (() => void) | null = null;
+
+    const connectCloud = async () => {
+      setSyncStatus("syncing");
+      setSyncError(null);
+      try {
+        await ensureUserAccount(cloudUser);
+        if (cancelled) return;
+
+        // Automatically migrate existing local Study Notes, profiles, chats, and alarms if cloud is empty
+        await syncLocalWorkspaceToCloud(
+          cloudUser.uid,
+          latestLocalStateRef.current,
+          true
+        );
+        if (cancelled) return;
+
+        unsubscribeCloud = subscribeToFamilyCloud(cloudUser.uid, {
+          onProfiles: (cloudProfiles) => {
+            setProfiles(cloudProfiles);
+            setActiveProfileId((prev) =>
+              cloudProfiles.some((p) => p.id === prev)
+                ? prev
+                : cloudProfiles[0]?.id || prev
+            );
+          },
+          onNotes: (cloudNotes) => {
+            setNotes(cloudNotes);
+            setSelectedNoteId((prev) =>
+              prev && cloudNotes.some((n) => n.id === prev)
+                ? prev
+                : cloudNotes[0]?.id || null
+            );
+          },
+          onChats: (cloudChats) => {
+            setChatsByProfile((prev) => ({ ...prev, ...cloudChats }));
+          },
+          onAlarms: (cloudAlarms) => {
+            setAlarms(cloudAlarms);
+          },
+          onSyncError: (message) => {
+            setSyncStatus("error");
+            setSyncError(message);
+          },
+        });
+        setSyncStatus("synced");
+      } catch (err) {
+        if (!cancelled) {
+          setSyncStatus("error");
+          setSyncError(
+            err instanceof Error ? err.message : "Could not connect to Cloud Sync."
+          );
+        }
+      }
+    };
+
+    void connectCloud();
+
+    return () => {
+      cancelled = true;
+      if (unsubscribeCloud) unsubscribeCloud();
+      for (const timerId of Object.values(chatSyncTimersRef.current)) {
+        window.clearTimeout(timerId);
+      }
+      chatSyncTimersRef.current = {};
+    };
+  }, [authReady, cloudUser]);
+
+  const handleSignInCloud = useCallback(async () => {
+    setSyncError(null);
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (err) {
+      setSyncStatus("error");
+      setSyncError(
+        err instanceof Error ? err.message : "Google Sign-In was cancelled."
+      );
+    }
+  }, []);
+
+  const handleSignOutCloud = useCallback(async () => {
+    await signOut(auth);
+  }, []);
+
+  const handleBackupNow = useCallback(async () => {
+    const uid = cloudUidRef.current;
+    if (!uid) return;
+    setSyncStatus("syncing");
+    setSyncError(null);
+    try {
+      await syncLocalWorkspaceToCloud(uid, latestLocalStateRef.current, false);
+      setSyncStatus("synced");
+    } catch (err) {
+      setSyncStatus("error");
+      setSyncError(
+        err instanceof Error ? err.message : "Manual cloud backup failed."
+      );
+    }
+  }, []);
 
   useEffect(() => {
     try {
@@ -107,40 +277,63 @@ export default function App() {
 
   const handleAddAlarm = useCallback(
     (alarm: Omit<ActiveAlarm, "id" | "ringing">) => {
-      setAlarms((prev) => [
-        ...prev,
-        {
-          ...alarm,
-          id: `alarm-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
-          ringing: false,
-        },
-      ]);
+      const created: ActiveAlarm = {
+        ...alarm,
+        id: `alarm-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+        ringing: false,
+      };
+      setAlarms((prev) => [...prev, created]);
+      const uid = cloudUidRef.current;
+      if (uid) {
+        void saveCloudAlarm(uid, created).catch((err) => {
+          setSyncStatus("error");
+          setSyncError(err instanceof Error ? err.message : "Alarm sync error.");
+        });
+      }
     },
     []
   );
 
   const handleDismissAlarm = useCallback((id: string) => {
     setAlarms((prev) => prev.filter((a) => a.id !== id));
+    const uid = cloudUidRef.current;
+    if (uid) {
+      void deleteCloudAlarm(uid, id).catch(() => {});
+    }
   }, []);
 
   const handleSnoozeAlarm = useCallback((id: string, minutes: number) => {
+    let updatedAlarm: ActiveAlarm | null = null;
     setAlarms((prev) =>
-      prev.map((a) =>
-        a.id === id
-          ? {
-              ...a,
-              triggerAt: Date.now() + minutes * 60 * 1000,
-              ringing: false,
-            }
-          : a
-      )
+      prev.map((a) => {
+        if (a.id !== id) return a;
+        updatedAlarm = {
+          ...a,
+          triggerAt: Date.now() + minutes * 60 * 1000,
+          ringing: false,
+        };
+        return updatedAlarm;
+      })
     );
+    const uid = cloudUidRef.current;
+    if (uid && updatedAlarm) {
+      void saveCloudAlarm(uid, updatedAlarm).catch(() => {});
+    }
   }, []);
 
   const handleMarkAlarmRinging = useCallback((id: string) => {
+    let updatedAlarm: ActiveAlarm | null = null;
     setAlarms((prev) =>
-      prev.map((a) => (a.id === id ? { ...a, ringing: true } : a))
+      prev.map((a) => {
+        if (a.id !== id) return a;
+        updatedAlarm = { ...a, ringing: true };
+        return updatedAlarm;
+      })
     );
+    const uid = cloudUidRef.current;
+    if (uid && updatedAlarm) {
+      void saveCloudAlarm(uid, updatedAlarm).catch(() => {});
+    }
   }, []);
 
   useEffect(() => {
@@ -170,14 +363,36 @@ export default function App() {
 
   const handleUpdateMessages = (profileId: string, updated: ChatMessage[]) => {
     setChatsByProfile((prev) => ({ ...prev, [profileId]: updated }));
+    const uid = cloudUidRef.current;
+    if (uid) {
+      const prevTimer = chatSyncTimersRef.current[profileId];
+      if (prevTimer) window.clearTimeout(prevTimer);
+      chatSyncTimersRef.current[profileId] = window.setTimeout(() => {
+        void saveCloudChatThread(uid, profileId, updated).catch(() => {});
+      }, 1200);
+    }
   };
 
   const handleAddNote = (note: StudyNote) => {
     setNotes((prev) => [note, ...prev]);
+    const uid = cloudUidRef.current;
+    if (uid) {
+      void saveCloudNote(uid, note).catch((err) => {
+        setSyncStatus("error");
+        setSyncError(err instanceof Error ? err.message : "Note sync error.");
+      });
+    }
   };
 
   const handleUpdateNote = (updated: StudyNote) => {
     setNotes((prev) => prev.map((n) => (n.id === updated.id ? updated : n)));
+    const uid = cloudUidRef.current;
+    if (uid) {
+      void saveCloudNote(uid, updated).catch((err) => {
+        setSyncStatus("error");
+        setSyncError(err instanceof Error ? err.message : "Note update sync error.");
+      });
+    }
   };
 
   const handleDeleteNote = (id: string) => {
@@ -188,6 +403,10 @@ export default function App() {
       }
       return remaining;
     });
+    const uid = cloudUidRef.current;
+    if (uid) {
+      void deleteCloudNote(uid, id).catch(() => {});
+    }
   };
 
   const handleOpenNote = (noteId: string) => {
@@ -257,11 +476,25 @@ export default function App() {
     setProfiles((prev) =>
       prev.map((p) => (p.id === updated.id ? updated : p))
     );
+    const uid = cloudUidRef.current;
+    if (uid) {
+      void saveCloudProfile(uid, updated).catch((err) => {
+        setSyncStatus("error");
+        setSyncError(err instanceof Error ? err.message : "Profile sync error.");
+      });
+    }
   };
 
   const handleAddProfile = (created: FamilyProfile) => {
     setProfiles((prev) => [...prev, created]);
     setActiveProfileId(created.id);
+    const uid = cloudUidRef.current;
+    if (uid) {
+      void saveCloudProfile(uid, created).catch((err) => {
+        setSyncStatus("error");
+        setSyncError(err instanceof Error ? err.message : "Profile sync error.");
+      });
+    }
   };
 
   const handleDeleteProfile = (id: string) => {
@@ -272,6 +505,10 @@ export default function App() {
       }
       return remaining;
     });
+    const uid = cloudUidRef.current;
+    if (uid) {
+      void deleteCloudProfile(uid, id).catch(() => {});
+    }
   };
 
   if (watchMode) {
@@ -306,6 +543,17 @@ export default function App() {
         onStartQuickVoice={handleStartQuickVoice}
         onOpenWatchMode={() => setWatchMode(true)}
         onToggleMobileMenu={() => setMobileMenuOpen((v) => !v)}
+        cloudSyncControl={
+          <CloudSyncButton
+            user={cloudUser}
+            authReady={authReady}
+            syncStatus={syncStatus}
+            syncError={syncError}
+            onSignIn={handleSignInCloud}
+            onSignOut={handleSignOutCloud}
+            onBackupNow={handleBackupNow}
+          />
+        }
       />
 
       <div className="flex flex-1 min-h-0">

@@ -1,0 +1,293 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Pillar 4.1: Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Hardened Global Primitives ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isVerifiedOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOptionalString(data, key, maxLen) {
+      return !(key in data) || (data[key] is string && data[key].size() <= maxLen);
+    }
+
+    function hasValidParentAccount(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId))
+        && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+    }
+
+    // --- Validation Blueprints (Pillar 2 + Pillar 5) ---
+    function isValidUserAccount(data, userId) {
+      return data.keys().hasAll(['uid', 'displayName', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'photoURL', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.uid == request.auth.uid
+        && data.uid == userId
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
+        && isOptionalString(data, 'photoURL', 500)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidFamilyProfile(data, userId, profileId) {
+      return data.keys().hasAll([
+          'ownerId', 'id', 'name', 'relation', 'role', 'voiceName',
+          'initials', 'accentColor', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'id', 'name', 'relation', 'role', 'grade', 'learningGoal',
+          'voiceName', 'preferredLanguage', 'avatarUrl', 'initials',
+          'accentColor', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.ownerId == userId
+        && isValidId(data.id)
+        && data.id == profileId
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+        && data.relation is string && data.relation.size() >= 1 && data.relation.size() <= 60
+        && data.role in ['parent', 'student']
+        && isOptionalString(data, 'grade', 60)
+        && isOptionalString(data, 'learningGoal', 300)
+        && data.voiceName in ['Zephyr', 'Kore', 'Puck', 'Charon', 'Fenrir']
+        && isOptionalString(data, 'preferredLanguage', 60)
+        && isOptionalString(data, 'avatarUrl', 180000)
+        && data.initials is string && data.initials.size() >= 1 && data.initials.size() <= 4
+        && data.accentColor is string && data.accentColor.size() >= 1 && data.accentColor.size() <= 32
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidStudyNote(data, userId, noteId) {
+      return data.keys().hasAll([
+          'ownerId', 'id', 'profileId', 'profileName', 'title', 'subject',
+          'summary', 'keyPoints', 'definitions', 'practiceQuestions',
+          'teacherTip', 'sourceMode', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'id', 'profileId', 'profileName', 'title', 'subject',
+          'summary', 'keyPoints', 'definitions', 'practiceQuestions',
+          'teacherTip', 'sourceMode', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.ownerId == userId
+        && isValidId(data.id)
+        && data.id == noteId
+        && isValidId(data.profileId)
+        && data.profileName is string && data.profileName.size() >= 1 && data.profileName.size() <= 80
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 200
+        && data.subject is string && data.subject.size() >= 1 && data.subject.size() <= 80
+        && data.summary is string && data.summary.size() <= 4000
+        && data.keyPoints is list && data.keyPoints.size() <= 30
+        && (data.keyPoints.size() == 0 || (data.keyPoints[0] is string && data.keyPoints[0].size() <= 600))
+        && data.definitions is list && data.definitions.size() <= 30
+        && (data.definitions.size() == 0 || data.definitions[0] is map)
+        && data.practiceQuestions is list && data.practiceQuestions.size() <= 20
+        && (data.practiceQuestions.size() == 0 || data.practiceQuestions[0] is map)
+        && data.teacherTip is string && data.teacherTip.size() <= 1000
+        && data.sourceMode in ['chat', 'voice', 'topic']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidChatThread(data, userId, profileId) {
+      return data.keys().hasAll(['ownerId', 'profileId', 'messages', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'profileId', 'messages', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.ownerId == userId
+        && isValidId(data.profileId)
+        && data.profileId == profileId
+        && data.messages is list && data.messages.size() <= 40
+        && (data.messages.size() == 0 || data.messages[0] is map)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAlarm(data, userId, alarmId) {
+      return data.keys().hasAll([
+          'ownerId', 'id', 'label', 'triggerAt', 'type', 'ringing', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'id', 'label', 'triggerAt', 'type', 'ringing', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.ownerId == userId
+        && isValidId(data.id)
+        && data.id == alarmId
+        && data.label is string && data.label.size() >= 1 && data.label.size() <= 120
+        && data.triggerAt is number && data.triggerAt > 0
+        && data.type in ['alarm', 'timer']
+        && data.ringing is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // --- Collection Rules ---
+
+    // Root account document (strict owner get/create/update; no list allowed)
+    match /users/{userId} {
+      allow get: if isVerifiedOwner(userId) && isValidId(userId);
+      allow list: if false;
+      allow create: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidUserAccount(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidUserAccount(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'updatedAt']);
+      allow delete: if isVerifiedOwner(userId) && isValidId(userId);
+
+      // Family member profiles
+      match /profiles/{profileId} {
+        allow get: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(profileId);
+        allow list: if isVerifiedOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(profileId)
+          && isValidFamilyProfile(incoming(), userId, profileId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && hasValidParentAccount(userId);
+        allow update: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(profileId)
+          && isValidFamilyProfile(incoming(), userId, profileId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().id == existing().id
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'relation', 'role', 'grade', 'learningGoal',
+            'voiceName', 'preferredLanguage', 'avatarUrl', 'initials',
+            'accentColor', 'updatedAt'
+          ])
+          && hasValidParentAccount(userId);
+        allow delete: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(profileId)
+          && hasValidParentAccount(userId);
+      }
+
+      // Saved Study Notes
+      match /notes/{noteId} {
+        allow get: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(noteId);
+        allow list: if isVerifiedOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(noteId)
+          && isValidStudyNote(incoming(), userId, noteId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && hasValidParentAccount(userId);
+        allow update: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(noteId)
+          && isValidStudyNote(incoming(), userId, noteId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().id == existing().id
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'profileId', 'profileName', 'title', 'subject', 'summary',
+            'keyPoints', 'definitions', 'practiceQuestions', 'teacherTip',
+            'sourceMode', 'updatedAt'
+          ])
+          && hasValidParentAccount(userId);
+        allow delete: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(noteId)
+          && hasValidParentAccount(userId);
+      }
+
+      // Per-profile synced chat history
+      match /chats/{profileId} {
+        allow get: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(profileId);
+        allow list: if isVerifiedOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(profileId)
+          && isValidChatThread(incoming(), userId, profileId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && hasValidParentAccount(userId);
+        allow update: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(profileId)
+          && isValidChatThread(incoming(), userId, profileId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().profileId == existing().profileId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['messages', 'updatedAt'])
+          && hasValidParentAccount(userId);
+        allow delete: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(profileId)
+          && hasValidParentAccount(userId);
+      }
+
+      // Synced live alarms and countdown timers
+      match /alarms/{alarmId} {
+        allow get: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(alarmId);
+        allow list: if isVerifiedOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(alarmId)
+          && isValidAlarm(incoming(), userId, alarmId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && hasValidParentAccount(userId);
+        allow update: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(alarmId)
+          && isValidAlarm(incoming(), userId, alarmId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().id == existing().id
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'label', 'triggerAt', 'type', 'ringing', 'updatedAt'
+          ])
+          && hasValidParentAccount(userId);
+        allow delete: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(alarmId)
+          && hasValidParentAccount(userId);
+      }
+    }
+  }
+}

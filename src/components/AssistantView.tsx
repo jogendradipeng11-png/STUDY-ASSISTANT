@@ -127,6 +127,8 @@ export function AssistantView({
   const [speedMode, setSpeedMode] = useState<"fast" | "detailed">("fast");
   const [engine, setEngine] = useState<"auto" | "gemini" | "nvidia">("auto");
   const [nvidiaAvailable, setNvidiaAvailable] = useState(false);
+  const [fallbackPoolAvailable, setFallbackPoolAvailable] = useState(false);
+  const [totalActiveModels, setTotalActiveModels] = useState(2);
   const [useSearch, setUseSearch] = useState(true);
   const [autoSpeak, setAutoSpeak] = useState<boolean>(() => {
     try {
@@ -192,11 +194,25 @@ export function AssistantView({
     let cancelled = false;
     fetch("/api/providers")
       .then((res) => (res.ok ? res.json() : null))
-      .then((data: { nvidiaConfigured?: boolean } | null) => {
-        if (!cancelled && data) {
-          setNvidiaAvailable(Boolean(data.nvidiaConfigured));
+      .then(
+        (
+          data: {
+            nvidiaConfigured?: boolean;
+            fallbackPoolConfigured?: boolean;
+            totalActiveModels?: number;
+          } | null
+        ) => {
+          if (!cancelled && data) {
+            setNvidiaAvailable(Boolean(data.nvidiaConfigured));
+            setFallbackPoolAvailable(
+              Boolean(data.fallbackPoolConfigured || data.nvidiaConfigured)
+            );
+            if (typeof data.totalActiveModels === "number" && data.totalActiveModels > 0) {
+              setTotalActiveModels(data.totalActiveModels);
+            }
+          }
         }
-      })
+      )
       .catch(() => {
         // non-blocking provider check
       });
@@ -945,10 +961,10 @@ export function AssistantView({
             <span>{speedMode === "fast" ? "Fast Mode" : "Deep Math"}</span>
           </button>
 
-          {nvidiaAvailable && (
+          {fallbackPoolAvailable && (
             <label
               className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium bg-white border border-slate-200 text-slate-700 whitespace-nowrap shrink-0"
-              title="Choose AI Engine (Auto falls back to NVIDIA NIM if Gemini hits a rate limit)"
+              title={`Choose AI Engine (Auto rotates across ${totalActiveModels} models automatically if any model hits a rate limit)`}
             >
               <Cpu className="h-3.5 w-3.5 text-emerald-700 shrink-0" />
               <select
@@ -959,9 +975,13 @@ export function AssistantView({
                 }
                 className="bg-transparent text-xs font-medium text-slate-800 focus:outline-none cursor-pointer"
               >
-                <option value="auto">Auto (Gemini + NVIDIA)</option>
+                <option value="auto">
+                  Auto ({totalActiveModels} Models)
+                </option>
                 <option value="gemini">Gemini</option>
-                <option value="nvidia">NVIDIA NIM</option>
+                {nvidiaAvailable && (
+                  <option value="nvidia">NVIDIA NIM (12 Models)</option>
+                )}
               </select>
             </label>
           )}

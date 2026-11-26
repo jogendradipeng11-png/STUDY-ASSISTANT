@@ -33,21 +33,147 @@ interface IncomingMessage {
 
 const NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
 
+type FallbackProviderId =
+  | "nvidia"
+  | "groq"
+  | "openrouter"
+  | "cerebras"
+  | "mistral"
+  | "openai";
+
+interface ModelCandidate {
+  provider: FallbackProviderId;
+  providerLabel: string;
+  apiUrl: string;
+  apiKey: string;
+  model: string;
+  extraHeaders?: Record<string, string>;
+}
+
+const GEMINI_TEXT_MODELS = ["gemini-4-hydrogen", "gemini-3.1-flash-lite"] as const;
+
+// 12 verified NVIDIA NIM chat models (all usable under a single NVIDIA_API_KEY)
 const NVIDIA_FAST_FALLBACKS = [
   "google/gemma-3-12b-it",
   "nvidia/nemotron-3.5-lightning-30b-a3b",
   "meta/llama-3.3-70b-instruct",
+  "google/gemma-3-27b-it",
+  "qwen/qwen2.5-72b-instruct",
+  "meta/llama-3.1-70b-instruct",
+  "mistralai/mistral-large-2-instruct",
+  "nvidia/llama-3.3-nemotron-super-49b-v1",
+  "meta/llama-3.1-8b-instruct",
+  "mistralai/mixtral-8x22b-instruct-v0.1",
   "nvidia/nemotron-3.5-bolt-e4b",
   "z-ai/glm-5.3-flash",
 ];
 
+// 12 math/reasoning-prioritized NVIDIA NIM models
 const NVIDIA_MATH_FALLBACKS = [
+  "qwen/qwen2.5-72b-instruct",
+  "nvidia/llama-3.3-nemotron-super-49b-v1",
+  "meta/llama-3.3-70b-instruct",
+  "google/gemma-3-27b-it",
+  "qwen/qwen2.5-coder-32b-instruct",
+  "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+  "mistralai/mistral-large-2-instruct",
   "google/gemma-3-12b-it",
   "nvidia/nemotron-3.5-lightning-30b-a3b",
-  "meta/llama-3.3-70b-instruct",
-  "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+  "meta/llama-3.1-70b-instruct",
+  "deepseek-ai/deepseek-r1-distill-llama-8b",
   "nvidia/nemotron-3.5-bolt-e4b",
 ];
+
+// Optional additional single-key OpenAI-compatible providers (activated automatically if key is set)
+const GROQ_MODELS = [
+  "llama-3.3-70b-versatile",
+  "llama-3.1-8b-instant",
+  "qwen/qwen3-32b",
+  "gemma2-9b-it",
+];
+
+const OPENROUTER_MODELS = [
+  "meta-llama/llama-3.3-70b-instruct:free",
+  "google/gemma-3-27b-it:free",
+  "mistralai/mistral-small-3.1-24b-instruct:free",
+  "qwen/qwen-2.5-72b-instruct:free",
+];
+
+const CEREBRAS_MODELS = ["llama-3.3-70b", "llama3.1-8b"];
+
+const MISTRAL_MODELS = ["mistral-small-latest", "open-mistral-nemo"];
+
+const OPENAI_MODELS = ["gpt-4o-mini"];
+
+// Per-model smart cooldown cache so rate-limited or retired models are skipped immediately
+const modelCooldownUntil = new Map<string, number>();
+
+function getCooldownKey(provider: string, model: string): string {
+  return `${provider}:${model}`;
+}
+
+function isModelCoolingDown(provider: string, model: string): boolean {
+  const until = modelCooldownUntil.get(getCooldownKey(provider, model));
+  if (!until) return false;
+  if (Date.now() >= until) {
+    modelCooldownUntil.delete(getCooldownKey(provider, model));
+    return false;
+  }
+  return true;
+}
+
+function markModelCooldown(provider: string, model: string, ms: number): void {
+  modelCooldownUntil.set(getCooldownKey(provider, model), Date.now() + ms);
+}
+
+function orderByCooldown<T>(
+  items: T[],
+  getKey: (item: T) => { provider: string; model: string }
+): T[] {
+  const now = Date.now();
+  const ready: T[] = [];
+  const cooling: Array<{ item: T; until: number }> = [];
+
+  for (const item of items) {
+    const { provider, model } = getKey(item);
+    const until = modelCooldownUntil.get(getCooldownKey(provider, model)) || 0;
+    if (until > now) {
+      cooling.push({ item, until });
+    } else {
+      ready.push(item);
+    }
+  }
+
+  cooling.sort((a, b) => a.until - b.until);
+  return [...ready, ...cooling.map((c) => c.item)];
+}
+
+function getCooldownMsForError(err: unknown, status?: number): number {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (
+    status === 404 ||
+    status === 410 ||
+    status === 422 ||
+    msg.includes("NOT_FOUND") ||
+    msg.includes("(404)") ||
+    msg.includes("(410)")
+  ) {
+    return 20 * 60 * 1000; // 20 min for unavailable/retired model
+  }
+  if (
+    status === 429 ||
+    msg.includes("429") ||
+    msg.includes("RESOURCE_EXHAUSTED") ||
+    msg.toLowerCase().includes("rate limit")
+  ) {
+    return 90 * 1000; // 90s for per-model rate limit
+  }
+  return 45 * 1000; // 45s for transient upstream failure
+}
+
+function stripThinkingTags(text: string): string {
+  return text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+}
 
 function isNonChatModelId(modelId: string): boolean {
   return /embed|rerank|nvclip|whisper|parakeet|riva|flux|stable-diffusion|ocr|parse|guard|safety|detector/i.test(
@@ -63,11 +189,44 @@ function hasNvidiaKey(): boolean {
   return Boolean(process.env.NVIDIA_API_KEY?.trim());
 }
 
+function hasGroqKey(): boolean {
+  return Boolean(process.env.GROQ_API_KEY?.trim());
+}
+
+function hasOpenRouterKey(): boolean {
+  return Boolean(process.env.OPENROUTER_API_KEY?.trim());
+}
+
+function hasCerebrasKey(): boolean {
+  return Boolean(process.env.CEREBRAS_API_KEY?.trim());
+}
+
+function hasMistralKey(): boolean {
+  return Boolean(process.env.MISTRAL_API_KEY?.trim());
+}
+
+function hasOpenAiKey(): boolean {
+  return Boolean(process.env.OPENAI_API_KEY?.trim());
+}
+
+function parseEnvModelList(raw?: string): string[] {
+  if (!raw?.trim()) return [];
+  return raw
+    .split(",")
+    .map((m) => m.trim())
+    .filter((m) => Boolean(m && !isNonChatModelId(m)));
+}
+
 function getNvidiaCandidateModels(speedMode: "fast" | "detailed" = "fast"): string[] {
+  const customList = parseEnvModelList(process.env.NVIDIA_MODELS);
   const envCustom =
     speedMode === "detailed"
-      ? [process.env.NVIDIA_MATH_MODEL?.trim(), process.env.NVIDIA_MODEL?.trim()]
-      : [process.env.NVIDIA_MODEL?.trim()];
+      ? [
+          process.env.NVIDIA_MATH_MODEL?.trim(),
+          process.env.NVIDIA_MODEL?.trim(),
+          ...customList,
+        ]
+      : [process.env.NVIDIA_MODEL?.trim(), ...customList];
 
   const validEnvModels = envCustom.filter(
     (m): m is string => Boolean(m && m.includes("/") && !isNonChatModelId(m))
@@ -81,6 +240,123 @@ function getNvidiaCandidateModels(speedMode: "fast" | "detailed" = "fast"): stri
 
 function getNvidiaModel(speedMode: "fast" | "detailed" = "fast"): string {
   return getNvidiaCandidateModels(speedMode)[0];
+}
+
+function getFallbackPoolCandidates(
+  speedMode: "fast" | "detailed" = "fast",
+  providerFilter?: FallbackProviderId
+): ModelCandidate[] {
+  const candidates: ModelCandidate[] = [];
+
+  const addProvider = (
+    provider: FallbackProviderId,
+    providerLabel: string,
+    apiUrl: string,
+    apiKey: string | undefined,
+    models: string[],
+    extraHeaders?: Record<string, string>
+  ) => {
+    if (providerFilter && providerFilter !== provider) return;
+    const key = apiKey?.trim();
+    if (!key) return;
+    for (const model of models) {
+      candidates.push({
+        provider,
+        providerLabel,
+        apiUrl,
+        apiKey: key,
+        model,
+        extraHeaders,
+      });
+    }
+  };
+
+  addProvider(
+    "nvidia",
+    "NVIDIA NIM",
+    NVIDIA_API_URL,
+    process.env.NVIDIA_API_KEY,
+    getNvidiaCandidateModels(speedMode)
+  );
+  addProvider(
+    "groq",
+    "Groq",
+    "https://api.groq.com/openai/v1/chat/completions",
+    process.env.GROQ_API_KEY,
+    [...parseEnvModelList(process.env.GROQ_MODELS), ...GROQ_MODELS]
+  );
+  addProvider(
+    "openrouter",
+    "OpenRouter",
+    "https://openrouter.ai/api/v1/chat/completions",
+    process.env.OPENROUTER_API_KEY,
+    [...parseEnvModelList(process.env.OPENROUTER_MODELS), ...OPENROUTER_MODELS],
+    {
+      "HTTP-Referer": process.env.APP_URL?.trim() || "https://study-assistant-0fvk.onrender.com",
+      "X-Title": "Jogi Jarvis",
+    }
+  );
+  addProvider(
+    "cerebras",
+    "Cerebras",
+    "https://api.cerebras.ai/v1/chat/completions",
+    process.env.CEREBRAS_API_KEY,
+    [...parseEnvModelList(process.env.CEREBRAS_MODELS), ...CEREBRAS_MODELS]
+  );
+  addProvider(
+    "mistral",
+    "Mistral",
+    "https://api.mistral.ai/v1/chat/completions",
+    process.env.MISTRAL_API_KEY,
+    [...parseEnvModelList(process.env.MISTRAL_MODELS), ...MISTRAL_MODELS]
+  );
+  addProvider(
+    "openai",
+    "OpenAI",
+    "https://api.openai.com/v1/chat/completions",
+    process.env.OPENAI_API_KEY,
+    [...parseEnvModelList(process.env.OPENAI_MODELS), ...OPENAI_MODELS]
+  );
+
+  // Deduplicate by provider+model
+  const unique = Array.from(
+    new Map(candidates.map((c) => [`${c.provider}:${c.model}`, c])).values()
+  );
+  return orderByCooldown(unique, (c) => ({ provider: c.provider, model: c.model }));
+}
+
+function hasAnyFallbackProvider(): boolean {
+  return (
+    hasNvidiaKey() ||
+    hasGroqKey() ||
+    hasOpenRouterKey() ||
+    hasCerebrasKey() ||
+    hasMistralKey() ||
+    hasOpenAiKey()
+  );
+}
+
+function getProviderSummary() {
+  const extraProviders: string[] = [];
+  if (hasNvidiaKey()) extraProviders.push("NVIDIA NIM");
+  if (hasGroqKey()) extraProviders.push("Groq");
+  if (hasOpenRouterKey()) extraProviders.push("OpenRouter");
+  if (hasCerebrasKey()) extraProviders.push("Cerebras");
+  if (hasMistralKey()) extraProviders.push("Mistral");
+  if (hasOpenAiKey()) extraProviders.push("OpenAI");
+
+  const geminiCount = hasGeminiKey() ? GEMINI_TEXT_MODELS.length : 0;
+  const fallbackCount = getFallbackPoolCandidates("fast").length;
+
+  return {
+    geminiConfigured: hasGeminiKey(),
+    nvidiaConfigured: hasNvidiaKey(),
+    fallbackPoolConfigured: hasAnyFallbackProvider(),
+    extraProviders,
+    totalActiveModels: geminiCount + fallbackCount,
+    nvidiaModel: getNvidiaModel("fast"),
+    nvidiaMathModel: getNvidiaModel("detailed"),
+  };
 }
 
 function getAiClient(): GoogleGenAI {
@@ -106,7 +382,7 @@ function getLiveAiClient(): GoogleGenAI {
 }
 
 function parseJsonFromText<T = Record<string, unknown>>(raw: string): T {
-  const cleaned = raw
+  const cleaned = stripThinkingTags(raw)
     .trim()
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```$/i, "")
@@ -123,15 +399,11 @@ function parseJsonFromText<T = Record<string, unknown>>(raw: string): T {
   }
 }
 
-function isUnavailableNvidiaModelStatus(status: number): boolean {
-  return status === 404 || status === 410 || status === 422;
-}
-
 function normalizePromptText(text: string): string {
   return text.replace(/[\u00A0\u2000-\u200B\u202F\u205F\u3000]/g, " ");
 }
 
-function formatNvidiaMessagesForModel(
+function formatOpenAiMessagesForModel(
   model: string,
   messages: Array<{ role: "system" | "user" | "assistant"; content: string }>
 ): Array<{ role: "system" | "user" | "assistant"; content: string }> {
@@ -141,7 +413,7 @@ function formatNvidiaMessagesForModel(
   }));
 
   // Gemma chat templates work most reliably when system instructions are folded into the first user turn
-  if (/^google\/gemma/i.test(model)) {
+  if (/gemma/i.test(model)) {
     const systemParts = cleaned
       .filter((m) => m.role === "system")
       .map((m) => m.content)
@@ -163,89 +435,93 @@ function formatNvidiaMessagesForModel(
   return cleaned;
 }
 
-function buildNvidiaRequestBody(
-  model: string,
+function buildOpenAiRequestBody(
+  candidate: ModelCandidate,
   messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
   speedMode: "fast" | "detailed",
   stream: boolean,
   options?: { temperature?: number; maxTokens?: number }
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
-    model,
-    messages: formatNvidiaMessagesForModel(model, messages),
+    model: candidate.model,
+    messages: formatOpenAiMessagesForModel(candidate.model, messages),
     temperature: options?.temperature ?? 0.35,
     max_tokens: options?.maxTokens ?? 4096,
     stream,
   };
 
-  // Prevent reasoning-capable Nemotron models from exhausting max_tokens in hidden thinking
-  if (speedMode === "fast" && /nemotron/i.test(model)) {
+  // Prevent reasoning-capable Nemotron models on NVIDIA NIM from exhausting max_tokens in hidden thinking
+  if (
+    candidate.provider === "nvidia" &&
+    speedMode === "fast" &&
+    /nemotron/i.test(candidate.model)
+  ) {
     body.chat_template_kwargs = { enable_thinking: false };
   }
 
   return body;
 }
 
-async function fetchSingleNvidiaModel(
-  model: string,
+async function fetchOpenAiCandidate(
+  candidate: ModelCandidate,
   body: Record<string, unknown>,
   acceptHeader?: string
 ): Promise<globalThis.Response> {
-  const apiKey = process.env.NVIDIA_API_KEY?.trim();
-  if (!apiKey) {
-    throw new Error(
-      "NVIDIA_API_KEY is missing. Add it in Settings > Secrets to use NVIDIA NIM."
-    );
-  }
-
-  return withRetry(async () => {
-    const res = await fetch(NVIDIA_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(acceptHeader ? { Accept: acceptHeader } : {}),
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(25000),
-    });
-
-    if (res.status === 429 || res.status >= 500) {
-      const errText = await res.text().catch(() => "");
-      throw new Error(
-        `NVIDIA NIM error (${res.status}): ${errText.slice(0, 240) || res.statusText}`
-      );
-    }
-    return res;
+  return fetch(candidate.apiUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(acceptHeader ? { Accept: acceptHeader } : {}),
+      Authorization: `Bearer ${candidate.apiKey}`,
+      ...(candidate.extraHeaders || {}),
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(22000),
   });
 }
 
-async function callNvidiaChat(
+async function callFallbackPoolChat(
   messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
   speedMode: "fast" | "detailed" = "fast",
-  options?: { temperature?: number; maxTokens?: number }
-): Promise<string> {
-  const candidates = getNvidiaCandidateModels(speedMode);
-  let lastError: Error | null = null;
+  options?: {
+    temperature?: number;
+    maxTokens?: number;
+    providerFilter?: FallbackProviderId;
+  }
+): Promise<{ text: string; provider: FallbackProviderId; model: string }> {
+  const candidates = getFallbackPoolCandidates(speedMode, options?.providerFilter);
+  if (candidates.length === 0) {
+    throw new Error(
+      "No fallback AI provider key is configured. Add NVIDIA_API_KEY (or GROQ_API_KEY / OPENROUTER_API_KEY) in Settings > Secrets."
+    );
+  }
 
-  for (const model of candidates) {
+  let lastError: Error | null = null;
+  const authFailedProviders = new Set<FallbackProviderId>();
+
+  for (const candidate of candidates) {
+    if (authFailedProviders.has(candidate.provider)) continue;
+
     try {
-      const response = await fetchSingleNvidiaModel(
-        model,
-        buildNvidiaRequestBody(model, messages, speedMode, false, options)
+      const response = await fetchOpenAiCandidate(
+        candidate,
+        buildOpenAiRequestBody(candidate, messages, speedMode, false, options)
       );
 
       if (!response.ok) {
         const errText = await response.text().catch(() => "");
         lastError = new Error(
-          `NVIDIA NIM error (${response.status}): ${errText.slice(0, 240) || response.statusText}`
+          `${candidate.providerLabel} (${candidate.model}) error (${response.status}): ${errText.slice(0, 220) || response.statusText}`
         );
         if (response.status === 401 || response.status === 403) {
-          throw lastError;
-        }
-        if (isUnavailableNvidiaModelStatus(response.status)) {
+          authFailedProviders.add(candidate.provider);
           continue;
         }
+        markModelCooldown(
+          candidate.provider,
+          candidate.model,
+          getCooldownMsForError(lastError, response.status)
+        );
         continue;
       }
 
@@ -254,54 +530,76 @@ async function callNvidiaChat(
           message?: { content?: string | null; reasoning_content?: string | null };
         }>;
       };
-      const text = (data.choices?.[0]?.message?.content || "").trim();
+      const text = stripThinkingTags(data.choices?.[0]?.message?.content || "");
       if (text) {
-        return text;
+        return { text, provider: candidate.provider, model: candidate.model };
       }
-      // Empty content (e.g., hidden thinking exhausted max_tokens) -> try next live model
-      lastError = new Error(`NVIDIA model ${model} returned an empty response.`);
+
+      markModelCooldown(candidate.provider, candidate.model, 45 * 1000);
+      lastError = new Error(
+        `${candidate.providerLabel} model ${candidate.model} returned an empty response.`
+      );
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
-      if (lastError.message.includes("(401)") || lastError.message.includes("(403)")) {
-        throw lastError;
-      }
+      markModelCooldown(
+        candidate.provider,
+        candidate.model,
+        getCooldownMsForError(lastError)
+      );
     }
   }
 
-  throw lastError || new Error("No NVIDIA NIM chat model returned an answer.");
+  throw lastError || new Error("No AI model in the fallback pool returned an answer.");
 }
 
-async function streamNvidiaChat(
+async function streamFallbackPoolChat(
   messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
   speedMode: "fast" | "detailed",
-  res: express.Response
+  res: express.Response,
+  providerFilter?: FallbackProviderId
 ): Promise<void> {
-  const candidates = getNvidiaCandidateModels(speedMode);
-  let lastError: Error | null = null;
+  const candidates = getFallbackPoolCandidates(speedMode, providerFilter);
+  if (candidates.length === 0) {
+    throw new Error(
+      "No fallback AI provider key is configured. Add NVIDIA_API_KEY (or GROQ_API_KEY / OPENROUTER_API_KEY) in Settings > Secrets."
+    );
+  }
 
-  for (const model of candidates) {
+  let lastError: Error | null = null;
+  const authFailedProviders = new Set<FallbackProviderId>();
+
+  for (const candidate of candidates) {
+    if (authFailedProviders.has(candidate.provider)) continue;
+
     let emittedAnyText = false;
     try {
-      const upstream = await fetchSingleNvidiaModel(
-        model,
-        buildNvidiaRequestBody(model, messages, speedMode, true),
+      const upstream = await fetchOpenAiCandidate(
+        candidate,
+        buildOpenAiRequestBody(candidate, messages, speedMode, true),
         "text/event-stream"
       );
 
       if (!upstream.ok || !upstream.body) {
         const errText = await upstream.text().catch(() => "");
         lastError = new Error(
-          `NVIDIA NIM error (${upstream.status}): ${errText.slice(0, 240) || upstream.statusText}`
+          `${candidate.providerLabel} (${candidate.model}) error (${upstream.status}): ${errText.slice(0, 220) || upstream.statusText}`
         );
         if (upstream.status === 401 || upstream.status === 403) {
-          throw lastError;
+          authFailedProviders.add(candidate.provider);
+          continue;
         }
+        markModelCooldown(
+          candidate.provider,
+          candidate.model,
+          getCooldownMsForError(lastError, upstream.status)
+        );
         continue;
       }
 
       const reader = upstream.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let insideThink = false;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -319,7 +617,23 @@ async function streamNvidiaChat(
             const parsed = JSON.parse(payloadStr) as {
               choices?: Array<{ delta?: { content?: string | null } }>;
             };
-            const delta = parsed.choices?.[0]?.delta?.content;
+            let delta = parsed.choices?.[0]?.delta?.content || "";
+            if (!delta) continue;
+
+            // Filter hidden <think>...</think> blocks from reasoning models while streaming
+            if (delta.includes("<think>")) {
+              insideThink = true;
+              delta = delta.split("<think>")[0] || "";
+            }
+            if (insideThink) {
+              if (delta.includes("</think>")) {
+                insideThink = false;
+                delta = delta.split("</think>").slice(1).join("");
+              } else {
+                delta = "";
+              }
+            }
+
             if (delta) {
               if (!emittedAnyText) {
                 emittedAnyText = true;
@@ -337,44 +651,145 @@ async function streamNvidiaChat(
       }
 
       if (emittedAnyText) {
-        res.write(`data: ${JSON.stringify({ done: true, sources: [] })}\n\n`);
+        res.write(
+          `data: ${JSON.stringify({
+            done: true,
+            sources: [],
+            provider: candidate.provider,
+            model: candidate.model,
+          })}\n\n`
+        );
         res.end();
         return;
       }
 
-      // Stream completed with zero visible text tokens -> try next candidate model
-      lastError = new Error(`NVIDIA model ${model} returned an empty stream.`);
+      markModelCooldown(candidate.provider, candidate.model, 45 * 1000);
+      lastError = new Error(
+        `${candidate.providerLabel} model ${candidate.model} returned an empty stream.`
+      );
     } catch (err) {
       if (emittedAnyText) {
         throw err;
       }
       lastError = err instanceof Error ? err : new Error(String(err));
-      if (lastError.message.includes("(401)") || lastError.message.includes("(403)")) {
-        throw lastError;
-      }
+      markModelCooldown(
+        candidate.provider,
+        candidate.model,
+        getCooldownMsForError(lastError)
+      );
     }
   }
 
-  throw lastError || new Error("No NVIDIA NIM chat model returned an answer.");
+  throw lastError || new Error("No AI model in the fallback pool returned an answer.");
 }
 
-async function callNvidiaJson<T>(
+async function callFallbackPoolJson<T>(
   systemInstruction: string,
   userPrompt: string,
   schemaDescription: string
 ): Promise<T> {
-  const content = await callNvidiaChat(
-    [
-      {
-        role: "system",
-        content: `${systemInstruction} Return ONLY valid JSON matching this schema with no markdown fences or commentary:\n${schemaDescription}`,
-      },
-      { role: "user", content: userPrompt },
-    ],
-    "fast",
-    { temperature: 0.2, maxTokens: 2048 }
-  );
-  return parseJsonFromText<T>(content);
+  const candidates = getFallbackPoolCandidates("fast");
+  if (candidates.length === 0) {
+    throw new Error(
+      "No fallback AI provider key is configured for structured generation."
+    );
+  }
+
+  let lastError: Error | null = null;
+  const authFailedProviders = new Set<FallbackProviderId>();
+  const messages = [
+    {
+      role: "system" as const,
+      content: `${systemInstruction} Return ONLY valid JSON matching this schema with no markdown fences or commentary:\n${schemaDescription}`,
+    },
+    { role: "user" as const, content: userPrompt },
+  ];
+
+  for (const candidate of candidates) {
+    if (authFailedProviders.has(candidate.provider)) continue;
+
+    try {
+      const response = await fetchOpenAiCandidate(
+        candidate,
+        buildOpenAiRequestBody(candidate, messages, "fast", false, {
+          temperature: 0.2,
+          maxTokens: 2048,
+        })
+      );
+
+      if (!response.ok) {
+        const errText = await response.text().catch(() => "");
+        lastError = new Error(
+          `${candidate.providerLabel} (${candidate.model}) error (${response.status}): ${errText.slice(0, 220) || response.statusText}`
+        );
+        if (response.status === 401 || response.status === 403) {
+          authFailedProviders.add(candidate.provider);
+          continue;
+        }
+        markModelCooldown(
+          candidate.provider,
+          candidate.model,
+          getCooldownMsForError(lastError, response.status)
+        );
+        continue;
+      }
+
+      const data = (await response.json()) as {
+        choices?: Array<{ message?: { content?: string | null } }>;
+      };
+      const rawContent = data.choices?.[0]?.message?.content || "";
+      if (!rawContent.trim()) {
+        markModelCooldown(candidate.provider, candidate.model, 45 * 1000);
+        continue;
+      }
+      return parseJsonFromText<T>(rawContent);
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      markModelCooldown(
+        candidate.provider,
+        candidate.model,
+        getCooldownMsForError(lastError)
+      );
+    }
+  }
+
+  throw lastError || new Error("No AI model returned valid structured JSON.");
+}
+
+async function generateGeminiTextWithFallback(
+  ai: GoogleGenAI,
+  contents: unknown,
+  buildConfig: (model: string) => Record<string, unknown>
+): Promise<{ response: Awaited<ReturnType<typeof ai.models.generateContent>>; model: string }> {
+  const orderedModels = orderByCooldown([...GEMINI_TEXT_MODELS], (model) => ({
+    provider: "gemini",
+    model,
+  }));
+
+  let lastErr: unknown = null;
+  for (const model of orderedModels) {
+    try {
+      const response = await withRetry(
+        () =>
+          ai.models.generateContent({
+            model,
+            contents: contents as never,
+            config: buildConfig(model),
+          }),
+        // Keep retries quick (2 attempts) so failover to next model is fast
+        2
+      );
+      if (response.text?.trim()) {
+        return { response, model };
+      }
+      lastErr = new Error(`Gemini model ${model} returned an empty response.`);
+    } catch (err) {
+      lastErr = err;
+      markModelCooldown("gemini", model, getCooldownMsForError(err));
+    }
+  }
+
+  throw lastErr || new Error("All Gemini models failed to respond.");
 }
 
 function isTransientError(err: unknown): boolean {
@@ -533,14 +948,9 @@ async function startServer() {
     res.json({ ok: true, name: "Jogi Jarvis" });
   });
 
-  // Configured server-side AI providers (booleans only, never exposes keys)
+  // Configured server-side AI providers & multi-model count (booleans/counts only, never exposes keys)
   app.get("/api/providers", (_req, res) => {
-    res.json({
-      geminiConfigured: hasGeminiKey(),
-      nvidiaConfigured: hasNvidiaKey(),
-      nvidiaModel: getNvidiaModel("fast"),
-      nvidiaMathModel: getNvidiaModel("detailed"),
-    });
+    res.json(getProviderSummary());
   });
 
   // 1. Conversational Ask & Study Tutor Endpoint (supports fast SSE streaming, Gemini + optional NVIDIA NIM fallback/routing)
@@ -626,20 +1036,27 @@ async function startServer() {
       })),
     ];
 
-    const respondWithNvidia = async () => {
-      const nvidiaMessages = buildNvidiaHistory();
+    const respondWithFallbackPool = async (providerFilter?: FallbackProviderId) => {
+      const poolMessages = buildNvidiaHistory();
       if (stream) {
-        await streamNvidiaChat(nvidiaMessages, safeSpeedMode, res);
+        await streamFallbackPoolChat(poolMessages, safeSpeedMode, res, providerFilter);
         return;
       }
-      const reply =
-        (await callNvidiaChat(nvidiaMessages, safeSpeedMode)) ||
-        "I heard you, but I could not form a response. Please try asking again.";
-      res.json({ reply, sources: [], provider: "nvidia" });
+      const result = await callFallbackPoolChat(poolMessages, safeSpeedMode, {
+        providerFilter,
+      });
+      res.json({
+        reply:
+          result.text ||
+          "I heard you, but I could not form a response. Please try asking again.",
+        sources: [],
+        provider: result.provider,
+        model: result.model,
+      });
     };
 
     try {
-      // Explicit NVIDIA NIM selection
+      // Explicit NVIDIA NIM selection (cascades across 12 NVIDIA NIM models)
       if (safeEngine === "nvidia") {
         if (!hasNvidiaKey()) {
           return res.status(400).json({
@@ -653,13 +1070,13 @@ async function startServer() {
               "Homework photo reading uses Gemini vision. Switch Engine to Auto or Gemini to analyze images.",
           });
         }
-        await respondWithNvidia();
+        await respondWithFallbackPool("nvidia");
         return;
       }
 
-      // Auto mode when Gemini key is absent but NVIDIA key is configured (text-only)
-      if (safeEngine === "auto" && !hasGeminiKey() && hasNvidiaKey() && !hasImage) {
-        await respondWithNvidia();
+      // Auto mode when Gemini key is absent but fallback providers are configured (text-only)
+      if (safeEngine === "auto" && !hasGeminiKey() && hasAnyFallbackProvider() && !hasImage) {
+        await respondWithFallbackPool();
         return;
       }
 
@@ -690,38 +1107,40 @@ async function startServer() {
       const thinkingLevel =
         safeSpeedMode === "detailed" ? ThinkingLevel.HIGH : ThinkingLevel.LOW;
 
-      const geminiModels: Array<{
-        name: string;
-        config: Record<string, unknown>;
-      }> = [
-        {
-          name: "gemini-4-hydrogen",
-          config: {
-            systemInstruction,
-            thinkingConfig: { thinkingLevel },
-            ...(effectiveUseSearch ? { tools: [{ googleSearch: {} }] } : {}),
+      const geminiModels = orderByCooldown(
+        [
+          {
+            name: "gemini-4-hydrogen",
+            config: {
+              systemInstruction,
+              thinkingConfig: { thinkingLevel },
+              ...(effectiveUseSearch ? { tools: [{ googleSearch: {} }] } : {}),
+            },
           },
-        },
-        {
-          name: "gemini-3.1-flash-lite",
-          config: {
-            systemInstruction,
-            ...(effectiveUseSearch ? { tools: [{ googleSearch: {} }] } : {}),
+          {
+            name: "gemini-3.1-flash-lite",
+            config: {
+              systemInstruction,
+              ...(effectiveUseSearch ? { tools: [{ googleSearch: {} }] } : {}),
+            },
           },
-        },
-      ];
+        ],
+        (c) => ({ provider: "gemini", model: c.name })
+      );
 
       if (stream) {
         let lastGeminiErr: unknown = null;
         for (const candidate of geminiModels) {
           let emittedAnyText = false;
           try {
-            const streamResponse = await withRetry(() =>
-              ai.models.generateContentStream({
-                model: candidate.name,
-                contents,
-                config: candidate.config,
-              })
+            const streamResponse = await withRetry(
+              () =>
+                ai.models.generateContentStream({
+                  model: candidate.name,
+                  contents,
+                  config: candidate.config,
+                }),
+              2
             );
 
             const allChunks: unknown[] = [];
@@ -746,11 +1165,17 @@ async function startServer() {
             if (emittedAnyText) {
               const uniqueSources = extractSources(allChunks);
               res.write(
-                `data: ${JSON.stringify({ done: true, sources: uniqueSources })}\n\n`
+                `data: ${JSON.stringify({
+                  done: true,
+                  sources: uniqueSources,
+                  provider: "gemini",
+                  model: candidate.name,
+                })}\n\n`
               );
               return res.end();
             }
 
+            markModelCooldown("gemini", candidate.name, 45 * 1000);
             lastGeminiErr = new Error(
               `Gemini model ${candidate.name} returned an empty stream.`
             );
@@ -758,12 +1183,17 @@ async function startServer() {
             if (emittedAnyText) {
               throw geminiErr;
             }
+            markModelCooldown(
+              "gemini",
+              candidate.name,
+              getCooldownMsForError(geminiErr)
+            );
             lastGeminiErr = geminiErr;
           }
         }
 
-        if (safeEngine === "auto" && hasNvidiaKey() && !hasImage) {
-          await respondWithNvidia();
+        if (safeEngine === "auto" && hasAnyFallbackProvider() && !hasImage) {
+          await respondWithFallbackPool();
           return;
         }
         throw lastGeminiErr || new Error("Gemini could not generate a response.");
@@ -772,12 +1202,14 @@ async function startServer() {
       let lastGeminiErr: unknown = null;
       for (const candidate of geminiModels) {
         try {
-          const response = await withRetry(() =>
-            ai.models.generateContent({
-              model: candidate.name,
-              contents,
-              config: candidate.config,
-            })
+          const response = await withRetry(
+            () =>
+              ai.models.generateContent({
+                model: candidate.name,
+                contents,
+                config: candidate.config,
+              }),
+            2
           );
 
           const reply = response.text?.trim() || "";
@@ -785,19 +1217,30 @@ async function startServer() {
             const uniqueSources = extractSources(
               response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? []
             );
-            return res.json({ reply, sources: uniqueSources, provider: "gemini" });
+            return res.json({
+              reply,
+              sources: uniqueSources,
+              provider: "gemini",
+              model: candidate.name,
+            });
           }
 
+          markModelCooldown("gemini", candidate.name, 45 * 1000);
           lastGeminiErr = new Error(
             `Gemini model ${candidate.name} returned an empty response.`
           );
         } catch (geminiErr) {
+          markModelCooldown(
+            "gemini",
+            candidate.name,
+            getCooldownMsForError(geminiErr)
+          );
           lastGeminiErr = geminiErr;
         }
       }
 
-      if (safeEngine === "auto" && hasNvidiaKey() && !hasImage) {
-        await respondWithNvidia();
+      if (safeEngine === "auto" && hasAnyFallbackProvider() && !hasImage) {
+        await respondWithFallbackPool();
         return;
       }
       throw lastGeminiErr || new Error("Gemini could not generate a response.");
@@ -857,43 +1300,46 @@ async function startServer() {
         langRule,
       ].join("\n");
 
-      const liveCandidates: Array<{
-        model: string;
-        config: Record<string, unknown>;
-      }> = [
-        {
-          model: "gemini-4-hydrogen",
-          config: {
-            systemInstruction: liveSystemInstruction,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            tools: [{ googleSearch: {} }],
+      const liveCandidates = orderByCooldown(
+        [
+          {
+            model: "gemini-4-hydrogen",
+            config: {
+              systemInstruction: liveSystemInstruction,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              tools: [{ googleSearch: {} }],
+            },
           },
-        },
-        {
-          model: "gemini-3.1-flash-lite",
-          config: {
-            systemInstruction: liveSystemInstruction,
-            tools: [{ googleSearch: {} }],
+          {
+            model: "gemini-3.1-flash-lite",
+            config: {
+              systemInstruction: liveSystemInstruction,
+              tools: [{ googleSearch: {} }],
+            },
           },
-        },
-      ];
+        ],
+        (c) => ({ provider: "gemini", model: c.model })
+      );
 
       let response: Awaited<ReturnType<typeof ai.models.generateContent>> | null =
         null;
       let lastErr: unknown = null;
       for (const candidate of liveCandidates) {
         try {
-          response = await withRetry(() =>
-            ai.models.generateContent({
-              model: candidate.model,
-              contents: userPrompt,
-              config: candidate.config,
-            })
+          response = await withRetry(
+            () =>
+              ai.models.generateContent({
+                model: candidate.model,
+                contents: userPrompt,
+                config: candidate.config,
+              }),
+            2
           );
           if (response.text?.trim()) {
             break;
           }
         } catch (err) {
+          markModelCooldown("gemini", candidate.model, getCooldownMsForError(err));
           lastErr = err;
         }
       }
@@ -1068,33 +1514,52 @@ async function startServer() {
           : `Calm, articulate, helpful personal assistant${langCue}${paceCue}`;
 
       const ai = getAiClient();
-      const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash-lite-tts",
-        contents: [
-          {
-            role: "user",
-            parts: [
+      const ttsModels = orderByCooldown(
+        ["gemini-3.8-flash-lite-tts", "gemini-3.8-flash-tts"],
+        (model) => ({ provider: "gemini-tts", model })
+      );
+
+      let audioBase64: string | undefined;
+      let lastTtsErr: unknown = null;
+
+      for (const ttsModel of ttsModels) {
+        try {
+          const response = await ai.models.generateContent({
+            model: ttsModel,
+            contents: [
               {
-                text: cleanText,
-                speechMetadata: { style },
+                role: "user",
+                parts: [
+                  {
+                    text: cleanText,
+                    speechMetadata: { style },
+                  },
+                ],
               },
             ],
-          },
-        ],
-        config: {
-          responseModalities: ["AUDIO"],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: safeVoice },
+            config: {
+              responseModalities: ["AUDIO"],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: safeVoice },
+                },
+              },
             },
-          },
-        },
-      });
-
-      const audioBase64 =
-        response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+          });
+          const data =
+            response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+          if (data) {
+            audioBase64 = data;
+            break;
+          }
+        } catch (err) {
+          markModelCooldown("gemini-tts", ttsModel, getCooldownMsForError(err));
+          lastTtsErr = err;
+        }
+      }
 
       if (!audioBase64) {
+        if (lastTtsErr) throw lastTtsErr;
         return res.status(502).json({ error: "Speech audio was not returned by Gemini." });
       }
 
@@ -1180,30 +1645,44 @@ async function startServer() {
         text: cleanInput ? `${taskPrompt}\n\nMaterial:\n${cleanInput}` : taskPrompt,
       });
 
-      const ai = getAiClient();
-      const candidates = ["gemini-4-hydrogen", "gemini-3.1-flash-lite"];
       let preparedText = "";
       let lastErr: unknown = null;
 
-      for (const model of candidates) {
+      if (hasGeminiKey()) {
         try {
-          const response = await withRetry(() =>
-            ai.models.generateContent({
-              model,
-              contents: [{ role: "user", parts }],
-              config: {
-                systemInstruction:
-                  "You are Jogi Jarvis, an expert multilingual reading coach and study teacher.",
-              },
+          const ai = getAiClient();
+          const { response } = await generateGeminiTextWithFallback(
+            ai,
+            [{ role: "user", parts }],
+            () => ({
+              systemInstruction:
+                "You are Jogi Jarvis, an expert multilingual reading coach and study teacher.",
             })
           );
-          if (response.text?.trim()) {
-            preparedText = response.text.trim();
-            break;
-          }
+          preparedText = response.text?.trim() || "";
         } catch (err) {
           lastErr = err;
         }
+      }
+
+      if (!preparedText && !imageBase64 && hasAnyFallbackProvider()) {
+        const fallback = await callFallbackPoolChat(
+          [
+            {
+              role: "system",
+              content:
+                "You are Jogi Jarvis, an expert multilingual reading coach and study teacher.",
+            },
+            {
+              role: "user",
+              content: cleanInput
+                ? `${taskPrompt}\n\nMaterial:\n${cleanInput}`
+                : taskPrompt,
+            },
+          ],
+          "fast"
+        );
+        preparedText = fallback.text;
       }
 
       if (!preparedText) {
@@ -1267,8 +1746,8 @@ async function startServer() {
       const noteJsonSchemaHint =
         '{"title":"string","subject":"string","summary":"string","keyPoints":["string"],"definitions":[{"term":"string","meaning":"string"}],"practiceQuestions":[{"question":"string","answer":"string"}],"teacherTip":"string"}';
 
-      if (!hasGeminiKey() && hasNvidiaKey()) {
-        const parsed = await callNvidiaJson(
+      if (!hasGeminiKey() && hasAnyFallbackProvider()) {
+        const parsed = await callFallbackPoolJson(
           noteSystemInstruction,
           prompt,
           noteJsonSchemaHint
@@ -1276,85 +1755,87 @@ async function startServer() {
         return res.json({ note: parsed });
       }
 
+      const noteResponseSchema = {
+        type: Type.OBJECT,
+        properties: {
+          title: {
+            type: Type.STRING,
+            description: "Concise, clear study note title (3 to 9 words).",
+          },
+          subject: {
+            type: Type.STRING,
+            description:
+              "Best matching subject name such as Mathematics, Science, English, History, Geography, Computer Science, Languages, or Personal.",
+          },
+          summary: {
+            type: Type.STRING,
+            description: "2 to 3 sentence Big Idea summary of the topic.",
+          },
+          keyPoints: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: "4 to 7 clear, self-contained bullet points.",
+          },
+          definitions: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                term: { type: Type.STRING },
+                meaning: { type: Type.STRING },
+              },
+              required: ["term", "meaning"],
+            },
+            description: "Important vocabulary terms, rules, or formulas.",
+          },
+          practiceQuestions: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                question: { type: Type.STRING },
+                answer: { type: Type.STRING },
+              },
+              required: ["question", "answer"],
+            },
+            description: "2 to 4 self-check questions with clear answers.",
+          },
+          teacherTip: {
+            type: Type.STRING,
+            description: "One practical, encouraging memory tip or study takeaway.",
+          },
+        },
+        required: [
+          "title",
+          "subject",
+          "summary",
+          "keyPoints",
+          "definitions",
+          "practiceQuestions",
+          "teacherTip",
+        ],
+      };
+
       try {
         const ai = getAiClient();
-        const response = await withRetry(() =>
-          ai.models.generateContent({
-            model: "gemini-4-hydrogen",
-            contents: prompt,
-            config: {
-              systemInstruction: noteSystemInstruction,
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-              responseMimeType: "application/json",
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  title: {
-                    type: Type.STRING,
-                    description: "Concise, clear study note title (3 to 9 words).",
-                  },
-                  subject: {
-                    type: Type.STRING,
-                    description:
-                      "Best matching subject name such as Mathematics, Science, English, History, Geography, Computer Science, Languages, or Personal.",
-                  },
-                  summary: {
-                    type: Type.STRING,
-                    description: "2 to 3 sentence Big Idea summary of the topic.",
-                  },
-                  keyPoints: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING },
-                    description: "4 to 7 clear, self-contained bullet points.",
-                  },
-                  definitions: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        term: { type: Type.STRING },
-                        meaning: { type: Type.STRING },
-                      },
-                      required: ["term", "meaning"],
-                    },
-                    description: "Important vocabulary terms, rules, or formulas.",
-                  },
-                  practiceQuestions: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        question: { type: Type.STRING },
-                        answer: { type: Type.STRING },
-                      },
-                      required: ["question", "answer"],
-                    },
-                    description: "2 to 4 self-check questions with clear answers.",
-                  },
-                  teacherTip: {
-                    type: Type.STRING,
-                    description: "One practical, encouraging memory tip or study takeaway.",
-                  },
-                },
-                required: [
-                  "title",
-                  "subject",
-                  "summary",
-                  "keyPoints",
-                  "definitions",
-                  "practiceQuestions",
-                  "teacherTip",
-                ],
-              },
-            },
+        const { response } = await generateGeminiTextWithFallback(
+          ai,
+          prompt,
+          (model) => ({
+            systemInstruction: noteSystemInstruction,
+            ...(model === "gemini-4-hydrogen"
+              ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+              : {}),
+            responseMimeType: "application/json",
+            responseSchema: noteResponseSchema,
           })
         );
 
-        const parsed = JSON.parse((response.text || "{}").trim());
+        const parsed = parseJsonFromText(response.text || "{}");
         return res.json({ note: parsed });
       } catch (geminiErr) {
-        if (hasNvidiaKey()) {
-          const parsed = await callNvidiaJson(
+        if (hasAnyFallbackProvider()) {
+          const parsed = await callFallbackPoolJson(
             noteSystemInstruction,
             prompt,
             noteJsonSchemaHint
@@ -1424,8 +1905,8 @@ async function startServer() {
       const summaryJsonSchemaHint =
         '{"title":"string","subject":"string","summary":"string","keyPoints":["string"],"definitions":[{"term":"string","meaning":"string"}],"practiceQuestions":[{"question":"string","answer":"string"}],"teacherTip":"string"}';
 
-      if (!hasGeminiKey() && hasNvidiaKey()) {
-        const parsed = await callNvidiaJson(
+      if (!hasGeminiKey() && hasAnyFallbackProvider()) {
+        const parsed = await callFallbackPoolJson(
           summarySystemInstruction,
           prompt,
           summaryJsonSchemaHint
@@ -1433,86 +1914,88 @@ async function startServer() {
         return res.json({ note: parsed });
       }
 
+      const summaryResponseSchema = {
+        type: Type.OBJECT,
+        properties: {
+          title: {
+            type: Type.STRING,
+            description:
+              "Concise title starting with 'Study Summary:' (e.g. 'Study Summary: Linear Equations & Slope').",
+          },
+          subject: {
+            type: Type.STRING,
+            description:
+              "Best matching subject name such as Mathematics, Science, English, History, Geography, Computer Science, Languages, or Personal.",
+          },
+          summary: {
+            type: Type.STRING,
+            description: "Concise 2 to 3 sentence synthesis of the entire session.",
+          },
+          keyPoints: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: "3 to 5 brief, high-signal bullet takeaways.",
+          },
+          definitions: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                term: { type: Type.STRING },
+                meaning: { type: Type.STRING },
+              },
+              required: ["term", "meaning"],
+            },
+            description: "Essential terms, rules, or formulas from the session.",
+          },
+          practiceQuestions: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                question: { type: Type.STRING },
+                answer: { type: Type.STRING },
+              },
+              required: ["question", "answer"],
+            },
+            description: "2 to 3 quick self-check revision questions.",
+          },
+          teacherTip: {
+            type: Type.STRING,
+            description: "One short sentence on what to remember or practice next.",
+          },
+        },
+        required: [
+          "title",
+          "subject",
+          "summary",
+          "keyPoints",
+          "definitions",
+          "practiceQuestions",
+          "teacherTip",
+        ],
+      };
+
       try {
         const ai = getAiClient();
-        const response = await withRetry(() =>
-          ai.models.generateContent({
-            model: "gemini-4-hydrogen",
-            contents: prompt,
-            config: {
-              systemInstruction: summarySystemInstruction,
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-              responseMimeType: "application/json",
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  title: {
-                    type: Type.STRING,
-                    description:
-                      "Concise title starting with 'Study Summary:' (e.g. 'Study Summary: Linear Equations & Slope').",
-                  },
-                  subject: {
-                    type: Type.STRING,
-                    description:
-                      "Best matching subject name such as Mathematics, Science, English, History, Geography, Computer Science, Languages, or Personal.",
-                  },
-                  summary: {
-                    type: Type.STRING,
-                    description: "Concise 2 to 3 sentence synthesis of the entire session.",
-                  },
-                  keyPoints: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING },
-                    description: "3 to 5 brief, high-signal bullet takeaways.",
-                  },
-                  definitions: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        term: { type: Type.STRING },
-                        meaning: { type: Type.STRING },
-                      },
-                      required: ["term", "meaning"],
-                    },
-                    description: "Essential terms, rules, or formulas from the session.",
-                  },
-                  practiceQuestions: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        question: { type: Type.STRING },
-                        answer: { type: Type.STRING },
-                      },
-                      required: ["question", "answer"],
-                    },
-                    description: "2 to 3 quick self-check revision questions.",
-                  },
-                  teacherTip: {
-                    type: Type.STRING,
-                    description: "One short sentence on what to remember or practice next.",
-                  },
-                },
-                required: [
-                  "title",
-                  "subject",
-                  "summary",
-                  "keyPoints",
-                  "definitions",
-                  "practiceQuestions",
-                  "teacherTip",
-                ],
-              },
-            },
+        const { response } = await generateGeminiTextWithFallback(
+          ai,
+          prompt,
+          (model) => ({
+            systemInstruction: summarySystemInstruction,
+            ...(model === "gemini-4-hydrogen"
+              ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+              : {}),
+            responseMimeType: "application/json",
+            responseSchema: summaryResponseSchema,
           })
         );
 
-        const parsed = JSON.parse((response.text || "{}").trim());
+        const parsed = parseJsonFromText(response.text || "{}");
         return res.json({ note: parsed });
       } catch (geminiErr) {
-        if (hasNvidiaKey()) {
-          const parsed = await callNvidiaJson(
+        if (hasAnyFallbackProvider()) {
+          const parsed = await callFallbackPoolJson(
             summarySystemInstruction,
             prompt,
             summaryJsonSchemaHint
@@ -1562,8 +2045,8 @@ async function startServer() {
       const translateJsonSchemaHint =
         '{"title":"string","subject":"string","summary":"string","keyPoints":["string"],"definitions":[{"term":"string","meaning":"string"}],"practiceQuestions":[{"question":"string","answer":"string"}],"teacherTip":"string"}';
 
-      if (!hasGeminiKey() && hasNvidiaKey()) {
-        const translated = await callNvidiaJson(
+      if (!hasGeminiKey() && hasAnyFallbackProvider()) {
+        const translated = await callFallbackPoolJson(
           translateSystemInstruction,
           prompt,
           translateJsonSchemaHint
@@ -1571,69 +2054,71 @@ async function startServer() {
         return res.json({ note: translated });
       }
 
+      const translateResponseSchema = {
+        type: Type.OBJECT,
+        properties: {
+          title: { type: Type.STRING },
+          subject: { type: Type.STRING },
+          summary: { type: Type.STRING },
+          keyPoints: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+          },
+          definitions: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                term: { type: Type.STRING },
+                meaning: { type: Type.STRING },
+              },
+              required: ["term", "meaning"],
+            },
+          },
+          practiceQuestions: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                question: { type: Type.STRING },
+                answer: { type: Type.STRING },
+              },
+              required: ["question", "answer"],
+            },
+          },
+          teacherTip: { type: Type.STRING },
+        },
+        required: [
+          "title",
+          "subject",
+          "summary",
+          "keyPoints",
+          "definitions",
+          "practiceQuestions",
+          "teacherTip",
+        ],
+      };
+
       try {
         const ai = getAiClient();
-        const response = await withRetry(() =>
-          ai.models.generateContent({
-            model: "gemini-4-hydrogen",
-            contents: prompt,
-            config: {
-              systemInstruction: translateSystemInstruction,
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-              responseMimeType: "application/json",
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  title: { type: Type.STRING },
-                  subject: { type: Type.STRING },
-                  summary: { type: Type.STRING },
-                  keyPoints: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING },
-                  },
-                  definitions: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        term: { type: Type.STRING },
-                        meaning: { type: Type.STRING },
-                      },
-                      required: ["term", "meaning"],
-                    },
-                  },
-                  practiceQuestions: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        question: { type: Type.STRING },
-                        answer: { type: Type.STRING },
-                      },
-                      required: ["question", "answer"],
-                    },
-                  },
-                  teacherTip: { type: Type.STRING },
-                },
-                required: [
-                  "title",
-                  "subject",
-                  "summary",
-                  "keyPoints",
-                  "definitions",
-                  "practiceQuestions",
-                  "teacherTip",
-                ],
-              },
-            },
+        const { response } = await generateGeminiTextWithFallback(
+          ai,
+          prompt,
+          (model) => ({
+            systemInstruction: translateSystemInstruction,
+            ...(model === "gemini-4-hydrogen"
+              ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+              : {}),
+            responseMimeType: "application/json",
+            responseSchema: translateResponseSchema,
           })
         );
 
-        const translated = JSON.parse((response.text || "{}").trim());
+        const translated = parseJsonFromText(response.text || "{}");
         return res.json({ note: translated });
       } catch (geminiErr) {
-        if (hasNvidiaKey()) {
-          const translated = await callNvidiaJson(
+        if (hasAnyFallbackProvider()) {
+          const translated = await callFallbackPoolJson(
             translateSystemInstruction,
             prompt,
             translateJsonSchemaHint
@@ -1680,8 +2165,8 @@ async function startServer() {
       const quizSchemaHint =
         '{"isCorrect":true,"feedback":"1 to 2 warm encouraging sentences","hint":"Optional short next-step tip"}';
 
-      if (!hasGeminiKey() && hasNvidiaKey()) {
-        const result = await callNvidiaJson(
+      if (!hasGeminiKey() && hasAnyFallbackProvider()) {
+        const result = await callFallbackPoolJson(
           quizSystemInstruction,
           quizPrompt,
           quizSchemaHint
@@ -1689,38 +2174,38 @@ async function startServer() {
         return res.json(result);
       }
 
+      const quizResponseSchema = {
+        type: Type.OBJECT,
+        properties: {
+          isCorrect: { type: Type.BOOLEAN },
+          feedback: {
+            type: Type.STRING,
+            description: "1 to 2 warm, encouraging sentences explaining what was right or what to refine.",
+          },
+          hint: {
+            type: Type.STRING,
+            description: "Optional short next-step tip or memory cue.",
+          },
+        },
+        required: ["isCorrect", "feedback"],
+      };
+
       try {
         const ai = getAiClient();
-        const response = await withRetry(() =>
-          ai.models.generateContent({
-            model: "gemini-4-hydrogen",
-            contents: quizPrompt,
-            config: {
-              responseMimeType: "application/json",
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  isCorrect: { type: Type.BOOLEAN },
-                  feedback: {
-                    type: Type.STRING,
-                    description: "1 to 2 warm, encouraging sentences explaining what was right or what to refine.",
-                  },
-                  hint: {
-                    type: Type.STRING,
-                    description: "Optional short next-step tip or memory cue.",
-                  },
-                },
-                required: ["isCorrect", "feedback"],
-              },
-            },
+        const { response } = await generateGeminiTextWithFallback(
+          ai,
+          quizPrompt,
+          () => ({
+            responseMimeType: "application/json",
+            responseSchema: quizResponseSchema,
           })
         );
 
-        const result = JSON.parse((response.text || "{}").trim());
+        const result = parseJsonFromText(response.text || "{}");
         return res.json(result);
       } catch (geminiErr) {
-        if (hasNvidiaKey()) {
-          const result = await callNvidiaJson(
+        if (hasAnyFallbackProvider()) {
+          const result = await callFallbackPoolJson(
             quizSystemInstruction,
             quizPrompt,
             quizSchemaHint

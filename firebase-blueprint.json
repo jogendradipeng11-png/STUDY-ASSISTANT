@@ -1,0 +1,354 @@
+{
+  "entities": {
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "Private family account root document owned by a single authenticated Google user.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID matching the document ID."
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "User display name shown in the Cloud Sync badge."
+        },
+        "photoURL": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Optional profile avatar URL from Google Auth."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the cloud workspace was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the latest account update."
+        }
+      },
+      "required": ["uid", "displayName", "createdAt", "updatedAt"]
+    },
+    "FamilyProfile": {
+      "title": "FamilyProfile",
+      "description": "Individual family member profile (parent assistant or student AI teacher profile).",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner UID matching parent user document."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique profile identifier matching document ID."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Family member display name."
+        },
+        "relation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "description": "Relation label (e.g., Father, Son, Daughter)."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["parent", "student"],
+          "description": "Mode of Jogi Jarvis for this family member."
+        },
+        "grade": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "Optional school grade or class level."
+        },
+        "learningGoal": {
+          "type": "string",
+          "maxLength": 300,
+          "description": "Optional study goal for this member."
+        },
+        "voiceName": {
+          "type": "string",
+          "enum": ["Zephyr", "Kore", "Puck", "Charon", "Fenrir"],
+          "description": "Preferred Gemini TTS/Live voice."
+        },
+        "preferredLanguage": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "Preferred spoken/written language."
+        },
+        "avatarUrl": {
+          "type": "string",
+          "maxLength": 180000,
+          "description": "Optional compressed 256x256 JPEG avatar data URL."
+        },
+        "initials": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4,
+          "description": "1 to 4 character monogram initials."
+        },
+        "accentColor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "Hex color for avatar badge."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of latest update."
+        }
+      },
+      "required": [
+        "ownerId",
+        "id",
+        "name",
+        "relation",
+        "role",
+        "voiceName",
+        "initials",
+        "accentColor",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "StudyNote": {
+      "title": "StudyNote",
+      "description": "Structured AI study note saved for long-term revision across devices.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner UID."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Note document ID."
+        },
+        "profileId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Associated family member profile ID."
+        },
+        "profileName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Associated family member display name."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Study note title."
+        },
+        "subject": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Subject category."
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 4000,
+          "description": "Big Idea summary."
+        },
+        "keyPoints": {
+          "type": "array",
+          "description": "Bounded list of up to 30 key revision takeaways."
+        },
+        "definitions": {
+          "type": "array",
+          "description": "Bounded list of up to 30 term/meaning definitions."
+        },
+        "practiceQuestions": {
+          "type": "array",
+          "description": "Bounded list of up to 20 self-test practice Q&A items."
+        },
+        "teacherTip": {
+          "type": "string",
+          "maxLength": 1000,
+          "description": "Encouraging teacher memory tip."
+        },
+        "sourceMode": {
+          "type": "string",
+          "enum": ["chat", "voice", "topic"],
+          "description": "How the note was generated."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of latest update."
+        }
+      },
+      "required": [
+        "ownerId",
+        "id",
+        "profileId",
+        "profileName",
+        "title",
+        "subject",
+        "summary",
+        "keyPoints",
+        "definitions",
+        "practiceQuestions",
+        "teacherTip",
+        "sourceMode",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ChatThread": {
+      "title": "ChatThread",
+      "description": "Synced conversation history for a single family profile (bounded to latest 40 text messages).",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner UID."
+        },
+        "profileId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Family profile ID matching document ID."
+        },
+        "messages": {
+          "type": "array",
+          "description": "Bounded array of up to 40 sanitized text chat messages."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of latest update."
+        }
+      },
+      "required": ["ownerId", "profileId", "messages", "createdAt", "updatedAt"]
+    },
+    "FamilyAlarm": {
+      "title": "FamilyAlarm",
+      "description": "Synced live alarm or countdown timer across phone, laptop, and watch.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner UID."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Alarm document ID."
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Alarm or timer label."
+        },
+        "triggerAt": {
+          "type": "number",
+          "description": "Epoch timestamp in milliseconds when the alarm rings."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["alarm", "timer"],
+          "description": "Alarm or countdown timer."
+        },
+        "ringing": {
+          "type": "boolean",
+          "description": "Whether the alarm is currently ringing."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of latest update."
+        }
+      },
+      "required": [
+        "ownerId",
+        "id",
+        "label",
+        "triggerAt",
+        "type",
+        "ringing",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserAccount" },
+      "description": "Root account document for a signed-in Google user."
+    },
+    "/users/{userId}/profiles/{profileId}": {
+      "schema": { "$ref": "#/entities/FamilyProfile" },
+      "description": "Family member profiles owned by the user."
+    },
+    "/users/{userId}/notes/{noteId}": {
+      "schema": { "$ref": "#/entities/StudyNote" },
+      "description": "Saved AI Study Notes owned by the user."
+    },
+    "/users/{userId}/chats/{profileId}": {
+      "schema": { "$ref": "#/entities/ChatThread" },
+      "description": "Per-profile synced chat history (latest 40 text messages)."
+    },
+    "/users/{userId}/alarms/{alarmId}": {
+      "schema": { "$ref": "#/entities/FamilyAlarm" },
+      "description": "Live alarms and countdown timers synced across devices."
+    }
+  }
+}
