@@ -1,4 +1,4 @@
-import { Menu, Mic } from "lucide-react";
+import { BookOpen, Menu, Mic, Watch } from "lucide-react";
 import type { AppTab } from "../types";
 import { PWAInstallButton } from "./PWAInstallButton";
 
@@ -6,12 +6,14 @@ interface TopBarProps {
   activeTab: AppTab;
   onSelectTab: (tab: AppTab) => void;
   onStartQuickVoice: () => void;
+  onOpenWatchMode: () => void;
   onToggleMobileMenu: () => void;
 }
 
 const NAV_ITEMS: Array<{ id: AppTab; label: string }> = [
   { id: "assistant", label: "Assistant" },
   { id: "live", label: "Live Voice" },
+  { id: "read", label: "Read" },
   { id: "notes", label: "Study Notes" },
   { id: "family", label: "Family" },
 ];
@@ -20,10 +22,11 @@ export function TopBar({
   activeTab,
   onSelectTab,
   onStartQuickVoice,
+  onOpenWatchMode,
   onToggleMobileMenu,
 }: TopBarProps) {
   return (
-    <header className="no-print sticky top-0 z-30 h-16 bg-white/95 backdrop-blur-sm border-b border-slate-200 px-4 sm:px-6 flex items-center justify-between gap-4 sm:gap-8">
+    <header className="no-print sticky top-0 z-30 h-16 bg-white/95 backdrop-blur-sm border-b border-slate-200 px-4 sm:px-6 flex items-center justify-between gap-3 sm:gap-6">
       {/* Zone 1: Brand wordmark (single text element) */}
       <div className="flex items-center gap-3 shrink-0">
         <button
@@ -43,10 +46,10 @@ export function TopBar({
         </button>
       </div>
 
-      {/* Zone 2: 4 clean single-line navigation links */}
+      {/* Zone 2: Clean single-line navigation links */}
       <nav
         aria-label="Primary navigation"
-        className="hidden md:flex items-center gap-7 text-sm font-medium"
+        className="hidden md:flex items-center gap-6 text-sm font-medium"
       >
         {NAV_ITEMS.map((item) => {
           const isActive = activeTab === item.id;
@@ -70,13 +73,35 @@ export function TopBar({
         })}
       </nav>
 
-      {/* Zone 3: Install App + primary Talk Now action */}
+      {/* Zone 3: Mobile Read shortcut, Watch Mode, Install App & primary Talk Now action */}
       <div className="flex items-center gap-2 shrink-0">
+        <button
+          type="button"
+          onClick={() => onSelectTab("read")}
+          title="Open Read Aloud Studio (any language)"
+          className={`md:hidden inline-flex items-center gap-1.5 px-2.5 py-2 text-xs font-semibold rounded-lg border transition-colors whitespace-nowrap shrink-0 min-h-[40px] ${
+            activeTab === "read"
+              ? "bg-blue-50 border-blue-300 text-blue-800"
+              : "bg-white border-slate-200 text-slate-700 hover:bg-slate-50"
+          }`}
+        >
+          <BookOpen className="h-4 w-4 text-blue-700 shrink-0" />
+          <span>Read</span>
+        </button>
+        <button
+          type="button"
+          onClick={onOpenWatchMode}
+          title="Open Android Watch (Wear OS) live voice mode"
+          className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-2 text-xs sm:text-sm font-semibold text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0 min-h-[40px] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
+        >
+          <Watch className="h-4 w-4 text-blue-700 shrink-0" />
+          <span className="hidden sm:inline">Watch</span>
+        </button>
         <PWAInstallButton />
         <button
           type="button"
           onClick={onStartQuickVoice}
-          className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors whitespace-nowrap shrink-0 min-h-[40px] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
+          className="inline-flex items-center gap-2 px-3.5 sm:px-4 py-2 text-xs sm:text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors whitespace-nowrap shrink-0 min-h-[40px] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
         >
           <Mic className="h-4 w-4" />
           <span>Talk Now</span>

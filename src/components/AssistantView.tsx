@@ -2,37 +2,69 @@ import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
+  AlarmClock,
   BookMarked,
+  BookOpen,
+  Calendar,
   Check,
+  CloudSun,
   Copy,
   Cpu,
+  Download,
   ExternalLink,
+  FileCode2,
   FileText,
   Globe,
   ImagePlus,
   Loader2,
+  Mail,
+  MapPin,
+  MessageSquare,
   Mic,
+  Newspaper,
+  Phone,
+  Play,
   Send,
   Square,
+  Timer,
   Trash2,
+  Trophy,
   Volume2,
   VolumeX,
   X,
   Zap,
 } from "lucide-react";
-import type { ChatMessage, FamilyProfile, StudyNote } from "../types";
+import type {
+  ActiveAlarm,
+  ChatMessage,
+  FamilyProfile,
+  MobileActionKind,
+  StudyNote,
+} from "../types";
 import { STARTER_PROMPTS } from "../data/defaults";
 import { blobToBase64 } from "../utils/audio";
+import {
+  downloadGeneratedScript,
+  formatAlarmTime,
+  parseMobileActions,
+  triggerMobileAction,
+  type AppCommand,
+} from "../utils/mobileActions";
 import { formatShortDate } from "../utils/storage";
 import {
   generateStudySummaryFromSession,
   isLongStudySession,
 } from "../utils/studySummary";
 import { LanguagePicker } from "./LanguagePicker";
+import {
+  MobileTaskModal,
+  type MobileTaskModalMode,
+} from "./MobileTaskModal";
 import { ProfileAvatar } from "./ProfileAvatar";
 
 interface AssistantViewProps {
   profile: FamilyProfile;
+  profiles: FamilyProfile[];
   subject: string;
   messages: ChatMessage[];
   autoNoteEnabled: boolean;
@@ -41,10 +73,42 @@ interface AssistantViewProps {
   onSaveNote: (note: StudyNote) => void;
   onOpenNote: (noteId: string) => void;
   onOpenLiveVoice: () => void;
+  onAddAlarm: (alarm: Omit<ActiveAlarm, "id" | "ringing">) => void;
+  onExecuteAppCommand: (
+    cmd: AppCommand,
+    lastAssistantReply?: string
+  ) => string;
+  onOpenInReader: (text: string, language?: string) => void;
+}
+
+function getActionIcon(kind: MobileActionKind) {
+  switch (kind) {
+    case "youtube":
+      return <Play className="h-4 w-4 text-red-600 shrink-0" />;
+    case "whatsapp":
+      return <MessageSquare className="h-4 w-4 text-emerald-600 shrink-0" />;
+    case "sms":
+      return <MessageSquare className="h-4 w-4 text-blue-700 shrink-0" />;
+    case "call":
+      return <Phone className="h-4 w-4 text-emerald-700 shrink-0" />;
+    case "email":
+      return <Mail className="h-4 w-4 text-blue-700 shrink-0" />;
+    case "maps":
+      return <MapPin className="h-4 w-4 text-red-600 shrink-0" />;
+    case "calendar":
+      return <Calendar className="h-4 w-4 text-blue-700 shrink-0" />;
+    case "alarm":
+      return <AlarmClock className="h-4 w-4 text-amber-600 shrink-0" />;
+    case "timer":
+      return <Timer className="h-4 w-4 text-amber-600 shrink-0" />;
+    default:
+      return <ExternalLink className="h-4 w-4 text-slate-600 shrink-0" />;
+  }
 }
 
 export function AssistantView({
   profile,
+  profiles,
   subject,
   messages,
   autoNoteEnabled,
@@ -53,6 +117,9 @@ export function AssistantView({
   onSaveNote,
   onOpenNote,
   onOpenLiveVoice,
+  onAddAlarm,
+  onExecuteAppCommand,
+  onOpenInReader,
 }: AssistantViewProps) {
   const activeLanguage = profile.preferredLanguage || "Auto-Detect";
   const [input, setInput] = useState("");
@@ -60,8 +127,9 @@ export function AssistantView({
   const [speedMode, setSpeedMode] = useState<"fast" | "detailed">("fast");
   const [engine, setEngine] = useState<"auto" | "gemini" | "nvidia">("auto");
   const [nvidiaAvailable, setNvidiaAvailable] = useState(false);
-  const [useSearch, setUseSearch] = useState(profile.role === "parent");
+  const [useSearch, setUseSearch] = useState(true);
   const [autoSpeak, setAutoSpeak] = useState(false);
+  const [autoRunActions, setAutoRunActions] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   // Voice dictation state
@@ -92,12 +160,13 @@ export function AssistantView({
   const [toast, setToast] = useState<{ message: string; noteId?: string } | null>(
     null
   );
+  const [taskModalMode, setTaskModalMode] =
+    useState<MobileTaskModalMode | null>(null);
 
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
-    setUseSearch(profile.role === "parent");
     setErrorMsg(null);
   }, [profile.id, profile.role]);
 
@@ -265,11 +334,61 @@ export function AssistantView({
     }
   };
 
-  const handleSend = async (overrideText?: string) => {
+  const handleSend = async (overrideText?: string, forceLiveSearch = false) => {
     const promptText = (overrideText ?? input).trim();
     if ((!promptText && !attachedImage) || isSending) return;
 
     setErrorMsg(null);
+    const parsedMobile = parseMobileActions(promptText, profiles);
+    const lastAssistantReply = [...messages]
+      .reverse()
+      .find((m) => m.role === "assistant")?.content;
+
+    const autoFeedbackLines: string[] = [];
+
+    // 1. Live in-app alarm / countdown timer
+    if (parsedMobile.autoAlarm) {
+      if (
+        typeof Notification !== "undefined" &&
+        Notification.permission === "default"
+      ) {
+        void Notification.requestPermission().catch(() => {});
+      }
+      onAddAlarm(parsedMobile.autoAlarm);
+      const alarmMsg =
+        parsedMobile.autoAlarm.type === "timer"
+          ? `Started live timer: **${parsedMobile.autoAlarm.label}**.`
+          : `Set live alarm for **${formatAlarmTime(parsedMobile.autoAlarm.triggerAt)}** (${parsedMobile.autoAlarm.label}).`;
+      autoFeedbackLines.push(alarmMsg);
+      showToast(alarmMsg.replace(/\*\*/g, ""));
+    }
+
+    // 2. Automatic in-app navigation / profile switch / Read Studio command
+    if (autoRunActions && parsedMobile.appCommand) {
+      const navConfirm = onExecuteAppCommand(
+        parsedMobile.appCommand,
+        lastAssistantReply
+      );
+      autoFeedbackLines.push(navConfirm);
+      setInput("");
+      if (parsedMobile.isDirectCommandOnly) {
+        return;
+      }
+    }
+
+    // 3. Automatic external mobile app / task launch (YouTube, WhatsApp, SMS, Call, Maps, Android Clock)
+    if (autoRunActions && parsedMobile.actions.length > 0 && !attachedImage) {
+      const primary = parsedMobile.actions[0];
+      // For pure alarms/timers we already started the live in-app alarm, so only auto-open external apps for non-alarm tasks or explicit external launches
+      if (primary.kind !== "alarm" && primary.kind !== "timer") {
+        triggerMobileAction(primary);
+        autoFeedbackLines.push(
+          `Automatically opening **${primary.label}** for you.`
+        );
+        showToast(`Opening ${primary.label}...`);
+      }
+    }
+
     const userMsg: ChatMessage = {
       id: `u-${Date.now()}`,
       role: "user",
@@ -287,6 +406,34 @@ export function AssistantView({
     onUpdateMessages(profile.id, nextMessages);
     setInput("");
     setAttachedImage(null);
+
+    // For direct mobile/navigation commands (e.g. "open YouTube", "set alarm for 6:30 AM"), respond instantaneously without waiting for an LLM round-trip
+    if (
+      autoRunActions &&
+      parsedMobile.isDirectCommandOnly &&
+      !attachedImage &&
+      autoFeedbackLines.length > 0
+    ) {
+      const instantReply: ChatMessage = {
+        id: `a-${Date.now()}`,
+        role: "assistant",
+        content:
+          autoFeedbackLines.join(" ") +
+          (parsedMobile.actions.length > 0
+            ? "\n\nIf your mobile browser paused the automatic redirect, tap the shortcut below to continue."
+            : ""),
+        timestamp: new Date().toISOString(),
+        subject: profile.role === "student" ? subject : undefined,
+        actions:
+          parsedMobile.actions.length > 0 ? parsedMobile.actions : undefined,
+      };
+      onUpdateMessages(profile.id, [...nextMessages, instantReply]);
+      if (autoSpeak) {
+        void speakText(instantReply.id, autoFeedbackLines.join(" "));
+      }
+      return;
+    }
+
     setIsSending(true);
 
     try {
@@ -302,7 +449,7 @@ export function AssistantView({
           })),
           profile,
           subject: profile.role === "student" ? subject : undefined,
-          useSearch,
+          useSearch: forceLiveSearch || useSearch,
           language: activeLanguage,
           speedMode,
           engine,
@@ -386,6 +533,8 @@ export function AssistantView({
         timestamp: new Date().toISOString(),
         subject: profile.role === "student" ? subject : undefined,
         sources,
+        actions:
+          parsedMobile.actions.length > 0 ? parsedMobile.actions : undefined,
       };
 
       const updatedMessages = [...nextMessages, assistantMsg];
@@ -510,10 +659,19 @@ export function AssistantView({
             throw new Error(data.error || "Could not transcribe voice audio.");
           }
           if (data.transcript) {
-            setInput((prev) =>
-              prev ? `${prev} ${data.transcript}` : data.transcript
-            );
-            textareaRef.current?.focus();
+            const spoken = String(data.transcript).trim();
+            const parsedSpoken = parseMobileActions(spoken, profiles);
+            if (
+              autoRunActions &&
+              (parsedSpoken.appCommand ||
+                parsedSpoken.autoAlarm ||
+                parsedSpoken.actions.length > 0)
+            ) {
+              void handleSend(spoken);
+            } else {
+              setInput((prev) => (prev ? `${prev} ${spoken}` : spoken));
+              textareaRef.current?.focus();
+            }
           }
         } catch (err) {
           setErrorMsg(
@@ -673,6 +831,7 @@ export function AssistantView({
           <button
             type="button"
             onClick={() => setUseSearch((v) => !v)}
+            title="Real-time Google Search access for live news, sports scores, weather, and current facts"
             className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border transition-colors whitespace-nowrap shrink-0 ${
               useSearch
                 ? "bg-blue-50 border-blue-200 text-blue-800"
@@ -680,7 +839,21 @@ export function AssistantView({
             }`}
           >
             <Globe className="h-3.5 w-3.5" />
-            <span>{useSearch ? "Web Search On" : "Web Search Off"}</span>
+            <span>{useSearch ? "Live Data On" : "Live Data Off"}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setAutoRunActions((v) => !v)}
+            title="Automatically navigate and launch tasks (YouTube, WhatsApp, SMS, Calls, Alarms, Read Tab) as soon as you ask"
+            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border transition-colors whitespace-nowrap shrink-0 ${
+              autoRunActions
+                ? "bg-emerald-50 border-emerald-200 text-emerald-800"
+                : "bg-white border-slate-200 text-slate-600 hover:text-slate-900"
+            }`}
+          >
+            <Zap className="h-3.5 w-3.5" />
+            <span>{autoRunActions ? "Auto-Run On" : "Auto-Run Off"}</span>
           </button>
 
           <button
@@ -841,6 +1014,141 @@ export function AssistantView({
                 </button>
               </div>
 
+              {/* Live Real-Time Data Quick Access */}
+              <div className="pt-6 border-t border-slate-200 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-xs font-semibold text-slate-500">
+                    Live Data · Real-time News, Sports &amp; Updates
+                  </h3>
+                  <span className="text-[11px] font-medium text-blue-700">
+                    Google Search Grounded
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void handleSend(
+                        "What are today's top breaking news headlines in India and around the world? Give a crisp summary.",
+                        true
+                      )
+                    }
+                    className="flex items-center gap-2 p-3 rounded-xl bg-white border border-slate-200 hover:border-blue-300 hover:bg-blue-50/30 transition-colors text-left"
+                  >
+                    <Newspaper className="h-4 w-4 text-blue-700 shrink-0" />
+                    <span className="text-xs font-semibold text-slate-800">
+                      Top News
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void handleSend(
+                        "Give me today's live sports scores, latest cricket and football match updates, and major sports headlines.",
+                        true
+                      )
+                    }
+                    className="flex items-center gap-2 p-3 rounded-xl bg-white border border-slate-200 hover:border-amber-300 hover:bg-amber-50/30 transition-colors text-left"
+                  >
+                    <Trophy className="h-4 w-4 text-amber-600 shrink-0" />
+                    <span className="text-xs font-semibold text-slate-800">
+                      Live Sports
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void handleSend(
+                        "What are the latest science, space, and technology updates today?",
+                        true
+                      )
+                    }
+                    className="flex items-center gap-2 p-3 rounded-xl bg-white border border-slate-200 hover:border-emerald-300 hover:bg-emerald-50/30 transition-colors text-left"
+                  >
+                    <Globe className="h-4 w-4 text-emerald-700 shrink-0" />
+                    <span className="text-xs font-semibold text-slate-800">
+                      Science &amp; Tech
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void handleSend(
+                        "Give me today's major weather alerts, gold/market highlights, and key world updates.",
+                        true
+                      )
+                    }
+                    className="flex items-center gap-2 p-3 rounded-xl bg-white border border-slate-200 hover:border-sky-300 hover:bg-sky-50/30 transition-colors text-left"
+                  >
+                    <CloudSun className="h-4 w-4 text-sky-600 shrink-0" />
+                    <span className="text-xs font-semibold text-slate-800">
+                      Weather &amp; World
+                    </span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Mobile Personal Tasks & Script Studio */}
+              <div className="pt-6 border-t border-slate-200 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-xs font-semibold text-slate-500">
+                    Mobile Personal Tasks &amp; Script Generator
+                  </h3>
+                  <span className="text-[11px] font-medium text-slate-500">
+                    1-Tap Mobile Actions
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                  <a
+                    href="https://m.youtube.com"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-2 p-3 rounded-xl bg-white border border-slate-200 hover:border-red-300 hover:bg-red-50/30 transition-colors text-left"
+                  >
+                    <Play className="h-4 w-4 text-red-600 shrink-0" />
+                    <span className="text-xs font-semibold text-slate-800">
+                      Open YouTube
+                    </span>
+                  </a>
+
+                  <button
+                    type="button"
+                    onClick={() => setTaskModalMode("message")}
+                    className="flex items-center gap-2 p-3 rounded-xl bg-white border border-slate-200 hover:border-emerald-300 hover:bg-emerald-50/30 transition-colors text-left"
+                  >
+                    <MessageSquare className="h-4 w-4 text-emerald-600 shrink-0" />
+                    <span className="text-xs font-semibold text-slate-800">
+                      Send Message
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setTaskModalMode("alarm")}
+                    className="flex items-center gap-2 p-3 rounded-xl bg-white border border-slate-200 hover:border-amber-300 hover:bg-amber-50/30 transition-colors text-left"
+                  >
+                    <AlarmClock className="h-4 w-4 text-amber-600 shrink-0" />
+                    <span className="text-xs font-semibold text-slate-800">
+                      Set Alarm / Timer
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setTaskModalMode("script")}
+                    className="flex items-center gap-2 p-3 rounded-xl bg-white border border-slate-200 hover:border-indigo-300 hover:bg-indigo-50/30 transition-colors text-left"
+                  >
+                    <FileCode2 className="h-4 w-4 text-indigo-700 shrink-0" />
+                    <span className="text-xs font-semibold text-slate-800">
+                      Generate Script
+                    </span>
+                  </button>
+                </div>
+              </div>
+
               <div className="pt-6 border-t border-slate-200">
                 <h3 className="text-xs font-semibold text-slate-500 mb-3">
                   Try asking
@@ -905,6 +1213,45 @@ export function AssistantView({
                           </ReactMarkdown>
                         </div>
 
+                        {/* Quick Mobile Action cards (auto-launched when Auto-Run is on, kept as fallback) */}
+                        {msg.actions && msg.actions.length > 0 && (
+                          <div className="pt-3 border-t border-slate-100">
+                            <p className="text-xs font-semibold text-slate-500 mb-2">
+                              {autoRunActions
+                                ? "Mobile Action · Auto-launched (tap below if your browser paused it)"
+                                : "Quick Mobile Actions · Tap to launch"}
+                            </p>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                              {msg.actions.map((action) => (
+                                <a
+                                  key={action.id}
+                                  href={action.href}
+                                  target={action.external ? "_blank" : undefined}
+                                  rel={
+                                    action.external
+                                      ? "noopener noreferrer"
+                                      : undefined
+                                  }
+                                  className="flex items-center gap-2.5 px-3 py-2.5 rounded-xl bg-slate-50 hover:bg-blue-50/70 border border-slate-200 hover:border-blue-300 transition-colors group"
+                                >
+                                  {getActionIcon(action.kind)}
+                                  <div className="min-w-0 flex-1">
+                                    <p className="text-xs font-semibold text-slate-900 truncate group-hover:text-blue-800">
+                                      {action.label}
+                                    </p>
+                                    {action.subtitle && (
+                                      <p className="text-[11px] text-slate-500 truncate">
+                                        {action.subtitle}
+                                      </p>
+                                    )}
+                                  </div>
+                                  <ExternalLink className="h-3.5 w-3.5 text-slate-400 group-hover:text-blue-600 shrink-0" />
+                                </a>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
                         {/* Grounding sources if Google Search was used */}
                         {msg.sources && msg.sources.length > 0 && (
                           <div className="pt-3 border-t border-slate-100">
@@ -934,7 +1281,7 @@ export function AssistantView({
                             type="button"
                             disabled={loadingTtsId === msg.id}
                             onClick={() => void speakText(msg.id, msg.content)}
-                            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium text-slate-700 hover:bg-slate-100 transition-colors whitespace-nowrap"
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium text-slate-700 hover:bg-slate-100 transition-colors whitespace-nowrap shrink-0"
                           >
                             {loadingTtsId === msg.id ? (
                               <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -948,11 +1295,42 @@ export function AssistantView({
                             </span>
                           </button>
 
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onOpenInReader(msg.content, activeLanguage)
+                            }
+                            title="Open in Read Tab with sentence highlighting, speed control, and translation"
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium text-blue-700 hover:bg-blue-50 transition-colors whitespace-nowrap shrink-0"
+                          >
+                            <BookOpen className="h-3.5 w-3.5" />
+                            <span>Read Tab</span>
+                          </button>
+
+                          {(msg.content.includes("```") ||
+                            /\b(script|speech|automation|python|bash|termux)\b/i.test(
+                              previousUserPrompt
+                            )) && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                downloadGeneratedScript(
+                                  msg.content,
+                                  previousUserPrompt || "jogi-jarvis-script"
+                                )
+                              }
+                              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium text-indigo-700 hover:bg-indigo-50 transition-colors whitespace-nowrap shrink-0"
+                            >
+                              <Download className="h-3.5 w-3.5" />
+                              <span>Download Script</span>
+                            </button>
+                          )}
+
                           {msg.noteSavedId ? (
                             <button
                               type="button"
                               onClick={() => onOpenNote(msg.noteSavedId!)}
-                              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 transition-colors whitespace-nowrap"
+                              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 transition-colors whitespace-nowrap shrink-0"
                             >
                               <Check className="h-3.5 w-3.5" />
                               <span>Saved · Open Study Note</span>
@@ -969,7 +1347,7 @@ export function AssistantView({
                                   msg.id
                                 )
                               }
-                              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium text-blue-700 hover:bg-blue-50 transition-colors whitespace-nowrap"
+                              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium text-blue-700 hover:bg-blue-50 transition-colors whitespace-nowrap shrink-0"
                             >
                               {savingNoteForId === msg.id ? (
                                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -983,7 +1361,7 @@ export function AssistantView({
                           <button
                             type="button"
                             onClick={() => void handleCopy(msg.id, msg.content)}
-                            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium text-slate-600 hover:bg-slate-100 transition-colors whitespace-nowrap"
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium text-slate-600 hover:bg-slate-100 transition-colors whitespace-nowrap shrink-0"
                           >
                             {copiedId === msg.id ? (
                               <Check className="h-3.5 w-3.5 text-emerald-600" />
@@ -1014,6 +1392,44 @@ export function AssistantView({
       {/* Bottom Composer */}
       <div className="bg-white border-t border-slate-200 px-4 sm:px-8 py-4">
         <div className="max-w-3xl mx-auto space-y-2.5">
+          {messages.length > 0 && (
+            <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5">
+              <a
+                href="https://m.youtube.com"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium text-slate-700 bg-slate-100 hover:bg-red-50 hover:text-red-700 transition-colors whitespace-nowrap shrink-0"
+              >
+                <Play className="h-3.5 w-3.5 text-red-600" />
+                <span>YouTube</span>
+              </a>
+              <button
+                type="button"
+                onClick={() => setTaskModalMode("message")}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium text-slate-700 bg-slate-100 hover:bg-emerald-50 hover:text-emerald-700 transition-colors whitespace-nowrap shrink-0"
+              >
+                <MessageSquare className="h-3.5 w-3.5 text-emerald-600" />
+                <span>Send Message</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setTaskModalMode("alarm")}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium text-slate-700 bg-slate-100 hover:bg-amber-50 hover:text-amber-700 transition-colors whitespace-nowrap shrink-0"
+              >
+                <AlarmClock className="h-3.5 w-3.5 text-amber-600" />
+                <span>Alarm / Timer</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setTaskModalMode("script")}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium text-slate-700 bg-slate-100 hover:bg-indigo-50 hover:text-indigo-700 transition-colors whitespace-nowrap shrink-0"
+              >
+                <FileCode2 className="h-3.5 w-3.5 text-indigo-700" />
+                <span>Script Generator</span>
+              </button>
+            </div>
+          )}
+
           {attachedImage && (
             <div className="flex items-center gap-3 p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
               <img
@@ -1119,6 +1535,24 @@ export function AssistantView({
           </div>
         </div>
       </div>
+
+      {taskModalMode && (
+        <MobileTaskModal
+          mode={taskModalMode}
+          onClose={() => setTaskModalMode(null)}
+          onAddAlarm={(alarm) => {
+            onAddAlarm(alarm);
+            showToast(
+              alarm.type === "timer"
+                ? `Live timer started: ${alarm.label}`
+                : `Live alarm set for ${formatAlarmTime(alarm.triggerAt)} (${alarm.label})`
+            );
+          }}
+          onRunScriptPrompt={(scriptPrompt) => {
+            void handleSend(scriptPrompt, false);
+          }}
+        />
+      )}
     </div>
   );
 }

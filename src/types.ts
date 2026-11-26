@@ -1,4 +1,4 @@
-export type AppTab = "assistant" | "live" | "notes" | "family";
+export type AppTab = "assistant" | "live" | "read" | "notes" | "family";
 
 export type VoiceName = "Zephyr" | "Kore" | "Puck" | "Charon" | "Fenrir";
 
@@ -23,6 +23,35 @@ export interface GroundingSource {
   title: string;
 }
 
+export type MobileActionKind =
+  | "youtube"
+  | "whatsapp"
+  | "sms"
+  | "call"
+  | "email"
+  | "maps"
+  | "calendar"
+  | "alarm"
+  | "timer"
+  | "web";
+
+export interface MobileAction {
+  id: string;
+  kind: MobileActionKind;
+  label: string;
+  subtitle?: string;
+  href?: string;
+  external?: boolean;
+}
+
+export interface ActiveAlarm {
+  id: string;
+  label: string;
+  triggerAt: number;
+  type: "alarm" | "timer";
+  ringing?: boolean;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -33,6 +62,7 @@ export interface ChatMessage {
   imageBase64?: string;
   imageMimeType?: string;
   sources?: GroundingSource[];
+  actions?: MobileAction[];
   noteSavedId?: string;
 }
 

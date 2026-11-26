@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  BookOpen,
   CheckCircle2,
   Download,
   Eye,
@@ -30,6 +31,7 @@ interface StudyNotesViewProps {
   onAddNote: (note: StudyNote) => void;
   onUpdateNote: (note: StudyNote) => void;
   onDeleteNote: (id: string) => void;
+  onOpenInReader?: (text: string, language?: string) => void;
 }
 
 interface QuizFeedback {
@@ -47,6 +49,7 @@ export function StudyNotesView({
   onAddNote,
   onUpdateNote,
   onDeleteNote,
+  onOpenInReader,
 }: StudyNotesViewProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [filterProfileId, setFilterProfileId] = useState<string>("all");
@@ -681,6 +684,36 @@ export function StudyNotesView({
                     )}
                     <span>{isReadingAloud ? "Stop Audio" : "Listen"}</span>
                   </button>
+
+                  {onOpenInReader && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const owner =
+                          profiles.find((p) => p.id === activeNote.profileId) ||
+                          activeProfile;
+                        const fullText = [
+                          `${activeNote.title}.`,
+                          activeNote.summary,
+                          ...activeNote.keyPoints,
+                          ...activeNote.definitions.map(
+                            (d) => `${d.term}: ${d.meaning}.`
+                          ),
+                          activeNote.teacherTip
+                            ? `Teacher Tip: ${activeNote.teacherTip}`
+                            : "",
+                        ]
+                          .filter(Boolean)
+                          .join("\n\n");
+                        onOpenInReader(fullText, owner.preferredLanguage);
+                      }}
+                      title="Open this note in Read Aloud Studio with sentence highlighting and speed control"
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-blue-50 hover:bg-blue-100 text-blue-800 transition-colors whitespace-nowrap"
+                    >
+                      <BookOpen className="h-3.5 w-3.5" />
+                      <span>Read Tab</span>
+                    </button>
+                  )}
 
                   <div className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-slate-200 bg-white text-xs font-medium text-slate-700">
                     {isTranslating ? (

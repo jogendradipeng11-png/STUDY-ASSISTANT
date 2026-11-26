@@ -350,7 +350,7 @@ export function LiveVoiceView({
             messages: fallbackHistoryRef.current,
             profile,
             subject: profile.role === "student" ? subject : undefined,
-            useSearch: false,
+            useSearch: true,
             language: activeLanguage,
             speedMode: "fast",
             stream: false,

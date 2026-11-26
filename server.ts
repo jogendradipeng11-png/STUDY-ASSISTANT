@@ -444,7 +444,9 @@ function buildSystemInstruction(
     const ownerName = profile?.name || "Jogi";
     return [
       `You are Jogi Jarvis, the dedicated personal AI assistant for ${ownerName} and their family.`,
-      `Your job is to listen carefully and answer anything ${ownerName} asks — daily planning, practical problem-solving, Math/Science help, drafting messages, research, technology, finance basics, family scheduling, or helping check their sons' and daughter's schoolwork.`,
+      `Your job is to listen carefully and answer anything ${ownerName} asks — daily planning, mobile personal tasks (opening YouTube, preparing WhatsApp/SMS messages, setting alarms/timers, navigating in Maps, dialing numbers), script generation (YouTube/Reels video scripts, speeches, WhatsApp notices, Python/Bash/Termux scripts), Math/Science help, live news & sports, or checking their sons' and daughter's schoolwork.`,
+      "MOBILE ACTIONS RULE: The Jogi Jarvis app automatically renders clickable 1-tap mobile action cards (Open YouTube, Send WhatsApp/SMS, Call, Open Maps, Set Android Clock Alarm) and live ticking alarms/timers directly below your reply whenever the user asks for a mobile action. Never say 'I cannot open YouTube' or 'I cannot set alarms'—instead, briefly confirm the action is ready to tap below (or that the live alarm/timer is active) and provide any drafted message cleanly.",
+      "SCRIPT GENERATION RULE: When asked to generate or write a script (YouTube video, Shorts/Reels, speech, WhatsApp broadcast, or Python/Bash/Termux automation code), deliver a complete, ready-to-use script immediately (using fenced code blocks for code scripts).",
       "Be crisp, fast, trustworthy, warm, respectful, and action-oriented. Give direct answers first, followed by helpful options or next steps.",
       mathGuidance,
       languageGuidance,
@@ -585,12 +587,28 @@ async function startServer() {
       return Array.from(new Map(sources.map((s) => [s.uri, s])).values()).slice(0, 6);
     };
 
-    const systemInstruction = buildSystemInstruction(
+    const shouldAutoEnableLiveSearch = (text: string): boolean => {
+      const normalized = text.trim();
+      if (!normalized) return false;
+      return /\b(news|headlines?|breaking|sports?|cricket|ipl|football|soccer|nba|nfl|tennis|badminton|hockey|f1|score|scores|match|matches|live|today|tonight|yesterday|latest|current|recent|weather|temperature|forecast|rain|stock|stocks|share price|sensex|nifty|gold price|petrol|diesel|bitcoin|crypto|election|result|results|who won|won the|schedule|fixture|trending|update|updates|happening|right now|current affairs|prime minister|president|world cup|olympics)\b|(समाचार|खबर|ताजा|स्कोर|मैच|मौसम|आज का|क्रिकेट|ଖବର|ତାଜା|ସ୍କୋର|ମ୍ୟାଚ୍|ପାଣିପାଗ|ଆଜିର)/i.test(
+        normalized
+      );
+    };
+
+    const lastUserMessageText =
+      [...messages].reverse().find((m) => m.role === "user")?.content || "";
+    const effectiveUseSearch =
+      Boolean(useSearch) || shouldAutoEnableLiveSearch(lastUserMessageText);
+
+    const baseSystemInstruction = buildSystemInstruction(
       profile,
       subject,
       "chat",
       language
     );
+    const systemInstruction = effectiveUseSearch
+      ? `${baseSystemInstruction}\n\nLIVE WEB DATA ACCESS ENABLED (Current UTC time: ${new Date().toUTCString()}): Use Google Search grounding to answer questions about live news, sports scores, weather, current events, prices, or any real-time information accurately and up-to-date. Mention dates/scores clearly when relevant.`
+      : baseSystemInstruction;
     const recentMessages = messages.slice(-18);
     const hasImage = recentMessages.some((m) =>
       Boolean(m.imageBase64 && m.imageMimeType)
@@ -681,14 +699,14 @@ async function startServer() {
           config: {
             systemInstruction,
             thinkingConfig: { thinkingLevel },
-            ...(useSearch ? { tools: [{ googleSearch: {} }] } : {}),
+            ...(effectiveUseSearch ? { tools: [{ googleSearch: {} }] } : {}),
           },
         },
         {
           name: "gemini-3.1-flash-lite",
           config: {
             systemInstruction,
-            ...(useSearch ? { tools: [{ googleSearch: {} }] } : {}),
+            ...(effectiveUseSearch ? { tools: [{ googleSearch: {} }] } : {}),
           },
         },
       ];
@@ -793,6 +811,182 @@ async function startServer() {
     }
   });
 
+  // 1b. Live Real-Time Data Endpoint (News, Sports, Weather, Anything Current — also powers Android Watch Mode)
+  app.post("/api/live-data", async (req, res) => {
+    try {
+      const {
+        category = "custom",
+        query = "",
+        language,
+        conciseForWatch = false,
+        profile,
+      } = req.body as {
+        category?: "news" | "sports" | "tech" | "weather" | "custom";
+        query?: string;
+        language?: string;
+        conciseForWatch?: boolean;
+        profile?: ProfilePayload;
+      };
+
+      const categoryPrompts: Record<string, string> = {
+        news: "Give me the latest top breaking news headlines today with brief, clear facts.",
+        sports:
+          "Give me today's live sports scores, cricket and football match updates, and major sports headlines right now.",
+        tech: "Give me today's latest science, AI, and technology news updates.",
+        weather:
+          "Give me today's major weather highlights and notable global updates.",
+      };
+
+      const userPrompt =
+        query.trim() ||
+        categoryPrompts[category] ||
+        "Give me today's top live news and sports updates.";
+
+      const langRule = buildLanguageGuidance(
+        language || profile?.preferredLanguage
+      );
+      const watchRule = conciseForWatch
+        ? "WATCH MODE FORMAT: Keep the answer ultra-concise (2 to 4 short sentences, max 65 words) with plain spoken text (no markdown tables or long lists) so it reads cleanly on an Android smartwatch screen and sounds crisp aloud."
+        : "Give a clear, well-structured, up-to-date live briefing with bullet points and exact scores/dates where available.";
+
+      const ai = getAiClient();
+      const liveSystemInstruction = [
+        `You are Jogi Jarvis, providing verified real-time live information (Current UTC time: ${new Date().toUTCString()}).`,
+        "Use Google Search grounding to retrieve the freshest news, sports scores, weather, and live facts.",
+        watchRule,
+        langRule,
+      ].join("\n");
+
+      const liveCandidates: Array<{
+        model: string;
+        config: Record<string, unknown>;
+      }> = [
+        {
+          model: "gemini-4-hydrogen",
+          config: {
+            systemInstruction: liveSystemInstruction,
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            tools: [{ googleSearch: {} }],
+          },
+        },
+        {
+          model: "gemini-3.1-flash-lite",
+          config: {
+            systemInstruction: liveSystemInstruction,
+            tools: [{ googleSearch: {} }],
+          },
+        },
+      ];
+
+      let response: Awaited<ReturnType<typeof ai.models.generateContent>> | null =
+        null;
+      let lastErr: unknown = null;
+      for (const candidate of liveCandidates) {
+        try {
+          response = await withRetry(() =>
+            ai.models.generateContent({
+              model: candidate.model,
+              contents: userPrompt,
+              config: candidate.config,
+            })
+          );
+          if (response.text?.trim()) {
+            break;
+          }
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+
+      if (!response || !response.text?.trim()) {
+        // Resilient live fallback: fetch real-time headlines from Google News RSS
+        const rssUrl =
+          query.trim()
+            ? `https://news.google.com/rss/search?q=${encodeURIComponent(query.trim())}&hl=en-IN&gl=IN&ceid=IN:en`
+            : category === "sports"
+              ? "https://news.google.com/rss/headlines/section/topic/SPORTS?hl=en-IN&gl=IN&ceid=IN:en"
+              : category === "tech"
+                ? "https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=en-IN&gl=IN&ceid=IN:en"
+                : "https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en";
+
+        const rssRes = await fetch(rssUrl, {
+          headers: { "User-Agent": "JogiJarvisLive/1.0" },
+        }).catch(() => null);
+
+        if (rssRes && rssRes.ok) {
+          const xml = await rssRes.text();
+          const itemMatches = Array.from(
+            xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)
+          ).slice(0, conciseForWatch ? 3 : 6);
+
+          const decodeXml = (s: string) =>
+            s
+              .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
+              .replace(/&amp;/g, "&")
+              .replace(/&lt;/g, "<")
+              .replace(/&gt;/g, ">")
+              .replace(/&quot;/g, '"')
+              .replace(/&#39;/g, "'")
+              .trim();
+
+          const liveItems = itemMatches
+            .map((m) => {
+              const block = m[1] || "";
+              const title = decodeXml(
+                (block.match(/<title>([\s\S]*?)<\/title>/i) || [])[1] || ""
+              );
+              const link = decodeXml(
+                (block.match(/<link>([\s\S]*?)<\/link>/i) || [])[1] || ""
+              );
+              return title ? { title, uri: link || rssUrl } : null;
+            })
+            .filter(
+              (x): x is { title: string; uri: string } => x !== null
+            );
+
+          if (liveItems.length > 0) {
+            const answer = conciseForWatch
+              ? liveItems.map((i) => i.title).join(". ") + "."
+              : liveItems.map((i, idx) => `${idx + 1}. ${i.title}`).join("\n");
+            return res.json({
+              answer,
+              sources: liveItems.map((i) => ({ uri: i.uri, title: i.title })),
+              updatedAt: new Date().toISOString(),
+            });
+          }
+        }
+
+        throw lastErr || new Error("Could not fetch live updates right now.");
+      }
+
+      const rawChunks =
+        response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
+      const sources = rawChunks
+        .map((chunk: unknown) => {
+          const web = (chunk as { web?: { uri?: string; title?: string } })?.web;
+          if (web?.uri) {
+            return { uri: web.uri, title: web.title || web.uri };
+          }
+          return null;
+        })
+        .filter((s): s is { uri: string; title: string } => s !== null);
+      const uniqueSources = Array.from(
+        new Map(sources.map((s) => [s.uri, s])).values()
+      ).slice(0, 6);
+
+      return res.json({
+        answer:
+          response.text?.trim() ||
+          "I checked for live updates, but could not find details right now. Please try again.",
+        sources: uniqueSources,
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      const formatted = formatApiError(err);
+      return res.status(formatted.status).json({ error: formatted.message });
+    }
+  });
+
   // 2. Audio Transcription Endpoint (gemini-3.5-transcribe)
   app.post("/api/transcribe", async (req, res) => {
     try {
@@ -839,11 +1033,13 @@ async function startServer() {
         voiceName = "Kore",
         role = "parent",
         language,
+        readingStyle = "normal",
       } = req.body as {
         text?: string;
         voiceName?: string;
         role?: "parent" | "student";
         language?: string;
+        readingStyle?: "normal" | "slow" | "explain";
       };
 
       const cleanText = stripMarkdownForSpeech(text || "");
@@ -859,10 +1055,17 @@ async function startServer() {
           ? ` speaking naturally in ${language}`
           : " speaking naturally in the exact language of the text";
 
+      const paceCue =
+        readingStyle === "slow"
+          ? " at a slow, extra-clear, word-by-word student learning pace with gentle pauses"
+          : readingStyle === "explain"
+            ? " like a warm classroom teacher explaining clearly to a student"
+            : "";
+
       const style =
         role === "student"
-          ? `Warm, patient, encouraging personal teacher${langCue}`
-          : `Calm, articulate, helpful personal assistant${langCue}`;
+          ? `Warm, patient, encouraging personal teacher${langCue}${paceCue}`
+          : `Calm, articulate, helpful personal assistant${langCue}${paceCue}`;
 
       const ai = getAiClient();
       const response = await ai.models.generateContent({
@@ -899,6 +1102,115 @@ async function startServer() {
         audioBase64,
         mimeType: "audio/wav",
       });
+    } catch (err) {
+      const formatted = formatApiError(err);
+      return res.status(formatted.status).json({ error: formatted.message });
+    }
+  });
+
+  // 3b. Read Studio Prepare Endpoint (OCR textbook photo, translate to any language, or simplify & explain for student reading aloud)
+  app.post("/api/read/prepare", async (req, res) => {
+    try {
+      const {
+        text = "",
+        imageBase64,
+        imageMimeType = "image/jpeg",
+        targetLanguage = "Auto-Detect",
+        mode = "exact",
+        profile,
+      } = req.body as {
+        text?: string;
+        imageBase64?: string;
+        imageMimeType?: string;
+        targetLanguage?: string;
+        mode?: "exact" | "translate" | "explain";
+        profile?: ProfilePayload;
+      };
+
+      const cleanInput = text.trim();
+      if (!cleanInput && !imageBase64) {
+        return res.status(400).json({
+          error: "Please enter text or attach a textbook photo to read.",
+        });
+      }
+
+      const targetLangInstruction =
+        targetLanguage && targetLanguage !== "Auto-Detect"
+          ? `Output MUST be written naturally in ${targetLanguage} using its authentic native script (for example, Odia in ଓଡ଼ିଆ, Hindi in हिन्दी, English in English).`
+          : "Keep the exact original language and script of the text.";
+
+      const studentContext =
+        profile?.role === "student"
+          ? `The listener is ${profile.name} (${profile.grade || "school student"}).`
+          : `The listener is ${profile?.name || "Jogi"}.`;
+
+      let taskPrompt = "";
+      if (imageBase64 && mode === "exact") {
+        taskPrompt = [
+          "Extract all readable text cleanly from this textbook, notebook, or worksheet image in reading order.",
+          "Return ONLY the clean extracted text formatted into natural readable paragraphs/sentences with no extra commentary or markdown headers.",
+          targetLanguage && targetLanguage !== "Auto-Detect"
+            ? `If the text is in another language, translate it cleanly into ${targetLanguage} so it can be read aloud directly.`
+            : "Preserve the exact original language and script.",
+        ].join("\n");
+      } else if (mode === "translate") {
+        taskPrompt = [
+          "Translate the provided passage naturally and accurately for smooth read-aloud listening.",
+          targetLangInstruction,
+          "Keep every sentence clear, natural to speak aloud, and accurate. Return ONLY the translated reading text without preamble or markdown symbols.",
+        ].join("\n");
+      } else {
+        taskPrompt = [
+          `${studentContext} Prepare a warm, crystal-clear read-aloud teaching script based on the provided material.`,
+          "First state the main idea clearly, then walk through the key facts sentence by sentence in easy, memorable language suitable for listening and learning.",
+          targetLangInstruction,
+          "Return ONLY clean plain spoken paragraphs (no markdown asterisks, bullets, or code blocks) so it sounds natural when read aloud.",
+        ].join("\n");
+      }
+
+      const parts: Array<
+        { text: string } | { inlineData: { mimeType: string; data: string } }
+      > = [];
+      if (imageBase64) {
+        parts.push({
+          inlineData: { mimeType: imageMimeType, data: imageBase64 },
+        });
+      }
+      parts.push({
+        text: cleanInput ? `${taskPrompt}\n\nMaterial:\n${cleanInput}` : taskPrompt,
+      });
+
+      const ai = getAiClient();
+      const candidates = ["gemini-4-hydrogen", "gemini-3.1-flash-lite"];
+      let preparedText = "";
+      let lastErr: unknown = null;
+
+      for (const model of candidates) {
+        try {
+          const response = await withRetry(() =>
+            ai.models.generateContent({
+              model,
+              contents: [{ role: "user", parts }],
+              config: {
+                systemInstruction:
+                  "You are Jogi Jarvis, an expert multilingual reading coach and study teacher.",
+              },
+            })
+          );
+          if (response.text?.trim()) {
+            preparedText = response.text.trim();
+            break;
+          }
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+
+      if (!preparedText) {
+        throw lastErr || new Error("Could not prepare text for reading.");
+      }
+
+      return res.json({ text: preparedText });
     } catch (err) {
       const formatted = formatApiError(err);
       return res.status(formatted.status).json({ error: formatted.message });
@@ -1494,98 +1806,120 @@ async function startServer() {
                 ? msg.profile.voiceName
                 : "Zephyr";
 
-          const systemInstruction = buildSystemInstruction(
+          const baseLiveSystemInstruction = buildSystemInstruction(
             msg.profile,
             msg.subject,
             "live",
             msg.language
           );
+          const systemInstruction = `${baseLiveSystemInstruction}\n\nLIVE WEB ACCESS (UTC ${new Date().toUTCString()}): You have Google Search enabled for real-time news, sports scores, weather, and current facts. Use it whenever asked about today's events, live matches, or up-to-date information.`;
 
-          liveSession = await ai.live.connect({
-            model: "gemini-3.8-live",
-            config: {
-              responseModalities: [Modality.AUDIO],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName: safeVoice },
-                },
-              },
-              inputAudioTranscription: {},
-              outputAudioTranscription: {},
-              systemInstruction,
+          const liveCallbacks = {
+            onopen: () => {
+              // Wait until ai.live.connect resolves (setupComplete) before notifying client
             },
-            callbacks: {
-              onopen: () => {
-                // Wait until ai.live.connect resolves (setupComplete) before notifying client
-              },
-              onmessage: (message: LiveServerMessage) => {
-                const content = message.serverContent;
-                if (!content) return;
+            onmessage: (message: LiveServerMessage) => {
+              const content = message.serverContent;
+              if (!content) return;
 
-                if (content.interrupted) {
-                  sendSafe({ type: "interrupted" });
-                }
+              if (content.interrupted) {
+                sendSafe({ type: "interrupted" });
+              }
 
-                if (content.inputTranscription?.text) {
+              if (content.inputTranscription?.text) {
+                sendSafe({
+                  type: "inputTranscript",
+                  text: content.inputTranscription.text,
+                });
+              }
+
+              if (content.outputTranscription?.text) {
+                sendSafe({
+                  type: "outputTranscript",
+                  text: content.outputTranscription.text,
+                });
+              }
+
+              for (const part of content.modelTurn?.parts ?? []) {
+                if (part.inlineData?.data) {
                   sendSafe({
-                    type: "inputTranscript",
-                    text: content.inputTranscription.text,
+                    type: "audio",
+                    audio: part.inlineData.data,
                   });
                 }
+              }
 
-                if (content.outputTranscription?.text) {
+              if (content.turnComplete) {
+                sendSafe({ type: "turnComplete" });
+              }
+            },
+            onerror: (e: unknown) => {
+              const ev = e as {
+                message?: string;
+                error?: { message?: string };
+              };
+              const rawErr =
+                e instanceof Error
+                  ? e.message
+                  : ev?.error?.message ||
+                    ev?.message ||
+                    "Live voice connection encountered an error.";
+              console.error("[Live API error]", rawErr, e);
+              const formatted = formatApiError(new Error(rawErr));
+              sendSafe({ type: "error", message: formatted.message });
+            },
+            onclose: (closeEv: unknown) => {
+              const ev = closeEv as { code?: number; reason?: string };
+              if (ev?.reason) {
+                console.error("[Live API close]", ev.code, ev.reason);
+              }
+              if (!isClosing) {
+                if (ev?.code && ev.code !== 1000 && ev.reason) {
                   sendSafe({
-                    type: "outputTranscript",
-                    text: content.outputTranscription.text,
+                    type: "error",
+                    message: `Live voice closed (${ev.code}): ${ev.reason}`,
                   });
+                } else {
+                  sendSafe({ type: "closed" });
                 }
+              }
+            },
+          };
 
-                for (const part of content.modelTurn?.parts ?? []) {
-                  if (part.inlineData?.data) {
-                    sendSafe({
-                      type: "audio",
-                      audio: part.inlineData.data,
-                    });
-                  }
-                }
-
-                if (content.turnComplete) {
-                  sendSafe({ type: "turnComplete" });
-                }
-              },
-              onerror: (e: unknown) => {
-                const ev = e as {
-                  message?: string;
-                  error?: { message?: string };
-                };
-                const rawErr =
-                  e instanceof Error
-                    ? e.message
-                    : ev?.error?.message ||
-                      ev?.message ||
-                      "Live voice connection encountered an error.";
-                console.error("[Live API error]", rawErr, e);
-                const formatted = formatApiError(new Error(rawErr));
-                sendSafe({ type: "error", message: formatted.message });
-              },
-              onclose: (closeEv: unknown) => {
-                const ev = closeEv as { code?: number; reason?: string };
-                if (ev?.reason) {
-                  console.error("[Live API close]", ev.code, ev.reason);
-                }
-                if (!isClosing) {
-                  if (ev?.code && ev.code !== 1000 && ev.reason) {
-                    sendSafe({
-                      type: "error",
-                      message: `Live voice closed (${ev.code}): ${ev.reason}`,
-                    });
-                  } else {
-                    sendSafe({ type: "closed" });
-                  }
-                }
+          const baseLiveConfig = {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: safeVoice },
               },
             },
-          });
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+            systemInstruction,
+          };
+
+          try {
+            liveSession = await ai.live.connect({
+              model: "gemini-3.8-live",
+              config: {
+                ...baseLiveConfig,
+                tools: [{ googleSearch: {} }],
+              },
+              callbacks: liveCallbacks,
+            });
+          } catch (liveWithSearchErr) {
+            console.warn(
+              "[Live API] Retrying without googleSearch tool:",
+              liveWithSearchErr instanceof Error
+                ? liveWithSearchErr.message
+                : liveWithSearchErr
+            );
+            liveSession = await ai.live.connect({
+              model: "gemini-3.8-live",
+              config: baseLiveConfig,
+              callbacks: liveCallbacks,
+            });
+          }
 
           // Session is now assigned and setupComplete has finished
           sendSafe({ type: "ready", voiceName: safeVoice });
@@ -1637,8 +1971,18 @@ async function startServer() {
   // Mount Vite middleware in development or static dist in production
   if (!IS_PROD) {
     const { createServer: createViteServer } = await import("vite");
+    const hmrDisabled = process.env.DISABLE_HMR === "true";
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: true,
+        hmr: !hmrDisabled,
+        watch: hmrDisabled ? null : {},
+        ws: {
+          server,
+          path: "/__vite_hmr",
+        },
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);

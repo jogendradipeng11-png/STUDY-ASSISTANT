@@ -79,6 +79,19 @@ export default defineConfig(() => {
                 },
               ],
             },
+            {
+              name: 'Watch Mode (Live Voice)',
+              short_name: 'Watch Mode',
+              description: 'Compact live voice, news, and sports view for Android Watch (Wear OS)',
+              url: '/?mode=watch',
+              icons: [
+                {
+                  src: '/pwa-192x192.png',
+                  sizes: '192x192',
+                  type: 'image/png',
+                },
+              ],
+            },
           ],
         },
         workbox: {
