@@ -226,7 +226,12 @@ export function speakWithChunkedBrowserTts(options: {
     };
 
     options.onStart?.();
-    speakNext();
+    // Brief delay after cancel() prevents Chrome/Android from silently dropping the first utterance
+    window.setTimeout(() => {
+      if (options.isStillCurrent()) {
+        speakNext();
+      }
+    }, 60);
     return true;
   } catch {
     return false;
