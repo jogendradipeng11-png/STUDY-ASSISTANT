@@ -68,9 +68,12 @@ import {
 import {
   LOCAL_LLM_MODELS,
   checkWebGpuSupport,
+  deleteCachedLocalModel,
   getLoadedLocalModelKey,
+  getRecordedDownloadedModels,
   loadLocalLlmModel,
   streamLocalLlmChat,
+  syncCachedLocalModels,
   unloadLocalLlmModel,
   type LocalLlmProgress,
   type WebGpuSupportInfo,
@@ -185,6 +188,24 @@ export function AssistantView({
   const [localProgress, setLocalProgress] = useState<LocalLlmProgress | null>(
     null
   );
+  const [downloadingModelKey, setDownloadingModelKey] = useState<string | null>(
+    null
+  );
+  const [downloadedModels, setDownloadedModels] = useState<string[]>(() =>
+    getRecordedDownloadedModels()
+  );
+  const [autoSelectOnDownload, setAutoSelectOnDownload] = useState<boolean>(
+    () => {
+      try {
+        const saved = localStorage.getItem("jogi_jarvis_local_autoselect_v1");
+        return saved === null ? true : saved === "true";
+      } catch {
+        return true;
+      }
+    }
+  );
+  const autoSelectOnDownloadRef = useRef(autoSelectOnDownload);
+  autoSelectOnDownloadRef.current = autoSelectOnDownload;
   const [gpuInfo, setGpuInfo] = useState<WebGpuSupportInfo | null>(null);
   const [useSearch, setUseSearch] = useState(true);
   const [autoSpeak, setAutoSpeak] = useState<boolean>(() => {
@@ -274,6 +295,17 @@ export function AssistantView({
   }, [localModelKey]);
 
   useEffect(() => {
+    try {
+      localStorage.setItem(
+        "jogi_jarvis_local_autoselect_v1",
+        String(autoSelectOnDownload)
+      );
+    } catch {
+      // ignore storage errors
+    }
+  }, [autoSelectOnDownload]);
+
+  useEffect(() => {
     if (engine !== "local-browser") return;
     let cancelled = false;
     void checkWebGpuSupport().then((info) => {
@@ -289,6 +321,11 @@ export function AssistantView({
               ? "ready"
               : "idle"
         );
+      }
+    });
+    void syncCachedLocalModels().then((keys) => {
+      if (!cancelled) {
+        setDownloadedModels(keys);
       }
     });
     return () => {
@@ -365,29 +402,47 @@ export function AssistantView({
   };
 
   const activeLocalModel =
-    LOCAL_LLM_MODELS.find((m) => m.key === localModelKey) || LOCAL_LLM_MODELS[1];
+    LOCAL_LLM_MODELS.find((m) => m.key === localModelKey) || LOCAL_LLM_MODELS[2];
+  const downloadingLocalModel = downloadingModelKey
+    ? LOCAL_LLM_MODELS.find((m) => m.key === downloadingModelKey) || null
+    : null;
+  const isCurrentLocalModelCached = downloadedModels.includes(localModelKey);
 
   const handleLoadLocalModel = async (targetKey = localModelKey) => {
     const targetMeta =
       LOCAL_LLM_MODELS.find((m) => m.key === targetKey) || activeLocalModel;
     setErrorMsg(null);
+    setDownloadingModelKey(targetMeta.key);
     setLocalStatus("loading");
     setLocalProgress({
       progress: 0.02,
-      text: `Preparing ${targetMeta.label}…`,
+      text: `Downloading ${targetMeta.label} (${targetMeta.sizeLabel})…`,
     });
     try {
-      await loadLocalLlmModel(targetKey, (info) => {
+      await loadLocalLlmModel(targetMeta.key, (info) => {
         setLocalProgress(info);
         if (info.progress >= 1) {
           setLocalStatus("ready");
         }
       });
       setLocalStatus("ready");
-      showToast(
-        `${targetMeta.label} is ready on your device — unlimited chats with zero API quota.`
+      setDownloadingModelKey(null);
+      setDownloadedModels((prev) =>
+        prev.includes(targetMeta.key) ? prev : [...prev, targetMeta.key]
       );
+      setLocalModelKey(targetMeta.key);
+      if (autoSelectOnDownloadRef.current) {
+        setEngine("local-browser");
+        showToast(
+          `${targetMeta.label} finished downloading and was auto-selected as your active Unlimited Local AI.`
+        );
+      } else {
+        showToast(
+          `${targetMeta.label} is ready on your device — unlimited chats with zero API quota.`
+        );
+      }
     } catch (err) {
+      setDownloadingModelKey(null);
       setLocalStatus(gpuInfo?.supported === false ? "unsupported" : "idle");
       setLocalProgress(null);
       setErrorMsg(
@@ -402,7 +457,16 @@ export function AssistantView({
     await unloadLocalLlmModel();
     setLocalStatus("idle");
     setLocalProgress(null);
-    showToast("Unloaded Local AI model from device GPU memory.");
+    showToast("Unloaded Local AI model from device GPU memory (file stays cached for fast reload).");
+  };
+
+  const handleDeleteCachedLocalModel = async () => {
+    const target = activeLocalModel;
+    const remaining = await deleteCachedLocalModel(target.key);
+    setDownloadedModels(remaining);
+    setLocalStatus("idle");
+    setLocalProgress(null);
+    showToast(`Cleared ${target.label} from browser storage.`);
   };
 
   const releaseWakeLock = () => {
@@ -940,6 +1004,10 @@ export function AssistantView({
         });
 
         setLocalStatus("ready");
+        setDownloadingModelKey(null);
+        setDownloadedModels((prev) =>
+          prev.includes(localModelKey) ? prev : [...prev, localModelKey]
+        );
         const assistantMsg: ChatMessage = {
           id: assistantId,
           role: "assistant",
@@ -1566,33 +1634,83 @@ export function AssistantView({
         </div>
       </div>
 
+      {/* Background download progress strip if user switches engine while a large Local AI model finishes downloading */}
+      {engine !== "local-browser" && localStatus === "loading" && downloadingLocalModel && (
+        <div className="bg-emerald-50 border-b border-emerald-200 px-5 sm:px-8 py-2 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-700 shrink-0" />
+            <span className="text-xs font-medium text-emerald-900 truncate">
+              Downloading {downloadingLocalModel.label} ({Math.round((localProgress?.progress || 0) * 100)}%)
+              {autoSelectOnDownload ? " · Will auto-select when finished" : ""}
+            </span>
+          </div>
+          <div className="w-36 h-1.5 rounded-full bg-emerald-200 overflow-hidden shrink-0">
+            <div
+              className="h-full bg-emerald-700 transition-all duration-200"
+              style={{
+                width: `${Math.max(4, Math.round((localProgress?.progress || 0) * 100))}%`,
+              }}
+            />
+          </div>
+        </div>
+      )}
+
       {/* On-Device Unlimited Local AI Control Strip */}
       {engine === "local-browser" && (
         <div className="bg-slate-50 border-b border-slate-200 px-5 sm:px-8 py-2.5 flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-2.5 min-w-0">
             <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-800">
               <Cpu className="h-3.5 w-3.5 shrink-0" />
-              <span>Local AI · Unlimited · Runs on Your Device</span>
+              <span>Local AI · Unlimited</span>
             </span>
             <select
               aria-label="Local AI Model"
               disabled={localStatus === "loading" || isSending}
               value={localModelKey}
               onChange={(e) => setLocalModelKey(e.target.value)}
-              className="px-2.5 py-1 rounded-md text-xs font-medium bg-white border border-slate-300 text-slate-800 focus:outline-none focus:border-emerald-600 disabled:opacity-60"
+              className="px-2.5 py-1 rounded-md text-xs font-medium bg-white border border-slate-300 text-slate-800 focus:outline-none focus:border-emerald-600 disabled:opacity-60 max-w-full"
             >
-              {LOCAL_LLM_MODELS.map((m) => (
-                <option key={m.key} value={m.key}>
-                  {m.label} ({m.sizeLabel})
-                </option>
-              ))}
+              <optgroup label="Phone & Everyday (0.3B – 2B)">
+                {LOCAL_LLM_MODELS.filter((m) => m.tier === "mobile").map((m) => (
+                  <option key={m.key} value={m.key}>
+                    {m.label} ({m.sizeLabel}){downloadedModels.includes(m.key) ? " · Downloaded" : ""}
+                  </option>
+                ))}
+              </optgroup>
+              <optgroup label="Mid-Size Power (3B – 3.8B)">
+                {LOCAL_LLM_MODELS.filter((m) => m.tier === "mid").map((m) => (
+                  <option key={m.key} value={m.key}>
+                    {m.label} ({m.sizeLabel}){downloadedModels.includes(m.key) ? " · Downloaded" : ""}
+                  </option>
+                ))}
+              </optgroup>
+              <optgroup label="Large Pro · Desktop / Laptop GPU (7B – 9B)">
+                {LOCAL_LLM_MODELS.filter((m) => m.tier === "large").map((m) => (
+                  <option key={m.key} value={m.key}>
+                    {m.label} ({m.sizeLabel}){downloadedModels.includes(m.key) ? " · Downloaded" : ""}
+                  </option>
+                ))}
+              </optgroup>
             </select>
-            <span className="text-[11px] text-slate-500 hidden md:inline">
-              {activeLocalModel.bestFor} · Cached offline after first download
+            <span className="text-[11px] text-slate-500 hidden lg:inline">
+              {activeLocalModel.bestFor} · {activeLocalModel.vramLabel}
             </span>
           </div>
 
-          <div className="flex items-center gap-2.5 shrink-0">
+          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+            <label
+              className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-600 cursor-pointer select-none whitespace-nowrap"
+              title="Automatically switch to this Local AI model as soon as its download finishes"
+            >
+              <input
+                type="checkbox"
+                checked={autoSelectOnDownload}
+                onChange={(e) => setAutoSelectOnDownload(e.target.checked)}
+                className="h-3.5 w-3.5 rounded border-slate-300 text-emerald-700 focus:ring-emerald-600"
+              />
+              <span>Auto-select when ready</span>
+            </label>
+
             {localStatus === "unsupported" ? (
               <div className="flex flex-wrap items-center gap-2 text-xs text-amber-900">
                 <span>
@@ -1608,9 +1726,9 @@ export function AssistantView({
                 </button>
               </div>
             ) : localStatus === "loading" ? (
-              <div className="flex items-center gap-2.5 min-w-[200px]">
+              <div className="flex items-center gap-2.5 min-w-[210px]">
                 <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-700 shrink-0" />
-                <div className="flex-1 min-w-[120px]">
+                <div className="flex-1 min-w-[130px]">
                   <div className="h-1.5 w-full rounded-full bg-slate-200 overflow-hidden">
                     <div
                       className="h-full bg-emerald-600 transition-all duration-200"
@@ -1621,7 +1739,7 @@ export function AssistantView({
                   </div>
                   <p className="text-[11px] text-slate-600 truncate max-w-[240px] mt-0.5">
                     {Math.round((localProgress?.progress || 0) * 100)}% ·{" "}
-                    {localProgress?.text || `Loading ${activeLocalModel.label}…`}
+                    {localProgress?.text || `Downloading ${activeLocalModel.label}…`}
                   </p>
                 </div>
               </div>
@@ -1629,7 +1747,7 @@ export function AssistantView({
               <div className="flex items-center gap-2">
                 <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-800">
                   <Check className="h-3.5 w-3.5" />
-                  <span>Ready on Device</span>
+                  <span>Active on Device</span>
                 </span>
                 <button
                   type="button"
@@ -1638,17 +1756,41 @@ export function AssistantView({
                 >
                   Unload
                 </button>
+                {isCurrentLocalModelCached && (
+                  <button
+                    type="button"
+                    onClick={() => void handleDeleteCachedLocalModel()}
+                    title="Delete downloaded model files from browser storage to free disk space"
+                    className="px-2 py-1 rounded-md text-xs font-medium text-slate-500 hover:text-red-700 hover:bg-red-50 whitespace-nowrap"
+                  >
+                    Clear Cache
+                  </button>
+                )}
               </div>
             ) : (
-              <button
-                type="button"
-                disabled={isSending}
-                onClick={() => void handleLoadLocalModel()}
-                className="inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white disabled:opacity-50 transition-colors whitespace-nowrap"
-              >
-                <Download className="h-3.5 w-3.5" />
-                <span>Load Model Now</span>
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={isSending}
+                  onClick={() => void handleLoadLocalModel()}
+                  className="inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white disabled:opacity-50 transition-colors whitespace-nowrap"
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  <span>
+                    {isCurrentLocalModelCached ? "Load Cached Model" : "Download & Activate"}
+                  </span>
+                </button>
+                {isCurrentLocalModelCached && (
+                  <button
+                    type="button"
+                    onClick={() => void handleDeleteCachedLocalModel()}
+                    title="Delete downloaded model files from browser storage to free disk space"
+                    className="px-2 py-1 rounded-md text-xs font-medium text-slate-500 hover:text-red-700 hover:bg-red-50 whitespace-nowrap"
+                  >
+                    Clear Cache
+                  </button>
+                )}
+              </div>
             )}
           </div>
         </div>
