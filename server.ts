@@ -2918,7 +2918,181 @@ async function startServer() {
     ];
   };
 
-  // 6a. Free Study Picture & Labeled Diagram Generator (+ Real Wikimedia Photos)
+  // Shared server-side validator/inferrer for AI-directed 3D PBR scene blueprints
+  function normalizeServerScene3d(
+    raw: unknown,
+    title: string,
+    subject?: string,
+    fallbackAccent = "#2563EB"
+  ) {
+    const allowedArchetypes = new Set([
+      "solar",
+      "atom",
+      "dna",
+      "heart",
+      "plant",
+      "watercycle",
+      "rocket",
+      "circuit",
+      "earth",
+      "volcano",
+      "wave",
+      "architecture",
+      "custom",
+    ]);
+    const allowedEnvs = new Set(["studio", "space", "outdoor", "lab", "sunset"]);
+    const allowedShapes = new Set([
+      "sphere",
+      "box",
+      "cylinder",
+      "cone",
+      "torus",
+      "capsule",
+      "icosahedron",
+      "ring",
+    ]);
+    const allowedAnims = new Set(["spin", "orbit", "pulse", "float", "none"]);
+
+    const obj = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+    const hay = `${title} ${subject || ""}`.toLowerCase();
+
+    let defaultArch = "architecture";
+    let defaultEnv = "studio";
+    let defaultPrimary = /^#[0-9a-fA-F]{6}$/.test(fallbackAccent) ? fallbackAccent : "#2563EB";
+    let defaultAccent = "#38BDF8";
+
+    if (/(solar|planet|sun|moon|orbit|galaxy|star|saturn|jupiter|mars|astronomy)/i.test(hay)) {
+      defaultArch = "solar";
+      defaultEnv = "space";
+      defaultPrimary = "#F59E0B";
+    } else if (/(dna|gene|helix|chromosome|rna|genetics|cell|mitochondria)/i.test(hay)) {
+      defaultArch = "dna";
+      defaultEnv = "lab";
+      defaultPrimary = "#06B6D4";
+      defaultAccent = "#EC4899";
+    } else if (/(heart|blood|circulat|artery|vein|organ|anatomy|human body)/i.test(hay)) {
+      defaultArch = "heart";
+      defaultEnv = "lab";
+      defaultPrimary = "#DC2626";
+      defaultAccent = "#3B82F6";
+    } else if (/(photosynthesis|plant|leaf|tree|flower|forest|botany|chlorophyll)/i.test(hay)) {
+      defaultArch = "plant";
+      defaultEnv = "outdoor";
+      defaultPrimary = "#10B981";
+      defaultAccent = "#FBBF24";
+    } else if (/(water cycle|rain|cloud|evaporat|condens|river|ocean|weather|climate)/i.test(hay)) {
+      defaultArch = "watercycle";
+      defaultEnv = "outdoor";
+      defaultPrimary = "#0284C7";
+      defaultAccent = "#F59E0B";
+    } else if (/(volcano|magma|lava|earthquake|tectonic|crust|geology)/i.test(hay)) {
+      defaultArch = "volcano";
+      defaultEnv = "sunset";
+      defaultPrimary = "#EA580C";
+      defaultAccent = "#FACC15";
+    } else if (/(rocket|spacecraft|launch|satellite|newton|gravity|thrust|airplane|flight)/i.test(hay)) {
+      defaultArch = "rocket";
+      defaultEnv = "space";
+      defaultPrimary = "#E2E8F0";
+      defaultAccent = "#F97316";
+    } else if (/(circuit|electric|ohm|voltage|chip|cpu|computer|robot|microchip|battery)/i.test(hay)) {
+      defaultArch = "circuit";
+      defaultEnv = "lab";
+      defaultPrimary = "#10B981";
+      defaultAccent = "#38BDF8";
+    } else if (/(atom|electron|proton|neutron|molecule|chemistry|periodic|quantum)/i.test(hay)) {
+      defaultArch = "atom";
+      defaultEnv = "lab";
+      defaultPrimary = "#6366F1";
+      defaultAccent = "#22D3EE";
+    } else if (/(earth|globe|world|continent|geography|map|latitude|longitude)/i.test(hay)) {
+      defaultArch = "earth";
+      defaultEnv = "space";
+      defaultPrimary = "#2563EB";
+      defaultAccent = "#10B981";
+    } else if (/(wave|sound|light|prism|optics|spectrum|rainbow|frequency|sine)/i.test(hay)) {
+      defaultArch = "wave";
+      defaultEnv = "studio";
+      defaultPrimary = "#8B5CF6";
+      defaultAccent = "#06B6D4";
+    }
+
+    const rawArch = String(obj.archetype || "").trim().toLowerCase();
+    const rawEnv = String(obj.environment || "").trim().toLowerCase();
+    const rawPrimary = String(obj.primaryColor || "").trim();
+    const rawAccent = String(obj.accentColor || "").trim();
+
+    const customParts = Array.isArray(obj.customParts)
+      ? obj.customParts
+          .slice(0, 12)
+          .map((p) => {
+            const part = (p && typeof p === "object" ? p : {}) as Record<string, unknown>;
+            const shape = String(part.shape || "box").toLowerCase();
+            const pos = Array.isArray(part.position) ? part.position : [0, 1, 0];
+            const rot = Array.isArray(part.rotation) ? part.rotation : undefined;
+            const scl = Array.isArray(part.scale) ? part.scale : [1, 1, 1];
+            const anim = String(part.animate || "none").toLowerCase();
+            return {
+              shape: allowedShapes.has(shape) ? shape : "box",
+              position: [
+                Number(pos[0]) || 0,
+                Number(pos[1]) || 1,
+                Number(pos[2]) || 0,
+              ] as [number, number, number],
+              ...(rot
+                ? {
+                    rotation: [
+                      Number(rot[0]) || 0,
+                      Number(rot[1]) || 0,
+                      Number(rot[2]) || 0,
+                    ] as [number, number, number],
+                  }
+                : {}),
+              scale: [
+                Math.max(0.12, Math.min(3.5, Number(scl[0]) || 1)),
+                Math.max(0.12, Math.min(3.5, Number(scl[1]) || 1)),
+                Math.max(0.12, Math.min(3.5, Number(scl[2]) || 1)),
+              ] as [number, number, number],
+              color: /^#[0-9a-fA-F]{6}$/.test(String(part.color || ""))
+                ? String(part.color)
+                : defaultPrimary,
+              metalness:
+                typeof part.metalness === "number"
+                  ? Math.max(0, Math.min(1, part.metalness))
+                  : 0.35,
+              roughness:
+                typeof part.roughness === "number"
+                  ? Math.max(0.05, Math.min(1, part.roughness))
+                  : 0.4,
+              ...(typeof part.emissive === "string" && /^#[0-9a-fA-F]{6}$/.test(part.emissive)
+                ? { emissive: part.emissive }
+                : {}),
+              ...(typeof part.opacity === "number"
+                ? { opacity: Math.max(0.2, Math.min(1, part.opacity)) }
+                : {}),
+              animate: allowedAnims.has(anim) ? anim : "none",
+            };
+          })
+      : undefined;
+
+    const archetype = allowedArchetypes.has(rawArch)
+      ? rawArch === "custom" && (!customParts || customParts.length < 3)
+        ? defaultArch
+        : rawArch
+      : defaultArch;
+
+    return {
+      archetype,
+      environment: allowedEnvs.has(rawEnv) ? rawEnv : defaultEnv,
+      primaryColor: /^#[0-9a-fA-F]{6}$/.test(rawPrimary) ? rawPrimary : defaultPrimary,
+      accentColor: /^#[0-9a-fA-F]{6}$/.test(rawAccent) ? rawAccent : defaultAccent,
+      title: title.slice(0, 90),
+      subtitle: subject || "Interactive 3D Real Render",
+      ...(customParts && customParts.length >= 3 ? { customParts } : {}),
+    };
+  }
+
+  // 6a. Free 3D Real Image & Labeled Diagram Generator (+ Real Wikimedia Photos)
   app.post("/api/study/picture", async (req, res) => {
     try {
       const { prompt, profile, subject, language } = req.body as {
@@ -2932,31 +3106,33 @@ async function startServer() {
       if (!cleanPrompt) {
         return res
           .status(400)
-          .json({ error: "Please describe the picture or diagram you want." });
+          .json({ error: "Please describe the 3D picture or diagram you want." });
       }
 
       const langRule = buildLanguageGuidance(
         language || profile?.preferredLanguage
       );
       const diagramSystem =
-        "You are Jogi Jarvis, an expert textbook illustrator and AI teacher. Create clean, accurate, colorful, well-labeled educational SVG illustrations and diagrams.";
+        "You are Jogi Jarvis, an expert 3D studio director, textbook illustrator, and AI teacher. Design BOTH a realistic 3D PBR scene blueprint (scene3d) AND a crisp labeled 2D SVG diagram.";
       const diagramPrompt = [
-        `Create a clear, colorful, textbook-quality SVG diagram/picture illustrating: "${cleanPrompt}".`,
+        `Create a realistic 3D PBR scene blueprint AND a colorful textbook SVG diagram illustrating: "${cleanPrompt}".`,
         subject && subject !== "All Subjects" ? `Subject: ${subject}.` : "",
         profile?.grade ? `Student level: ${profile.grade}.` : "",
-        "SVG Requirements:",
+        "3D Scene Blueprint Requirements (scene3d):",
+        "- Choose the best matching archetype from: solar, atom, dna, heart, plant, watercycle, rocket, circuit, earth, volcano, wave, architecture, custom.",
+        "- If the subject is a specific real-world object, monument, vehicle, animal, molecule, or geometry NOT covered by the specialized archetypes above, set archetype to \"custom\" and design 6 to 10 composite PBR 3D parts in customParts (using shapes: sphere, box, cylinder, cone, torus, capsule, icosahedron, ring; positions in [-2.5,2.5] X/Z and [0.3,3.5] Y; varied metalness & roughness; vibrant realistic hex colors; animations: spin, orbit, pulse, float, none) that assemble into a recognizable 3D sculpture.",
+        "- Choose environment: studio, space, outdoor, lab, or sunset.",
+        "2D SVG Requirements:",
         "- Root element MUST be <svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 800 520\">.",
-        "- Clean light background rectangle (#F8FAFC or subtle soft sky/card gradient) with a crisp title banner at top.",
-        "- Use rich vector shapes (circles, paths, arrows, rounded callout boxes, legends) and clear readable text labels (font-family=\"sans-serif\", font-size 13-22px) with plenty of spacing so labels NEVER overlap.",
-        "- Keep SVG self-contained (no external URLs, no scripts, no foreignObject).",
-        "- Also provide a short concise English searchQuery (2-4 words) for finding real reference photos on Wikimedia Commons, plus a warm 2-3 sentence teacher explanation.",
+        "- Clean light background rectangle (#F8FAFC or soft gradient) with a crisp title banner at top, rich vector shapes, and well-spaced readable labels (font-family=\"sans-serif\", font-size 13-22px). No external URLs, scripts, or foreignObject.",
+        "- Also provide a short English searchQuery (2-4 words) for Wikimedia Commons reference photos and a warm 2-3 sentence teacher explanation.",
         langRule,
       ]
         .filter(Boolean)
         .join("\n");
 
       const schemaHint =
-        '{"title":"string","caption":"string","explanation":"string","searchQuery":"2-4 English keywords","svgCode":"<svg xmlns=\\"http://www.w3.org/2000/svg\\" viewBox=\\"0 0 800 520\\">...</svg>"}';
+        '{"title":"string","caption":"string","explanation":"string","searchQuery":"2-4 English keywords","svgCode":"<svg xmlns=\\"http://www.w3.org/2000/svg\\" viewBox=\\"0 0 800 520\\">...</svg>","scene3d":{"archetype":"solar|atom|dna|heart|plant|watercycle|rocket|circuit|earth|volcano|wave|architecture|custom","environment":"studio|space|outdoor|lab|sunset","primaryColor":"#2563EB","accentColor":"#38BDF8","customParts":[{"shape":"sphere","position":[0,1.5,0],"scale":[1,1,1],"color":"#3B82F6","metalness":0.4,"roughness":0.3,"animate":"spin"}]}}';
 
       const diagramSchema = {
         type: Type.OBJECT,
@@ -2966,8 +3142,37 @@ async function startServer() {
           explanation: { type: Type.STRING },
           searchQuery: { type: Type.STRING },
           svgCode: { type: Type.STRING },
+          scene3d: {
+            type: Type.OBJECT,
+            properties: {
+              archetype: { type: Type.STRING },
+              environment: { type: Type.STRING },
+              primaryColor: { type: Type.STRING },
+              accentColor: { type: Type.STRING },
+              customParts: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    shape: { type: Type.STRING },
+                    position: { type: Type.ARRAY, items: { type: Type.NUMBER } },
+                    rotation: { type: Type.ARRAY, items: { type: Type.NUMBER } },
+                    scale: { type: Type.ARRAY, items: { type: Type.NUMBER } },
+                    color: { type: Type.STRING },
+                    metalness: { type: Type.NUMBER },
+                    roughness: { type: Type.NUMBER },
+                    emissive: { type: Type.STRING },
+                    opacity: { type: Type.NUMBER },
+                    animate: { type: Type.STRING },
+                  },
+                  required: ["shape", "position", "scale", "color"],
+                },
+              },
+            },
+            required: ["archetype", "environment", "primaryColor", "accentColor"],
+          },
         },
-        required: ["title", "caption", "explanation", "searchQuery", "svgCode"],
+        required: ["title", "caption", "explanation", "searchQuery", "svgCode", "scene3d"],
       };
 
       let generated: {
@@ -2976,6 +3181,7 @@ async function startServer() {
         explanation?: string;
         searchQuery?: string;
         svgCode?: string;
+        scene3d?: unknown;
       } = {};
 
       if (!hasGeminiKey() && hasAnyFallbackProvider()) {
@@ -3017,21 +3223,27 @@ async function startServer() {
       const photoQuery =
         String(generated.searchQuery || "").trim() || cleanPrompt;
       const photos = await searchWikimediaPhotos(photoQuery);
+      const resolvedTitle = String(generated.title || cleanPrompt).slice(0, 100);
+      const scene3d = normalizeServerScene3d(
+        generated.scene3d,
+        resolvedTitle,
+        subject
+      );
 
       return res.json({
         reply:
           String(generated.explanation || "").trim() ||
-          `Here is a visual study diagram and reference pictures for **${cleanPrompt}**.`,
-        diagram: sanitizedSvg
-          ? {
-              title: String(generated.title || cleanPrompt).slice(0, 100),
-              caption: String(generated.caption || "AI Study Illustration").slice(
-                0,
-                160
-              ),
-              svgCode: sanitizedSvg,
-            }
-          : undefined,
+          `Here is an interactive 3D real render, labeled diagram, and reference pictures for **${cleanPrompt}**.`,
+        diagram: {
+          title: resolvedTitle,
+          caption: String(
+            generated.caption || "Interactive 3D Real Render & Study Illustration"
+          ).slice(0, 160),
+          svgCode:
+            sanitizedSvg ||
+            `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 520"><rect width="800" height="520" fill="#F8FAFC"/><text x="400" y="260" text-anchor="middle" font-family="sans-serif" font-size="24" font-weight="700" fill="#0F172A">${resolvedTitle.replace(/[<>&"']/g, "")}</text></svg>`,
+          scene3d,
+        },
         photos,
       });
     } catch (err) {
@@ -3040,7 +3252,7 @@ async function startServer() {
     }
   });
 
-  // 6b. Free Animated Narrated Study Video Generator (+ Educational Video Links)
+  // 6b. Free 3D Real Animated Narrated Study Video Generator (+ Educational Video Links)
   app.post("/api/study/video", async (req, res) => {
     try {
       const { prompt, profile, subject, language } = req.body as {
@@ -3054,21 +3266,22 @@ async function startServer() {
       if (!cleanPrompt) {
         return res
           .status(400)
-          .json({ error: "Please enter a topic for the study video." });
+          .json({ error: "Please enter a topic for the 3D video." });
       }
 
       const activeLang = language || profile?.preferredLanguage || "Auto-Detect";
       const langRule = buildLanguageGuidance(activeLang);
       const videoSystem =
-        "You are Jogi Jarvis, an engaging educational video director and AI teacher. Design crisp 5-scene animated study explainer videos with warm narration and memorable takeaways.";
+        "You are Jogi Jarvis, an engaging 3D cinematic video director and AI teacher. Design crisp 5-scene 3D animated explainer videos with realistic PBR 3D stage direction, warm narration, and memorable takeaways.";
       const videoPrompt = [
-        `Design a 5-scene animated study explainer video about: "${cleanPrompt}".`,
+        `Design a 5-scene 3D real animated explainer video about: "${cleanPrompt}".`,
         subject && subject !== "All Subjects" ? `Subject: ${subject}.` : "",
         profile?.grade ? `Student level: ${profile.grade}.` : "",
         "Requirements:",
         "- Create exactly 5 clear sequential scenes (Intro -> Core Mechanism -> Key Example -> Real-World Connection -> Quick Recap).",
         "- For each scene, provide: heading (short, <= 6 words), narration (warm spoken teacher voiceover, 16-24 words), keyFact (1 crisp formula/takeaway <= 90 chars), bulletPoints (2-3 short scannable points), visualAccent (one of: sun, atom, globe, wave, chart, book, leaf, rocket, circuit, heart), durationSec (5 to 7).",
         "- Choose a vibrant hex themeColor (e.g. #2563EB, #059669, #7C3AED, #EA580C, #0284C7).",
+        "- Design a matching 3D PBR hero stage in scene3d (archetype: solar, atom, dna, heart, plant, watercycle, rocket, circuit, earth, volcano, wave, architecture, or custom with 6-10 composite customParts; environment: studio, space, outdoor, lab, or sunset).",
         "- Also include a short 2-sentence written summary in replyText and a clean 2-4 word English searchTopic for related study video links.",
         langRule,
       ]
@@ -3076,7 +3289,7 @@ async function startServer() {
         .join("\n");
 
       const schemaHint =
-        '{"title":"string","subtitle":"string","themeColor":"#2563EB","replyText":"string","searchTopic":"string","scenes":[{"heading":"string","narration":"string","keyFact":"string","visualAccent":"atom","bulletPoints":["string"],"durationSec":6}]}';
+        '{"title":"string","subtitle":"string","themeColor":"#2563EB","replyText":"string","searchTopic":"string","scene3d":{"archetype":"solar|atom|dna|heart|plant|watercycle|rocket|circuit|earth|volcano|wave|architecture|custom","environment":"studio|space|outdoor|lab|sunset","primaryColor":"#2563EB","accentColor":"#38BDF8"},"scenes":[{"heading":"string","narration":"string","keyFact":"string","visualAccent":"atom","bulletPoints":["string"],"durationSec":6}]}';
 
       const videoSchema = {
         type: Type.OBJECT,
@@ -3086,6 +3299,35 @@ async function startServer() {
           themeColor: { type: Type.STRING },
           replyText: { type: Type.STRING },
           searchTopic: { type: Type.STRING },
+          scene3d: {
+            type: Type.OBJECT,
+            properties: {
+              archetype: { type: Type.STRING },
+              environment: { type: Type.STRING },
+              primaryColor: { type: Type.STRING },
+              accentColor: { type: Type.STRING },
+              customParts: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    shape: { type: Type.STRING },
+                    position: { type: Type.ARRAY, items: { type: Type.NUMBER } },
+                    rotation: { type: Type.ARRAY, items: { type: Type.NUMBER } },
+                    scale: { type: Type.ARRAY, items: { type: Type.NUMBER } },
+                    color: { type: Type.STRING },
+                    metalness: { type: Type.NUMBER },
+                    roughness: { type: Type.NUMBER },
+                    emissive: { type: Type.STRING },
+                    opacity: { type: Type.NUMBER },
+                    animate: { type: Type.STRING },
+                  },
+                  required: ["shape", "position", "scale", "color"],
+                },
+              },
+            },
+            required: ["archetype", "environment", "primaryColor", "accentColor"],
+          },
           scenes: {
             type: Type.ARRAY,
             items: {
@@ -3118,6 +3360,7 @@ async function startServer() {
           "themeColor",
           "replyText",
           "searchTopic",
+          "scene3d",
           "scenes",
         ],
       };
@@ -3128,6 +3371,7 @@ async function startServer() {
         themeColor?: string;
         replyText?: string;
         searchTopic?: string;
+        scene3d?: unknown;
         scenes?: Array<{
           heading?: string;
           narration?: string;
@@ -3211,6 +3455,17 @@ async function startServer() {
           durationSec: Math.max(4, Math.min(9, Number(sc?.durationSec) || 6)),
         }));
 
+      const resolvedTitle = String(generated.title || cleanPrompt).slice(0, 90);
+      const themeColor = /^#[0-9a-fA-F]{6}$/.test(String(generated.themeColor || ""))
+        ? String(generated.themeColor)
+        : "#2563EB";
+      const scene3d = normalizeServerScene3d(
+        generated.scene3d,
+        resolvedTitle,
+        subject,
+        themeColor
+      );
+
       const searchTopic =
         String(generated.searchTopic || "").trim() || cleanPrompt;
       const videoLinks = buildStudyVideoLinks(searchTopic, subject);
@@ -3218,19 +3473,18 @@ async function startServer() {
       return res.json({
         reply:
           String(generated.replyText || "").trim() ||
-          `I created a ${normalizedScenes.length}-scene animated explainer video for **${cleanPrompt}**. Press **Play Video** to watch with narration or click **Download Video (.webm)** to save it.`,
+          `I created a ${normalizedScenes.length}-scene 3D real animated explainer video for **${cleanPrompt}**. Press **Play 3D Video** to watch with voice narration or click **Download 3D Video (.webm)** to save it.`,
         storyboard: {
-          title: String(generated.title || cleanPrompt).slice(0, 90),
-          subtitle: String(generated.subtitle || "Interactive Study Video").slice(
+          title: resolvedTitle,
+          subtitle: String(generated.subtitle || "3D Real Cinema Study Video").slice(
             0,
             120
           ),
           subject: subject || "General",
           language: activeLang,
-          themeColor: /^#[0-9a-fA-F]{6}$/.test(String(generated.themeColor || ""))
-            ? String(generated.themeColor)
-            : "#2563EB",
+          themeColor,
           scenes: normalizedScenes,
+          scene3d,
         },
         videoLinks,
       });

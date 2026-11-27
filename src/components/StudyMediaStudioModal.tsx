@@ -404,7 +404,7 @@ export function StudyMediaStudioModal({
               )}
             </div>
             <p className="text-[11px] text-slate-500 mt-0.5">
-              100% free web search, labeled SVG/PNG diagrams, reference photos &amp; narrated .webm videos
+              100% free web search, interactive 3D real images (PNG/SVG), reference photos &amp; 3D cinema .webm videos
             </p>
           </div>
 

@@ -1,25 +1,35 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Box,
   Download,
   ExternalLink,
   Film,
   Image as ImageIcon,
+  Layers,
   Loader2,
   Maximize2,
   Pause,
   Play,
   RotateCcw,
+  Sun,
   Volume2,
   VolumeX,
   X,
 } from "lucide-react";
 import type {
+  Study3DSceneBlueprint,
   StudyDiagramMedia,
   StudyPhotoResult,
   StudyVideoLink,
   StudyVideoScene,
   StudyVideoStoryboard,
 } from "../types";
+import {
+  infer3DSceneBlueprint,
+  Study3DViewportEngine,
+  type CameraPreset,
+  type LightingPreset,
+} from "../utils/study3dEngine";
 
 function slugifyFilename(text: string, fallback: string): string {
   const cleaned = text
@@ -62,9 +72,167 @@ function safeHexColor(color?: string): string {
   return "#2563EB";
 }
 
+function Interactive3DSceneStage({
+  blueprint,
+  heightClass = "h-[330px] sm:h-[380px]",
+  onEngineReady,
+}: {
+  blueprint: Study3DSceneBlueprint;
+  heightClass?: string;
+  onEngineReady?: (engine: Study3DViewportEngine | null) => void;
+}) {
+  const mountRef = useRef<HTMLDivElement | null>(null);
+  const engineRef = useRef<Study3DViewportEngine | null>(null);
+  const onEngineReadyRef = useRef(onEngineReady);
+  onEngineReadyRef.current = onEngineReady;
+
+  const [cameraPreset, setCameraPreset] = useState<CameraPreset>("hero");
+  const [lightingPreset, setLightingPreset] = useState<LightingPreset>("studio");
+  const [autoRotate, setAutoRotate] = useState(true);
+  const [webglError, setWebglError] = useState(false);
+
+  // Isolated WebGL lifecycle (never tears down on control state changes)
+  useEffect(() => {
+    const container = mountRef.current;
+    if (!container) return;
+
+    let engine: Study3DViewportEngine | null = null;
+    try {
+      const rect = container.getBoundingClientRect();
+      const width = Math.max(320, Math.round(rect.width || 640));
+      const height = Math.max(220, Math.round(rect.height || 360));
+      engine = new Study3DViewportEngine({
+        width,
+        height,
+        interactive: true,
+      });
+      engine.domElement.className = "w-full h-full block cursor-grab active:cursor-grabbing";
+      container.innerHTML = "";
+      container.appendChild(engine.domElement);
+      engine.loadBlueprint(blueprint);
+      engine.startLoop();
+      engineRef.current = engine;
+      onEngineReadyRef.current?.(engine);
+      setWebglError(false);
+    } catch {
+      setWebglError(true);
+      onEngineReadyRef.current?.(null);
+      return;
+    }
+
+    const ro = new ResizeObserver(() => {
+      if (!mountRef.current || !engineRef.current) return;
+      const r = mountRef.current.getBoundingClientRect();
+      if (r.width > 10 && r.height > 10) {
+        engineRef.current.resize(Math.round(r.width), Math.round(r.height));
+      }
+    });
+    ro.observe(container);
+
+    return () => {
+      ro.disconnect();
+      onEngineReadyRef.current?.(null);
+      engine?.dispose();
+      engineRef.current = null;
+      if (container) container.innerHTML = "";
+    };
+  }, [blueprint]);
+
+  if (webglError) {
+    return (
+      <div className={`w-full ${heightClass} bg-slate-900 text-slate-300 flex items-center justify-center text-xs px-4 text-center`}>
+        3D WebGL preview is unavailable on this browser—switch to the 2D Diagram tab above.
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative w-full bg-slate-950 overflow-hidden select-none">
+      {/* Isolated WebGL canvas mount */}
+      <div ref={mountRef} className={`w-full ${heightClass}`} />
+
+      {/* Top-left subtle static badge (no backdrop-blur over WebGL) */}
+      <div className="pointer-events-none absolute top-3 left-3 px-2.5 py-1 rounded-md bg-slate-950/85 border border-slate-700/70 text-[11px] font-semibold text-sky-300 flex items-center gap-1.5">
+        <Box className="h-3 w-3 shrink-0" />
+        <span>Interactive 3D Real Render · Drag to Orbit</span>
+      </div>
+
+      {/* Unified bottom control dock (solid surface, zero viewport occlusion) */}
+      <div className="px-3 py-2 bg-slate-900 border-t border-slate-800 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+        <div className="flex items-center gap-1 flex-wrap">
+          <span className="text-slate-400 font-medium mr-1">View:</span>
+          {(["hero", "closeup", "top", "side"] as const).map((preset) => (
+            <button
+              key={preset}
+              type="button"
+              onClick={() => {
+                setCameraPreset(preset);
+                engineRef.current?.setCameraPreset(preset);
+              }}
+              className={`px-2 py-0.5 rounded font-semibold capitalize transition-colors ${
+                cameraPreset === preset
+                  ? "bg-sky-500 text-slate-950"
+                  : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+              }`}
+            >
+              {preset === "closeup" ? "Close" : preset}
+            </button>
+          ))}
+          <button
+            type="button"
+            onClick={() => {
+              const next = !autoRotate;
+              setAutoRotate(next);
+              engineRef.current?.setAutoRotate(next);
+            }}
+            className={`px-2 py-0.5 rounded font-semibold transition-colors ${
+              autoRotate
+                ? "bg-blue-600 text-white"
+                : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+            }`}
+          >
+            {autoRotate ? "Spin On" : "Spin Off"}
+          </button>
+        </div>
+
+        <div className="flex items-center gap-1">
+          <Sun className="h-3 w-3 text-amber-400 mr-0.5" />
+          {(["studio", "dramatic", "daylight"] as const).map((light) => (
+            <button
+              key={light}
+              type="button"
+              onClick={() => {
+                setLightingPreset(light);
+                engineRef.current?.setLightingPreset(light);
+              }}
+              className={`px-2 py-0.5 rounded font-semibold capitalize transition-colors ${
+                lightingPreset === light
+                  ? "bg-amber-400 text-slate-950"
+                  : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+              }`}
+            >
+              {light}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function StudyDiagramCard({ diagram }: { diagram: StudyDiagramMedia }) {
+  const [viewMode, setViewMode] = useState<"3d" | "2d">("3d");
   const [expanded, setExpanded] = useState(false);
   const [downloadingPng, setDownloadingPng] = useState(false);
+  const inline3dEngineRef = useRef<Study3DViewportEngine | null>(null);
+  const modal3dEngineRef = useRef<Study3DViewportEngine | null>(null);
+
+  const resolvedBlueprint = useMemo<Study3DSceneBlueprint>(
+    () =>
+      diagram.scene3d ||
+      infer3DSceneBlueprint(diagram.title, diagram.caption),
+    [diagram.scene3d, diagram.title, diagram.caption]
+  );
 
   const svgDataUrl = useMemo(() => {
     const encoded = encodeURIComponent(diagram.svgCode);
@@ -86,6 +254,22 @@ export function StudyDiagramCard({ diagram }: { diagram: StudyDiagramMedia }) {
   const handleDownloadPng = async () => {
     setDownloadingPng(true);
     try {
+      // When in 3D Real Render mode, capture high-res WebGL 3D PNG directly!
+      const active3dEngine = expanded
+        ? modal3dEngineRef.current || inline3dEngineRef.current
+        : inline3dEngineRef.current;
+
+      if (viewMode === "3d" && active3dEngine) {
+        const pngUrl = active3dEngine.capturePngDataUrl(diagram.title);
+        if (pngUrl) {
+          const a = document.createElement("a");
+          a.href = pngUrl;
+          a.download = `${slugifyFilename(diagram.title, "3d-real-image")}-3d.png`;
+          a.click();
+          return;
+        }
+      }
+
       const img = new Image();
       img.crossOrigin = "anonymous";
       await new Promise<void>((resolve, reject) => {
@@ -117,7 +301,11 @@ export function StudyDiagramCard({ diagram }: { diagram: StudyDiagramMedia }) {
     <div className="rounded-xl border border-slate-200 bg-slate-50/70 overflow-hidden">
       <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2.5 bg-white border-b border-slate-200">
         <div className="flex items-center gap-2 min-w-0">
-          <ImageIcon className="h-4 w-4 text-blue-700 shrink-0" />
+          {viewMode === "3d" ? (
+            <Box className="h-4 w-4 text-sky-600 shrink-0" />
+          ) : (
+            <ImageIcon className="h-4 w-4 text-blue-700 shrink-0" />
+          )}
           <div className="min-w-0">
             <p className="text-xs font-semibold text-slate-900 truncate">
               {diagram.title}
@@ -129,7 +317,33 @@ export function StudyDiagramCard({ diagram }: { diagram: StudyDiagramMedia }) {
             )}
           </div>
         </div>
-        <div className="flex items-center gap-1.5 shrink-0">
+        <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
+          <div className="inline-flex items-center rounded-md bg-slate-100 p-0.5">
+            <button
+              type="button"
+              onClick={() => setViewMode("3d")}
+              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold transition-colors ${
+                viewMode === "3d"
+                  ? "bg-slate-900 text-sky-300"
+                  : "text-slate-600 hover:text-slate-900"
+              }`}
+            >
+              <Box className="h-3 w-3" />
+              <span>3D Real</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode("2d")}
+              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold transition-colors ${
+                viewMode === "2d"
+                  ? "bg-blue-700 text-white"
+                  : "text-slate-600 hover:text-slate-900"
+              }`}
+            >
+              <Layers className="h-3 w-3" />
+              <span>2D Diagram</span>
+            </button>
+          </div>
           <button
             type="button"
             disabled={downloadingPng}
@@ -141,19 +355,21 @@ export function StudyDiagramCard({ diagram }: { diagram: StudyDiagramMedia }) {
             ) : (
               <Download className="h-3 w-3" />
             )}
-            <span>PNG</span>
+            <span>{viewMode === "3d" ? "3D PNG" : "PNG"}</span>
           </button>
-          <button
-            type="button"
-            onClick={handleDownloadSvg}
-            className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 transition-colors whitespace-nowrap"
-          >
-            <span>SVG</span>
-          </button>
+          {viewMode === "2d" && (
+            <button
+              type="button"
+              onClick={handleDownloadSvg}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 transition-colors whitespace-nowrap"
+            >
+              <span>SVG</span>
+            </button>
+          )}
           <button
             type="button"
             onClick={() => setExpanded(true)}
-            aria-label="Expand study diagram"
+            aria-label="Expand 3D visual"
             className="inline-flex items-center justify-center h-7 w-7 rounded-md bg-white border border-slate-200 text-slate-600 hover:text-slate-900 hover:bg-slate-100 transition-colors"
           >
             <Maximize2 className="h-3.5 w-3.5" />
@@ -161,23 +377,32 @@ export function StudyDiagramCard({ diagram }: { diagram: StudyDiagramMedia }) {
         </div>
       </div>
 
-      <div className="p-3 bg-white flex items-center justify-center">
-        <img
-          src={svgDataUrl}
-          alt={diagram.title}
-          referrerPolicy="no-referrer"
-          className="w-full max-h-[420px] object-contain rounded-lg border border-slate-100 cursor-zoom-in"
-          onClick={() => setExpanded(true)}
+      {viewMode === "3d" ? (
+        <Interactive3DSceneStage
+          blueprint={resolvedBlueprint}
+          onEngineReady={(engine) => {
+            inline3dEngineRef.current = engine;
+          }}
         />
-      </div>
+      ) : (
+        <div className="p-3 bg-white flex items-center justify-center">
+          <img
+            src={svgDataUrl}
+            alt={diagram.title}
+            referrerPolicy="no-referrer"
+            className="w-full max-h-[420px] object-contain rounded-lg border border-slate-100 cursor-zoom-in"
+            onClick={() => setExpanded(true)}
+          />
+        </div>
+      )}
 
       {expanded && (
         <div
-          className="fixed inset-0 z-50 bg-slate-950/80 flex items-center justify-center p-4"
+          className="fixed inset-0 z-50 bg-slate-950/85 flex items-center justify-center p-4"
           onClick={() => setExpanded(false)}
         >
           <div
-            className="bg-white rounded-2xl max-w-5xl w-full max-h-[90vh] flex flex-col overflow-hidden shadow-2xl"
+            className="bg-white rounded-2xl max-w-5xl w-full max-h-[92vh] flex flex-col overflow-hidden shadow-2xl"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-slate-200">
@@ -191,26 +416,36 @@ export function StudyDiagramCard({ diagram }: { diagram: StudyDiagramMedia }) {
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-700 hover:bg-blue-800 text-white"
                 >
                   <Download className="h-3.5 w-3.5" />
-                  <span>Download PNG</span>
+                  <span>{viewMode === "3d" ? "Download 3D PNG" : "Download PNG"}</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => setExpanded(false)}
-                  aria-label="Close diagram preview"
+                  aria-label="Close preview"
                   className="h-8 w-8 inline-flex items-center justify-center rounded-lg text-slate-600 hover:bg-slate-100"
                 >
                   <X className="h-4 w-4" />
                 </button>
               </div>
             </div>
-            <div className="p-4 overflow-auto flex-1 flex items-center justify-center bg-slate-50">
-              <img
-                src={svgDataUrl}
-                alt={diagram.title}
-                referrerPolicy="no-referrer"
-                className="max-w-full max-h-[75vh] object-contain rounded-lg bg-white"
+            {viewMode === "3d" ? (
+              <Interactive3DSceneStage
+                blueprint={resolvedBlueprint}
+                heightClass="h-[68vh]"
+                onEngineReady={(engine) => {
+                  modal3dEngineRef.current = engine;
+                }}
               />
-            </div>
+            ) : (
+              <div className="p-4 overflow-auto flex-1 flex items-center justify-center bg-slate-50">
+                <img
+                  src={svgDataUrl}
+                  alt={diagram.title}
+                  referrerPolicy="no-referrer"
+                  className="max-w-full max-h-[75vh] object-contain rounded-lg bg-white"
+                />
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -617,104 +852,126 @@ function drawStudyVideoFrame(
   storyboard: StudyVideoStoryboard,
   sceneIndex: number,
   sceneProgress: number,
-  globalTimeSec: number
+  globalTimeSec: number,
+  webgl3dCanvas?: HTMLCanvasElement | null
 ) {
   const W = ctx.canvas.width;
   const H = ctx.canvas.height;
+  const scale = W / 960;
   const accent = safeHexColor(storyboard.themeColor);
   const scenes = storyboard.scenes;
   const scene = scenes[sceneIndex] || scenes[0];
   if (!scene) return;
 
-  // 1. Deep navy academic gradient backdrop
-  const bg = ctx.createLinearGradient(0, 0, W, H);
-  bg.addColorStop(0, "#0F172A");
-  bg.addColorStop(0.6, "#1E293B");
-  bg.addColorStop(1, "#0B1120");
-  ctx.fillStyle = bg;
-  ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.scale(scale, scale);
+  const vW = 960;
+  const vH = 540;
 
-  // 2. Subtle animated blueprint grid
-  ctx.strokeStyle = "rgba(148, 163, 184, 0.08)";
-  ctx.lineWidth = 1;
-  const offset = (globalTimeSec * 12) % 48;
-  for (let x = -48 + offset; x < W; x += 48) {
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, H);
-    ctx.stroke();
-  }
-  for (let y = 0; y < H; y += 48) {
-    ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(W, y);
-    ctx.stroke();
+  if (webgl3dCanvas && webgl3dCanvas.width > 0 && webgl3dCanvas.height > 0) {
+    // 1. Live Real 3D WebGL PBR Cinema Viewport
+    ctx.drawImage(webgl3dCanvas, 0, 0, vW, vH);
+
+    // Subtle left-to-right cinema scrim so typography reads razor-sharp while 3D hero shines on right
+    const scrim = ctx.createLinearGradient(0, 0, vW * 0.72, 0);
+    scrim.addColorStop(0, "rgba(2, 6, 23, 0.86)");
+    scrim.addColorStop(0.58, "rgba(2, 6, 23, 0.56)");
+    scrim.addColorStop(1, "rgba(2, 6, 23, 0.04)");
+    ctx.fillStyle = scrim;
+    ctx.fillRect(0, 0, vW, vH);
+  } else {
+    // Fallback 2D Slides Mode: Deep navy academic gradient backdrop
+    const bg = ctx.createLinearGradient(0, 0, vW, vH);
+    bg.addColorStop(0, "#0F172A");
+    bg.addColorStop(0.6, "#1E293B");
+    bg.addColorStop(1, "#0B1120");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, vW, vH);
+
+    ctx.strokeStyle = "rgba(148, 163, 184, 0.08)";
+    ctx.lineWidth = 1;
+    const offset = (globalTimeSec * 12) % 48;
+    for (let x = -48 + offset; x < vW; x += 48) {
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, vH);
+      ctx.stroke();
+    }
+    for (let y = 0; y < vH; y += 48) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(vW, y);
+      ctx.stroke();
+    }
   }
 
   // 3. Top header bar
-  ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
-  ctx.fillRect(0, 0, W, 62);
+  ctx.fillStyle = "rgba(2, 6, 23, 0.72)";
+  ctx.fillRect(0, 0, vW, 58);
   ctx.fillStyle = accent;
-  ctx.fillRect(0, 60, W, 2);
+  ctx.fillRect(0, 56, vW, 2);
 
   ctx.fillStyle = "#F8FAFC";
-  ctx.font = "700 20px Inter, system-ui, -apple-system, sans-serif";
-  ctx.fillText(storyboard.title.slice(0, 52), 28, 38);
+  ctx.font = "700 19px Inter, system-ui, -apple-system, sans-serif";
+  ctx.fillText(storyboard.title.slice(0, 48), 28, 36);
 
-  const badgeText = `Scene ${sceneIndex + 1} / ${scenes.length}`;
-  ctx.font = "600 13px Inter, system-ui, sans-serif";
+  const badgeText = webgl3dCanvas
+    ? `3D CINEMA · Scene ${sceneIndex + 1} / ${scenes.length}`
+    : `Scene ${sceneIndex + 1} / ${scenes.length}`;
+  ctx.font = "600 12px Inter, system-ui, sans-serif";
   const badgeW = ctx.measureText(badgeText).width + 24;
-  ctx.fillStyle = `${accent}33`;
-  drawRoundedRect(ctx, W - badgeW - 24, 17, badgeW, 28, 14);
+  ctx.fillStyle = `${accent}38`;
+  drawRoundedRect(ctx, vW - badgeW - 24, 15, badgeW, 28, 14);
   ctx.fill();
   ctx.strokeStyle = accent;
   ctx.lineWidth = 1.2;
   ctx.stroke();
   ctx.fillStyle = "#E2E8F0";
-  ctx.fillText(badgeText, W - badgeW - 12, 36);
+  ctx.fillText(badgeText, vW - badgeW - 12, 33);
 
   // 4. Left content column with smooth fade-in transition
   const fadeIn = Math.min(1, sceneProgress * 4.5);
   const slideX = (1 - fadeIn) * 18;
+  const colMaxW = webgl3dCanvas ? 450 : 540;
 
   ctx.save();
   ctx.globalAlpha = fadeIn;
 
   // Scene Heading
   ctx.fillStyle = "#FFFFFF";
-  ctx.font = "700 30px Inter, system-ui, -apple-system, sans-serif";
-  const headingLines = wrapCanvasLines(ctx, scene.heading, 540, 2);
+  ctx.font = "700 28px Inter, system-ui, -apple-system, sans-serif";
+  const headingLines = wrapCanvasLines(ctx, scene.heading, colMaxW, 2);
   headingLines.forEach((line, idx) => {
-    ctx.fillText(line, 34 + slideX, 118 + idx * 38);
+    ctx.fillText(line, 32 + slideX, 112 + idx * 36);
   });
 
   // Bullet Points (staggered reveal)
-  const bulletStartY = 122 + headingLines.length * 38 + 14;
-  ctx.font = "500 18px Inter, system-ui, -apple-system, sans-serif";
+  const bulletStartY = 118 + headingLines.length * 36 + 12;
+  ctx.font = "500 17px Inter, system-ui, -apple-system, sans-serif";
   const bullets = (scene.bulletPoints || []).slice(0, 3);
   bullets.forEach((pt, idx) => {
     const bulletAlpha = Math.min(1, Math.max(0, (sceneProgress - idx * 0.14) * 5));
     ctx.save();
     ctx.globalAlpha = fadeIn * bulletAlpha;
-    const by = bulletStartY + idx * 46;
+    const by = bulletStartY + idx * 44;
     ctx.fillStyle = accent;
     ctx.beginPath();
-    ctx.arc(44 + slideX, by - 6, 5, 0, Math.PI * 2);
+    ctx.arc(42 + slideX, by - 6, 4.5, 0, Math.PI * 2);
     ctx.fill();
 
-    ctx.fillStyle = "#CBD5E1";
-    const wrapped = wrapCanvasLines(ctx, pt, 505, 2);
+    ctx.fillStyle = "#E2E8F0";
+    const wrapped = wrapCanvasLines(ctx, pt, colMaxW - 30, 2);
     wrapped.forEach((line, lIdx) => {
-      ctx.fillText(line, 60 + slideX, by + lIdx * 20);
+      ctx.fillText(line, 56 + slideX, by + lIdx * 20);
     });
     ctx.restore();
   });
 
   // Highlighted Key Fact Card
   if (scene.keyFact) {
-    const cardY = 338;
-    ctx.fillStyle = "rgba(30, 41, 59, 0.92)";
-    drawRoundedRect(ctx, 34 + slideX, cardY, 540, 74, 12);
+    const cardY = 342;
+    ctx.fillStyle = "rgba(15, 23, 42, 0.88)";
+    drawRoundedRect(ctx, 32 + slideX, cardY, colMaxW, 74, 12);
     ctx.fill();
     ctx.strokeStyle = accent;
     ctx.lineWidth = 1.6;
@@ -722,39 +979,44 @@ function drawStudyVideoFrame(
 
     ctx.fillStyle = "#93C5FD";
     ctx.font = "700 11px Inter, system-ui, sans-serif";
-    ctx.fillText("KEY TAKEAWAY", 50 + slideX, cardY + 22);
+    ctx.fillText("KEY TAKEAWAY", 48 + slideX, cardY + 22);
 
     ctx.fillStyle = "#F8FAFC";
-    ctx.font = "600 16px Inter, system-ui, sans-serif";
-    const factLines = wrapCanvasLines(ctx, scene.keyFact, 508, 2);
+    ctx.font = "600 15px Inter, system-ui, sans-serif";
+    const factLines = wrapCanvasLines(ctx, scene.keyFact, colMaxW - 32, 2);
     factLines.forEach((line, idx) => {
-      ctx.fillText(line, 50 + slideX, cardY + 44 + idx * 20);
+      ctx.fillText(line, 48 + slideX, cardY + 43 + idx * 19);
     });
   }
 
   ctx.restore();
 
-  // 5. Right animated vector visual
-  drawSceneVisualAccent(ctx, scene.visualAccent, 770, 240, globalTimeSec, accent);
+  // 5. Right animated vector visual ONLY in 2D Slides mode
+  if (!webgl3dCanvas) {
+    drawSceneVisualAccent(ctx, scene.visualAccent, 770, 240, globalTimeSec, accent);
+  }
 
   // 6. Bottom subtitle / teacher narration bar
-  ctx.fillStyle = "rgba(2, 6, 23, 0.86)";
-  ctx.fillRect(0, H - 96, W, 96);
+  ctx.fillStyle = "rgba(2, 6, 23, 0.84)";
+  ctx.fillRect(0, vH - 92, vW, 92);
 
-  ctx.fillStyle = "#E2E8F0";
+  ctx.fillStyle = "#F1F5F9";
   ctx.font = "500 17px Inter, system-ui, -apple-system, sans-serif";
-  const subLines = wrapCanvasLines(ctx, scene.narration, W - 72, 2);
+  const subLines = wrapCanvasLines(ctx, scene.narration, vW - 72, 2);
   subLines.forEach((line, idx) => {
     const textW = ctx.measureText(line).width;
-    ctx.fillText(line, (W - textW) / 2, H - 56 + idx * 24);
+    ctx.fillText(line, (vW - textW) / 2, vH - 52 + idx * 24);
   });
 
   // 7. Overall timeline progress bar
-  const totalProgress = (sceneIndex + Math.min(1, sceneProgress)) / Math.max(1, scenes.length);
+  const totalProgress =
+    (sceneIndex + Math.min(1, sceneProgress)) / Math.max(1, scenes.length);
   ctx.fillStyle = "rgba(148, 163, 184, 0.25)";
-  ctx.fillRect(0, H - 6, W, 6);
+  ctx.fillRect(0, vH - 6, vW, 6);
   ctx.fillStyle = accent;
-  ctx.fillRect(0, H - 6, W * totalProgress, 6);
+  ctx.fillRect(0, vH - 6, vW * totalProgress, 6);
+
+  ctx.restore();
 }
 
 export function StudyVideoPlayer({
@@ -765,12 +1027,20 @@ export function StudyVideoPlayer({
   videoLinks?: StudyVideoLink[];
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const engine3dRef = useRef<Study3DViewportEngine | null>(null);
+  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const ttsCacheRef = useRef<Map<number, string>>(new Map());
+  const narrationRunIdRef = useRef(0);
+
+  const [renderMode, setRenderMode] = useState<"3d" | "2d">("3d");
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [sceneIndex, setSceneIndex] = useState(0);
   const [isExporting, setIsExporting] = useState(false);
   const [exportPercent, setExportPercent] = useState(0);
 
+  const renderModeRef = useRef(renderMode);
+  renderModeRef.current = renderMode;
   const isPlayingRef = useRef(isPlaying);
   isPlayingRef.current = isPlaying;
   const isMutedRef = useRef(isMuted);
@@ -783,7 +1053,54 @@ export function StudyVideoPlayer({
 
   const scenes = storyboard.scenes || [];
 
+  const resolvedBlueprint = useMemo<Study3DSceneBlueprint>(
+    () =>
+      storyboard.scene3d ||
+      infer3DSceneBlueprint(
+        storyboard.title,
+        storyboard.subject,
+        storyboard.themeColor
+      ),
+    [storyboard.scene3d, storyboard.title, storyboard.subject, storyboard.themeColor]
+  );
+
+  // Initialize dedicated offscreen 3D WebGL Cinema engine for the video player
+  useEffect(() => {
+    let engine: Study3DViewportEngine | null = null;
+    try {
+      engine = new Study3DViewportEngine({
+        width: 960,
+        height: 540,
+        interactive: false,
+      });
+      engine.loadBlueprint(resolvedBlueprint);
+      engine3dRef.current = engine;
+    } catch {
+      engine3dRef.current = null;
+    }
+    return () => {
+      engine?.dispose();
+      engine3dRef.current = null;
+    };
+  }, [resolvedBlueprint]);
+
+  // Clear TTS audio cache when storyboard changes
+  useEffect(() => {
+    const cache = ttsCacheRef.current;
+    cache.clear();
+  }, [storyboard]);
+
   const stopNarration = useCallback(() => {
+    narrationRunIdRef.current += 1;
+    if (ttsAudioRef.current) {
+      try {
+        ttsAudioRef.current.pause();
+        ttsAudioRef.current.src = "";
+      } catch {
+        // ignore
+      }
+      ttsAudioRef.current = null;
+    }
     if (typeof window !== "undefined" && "speechSynthesis" in window) {
       try {
         window.speechSynthesis.cancel();
@@ -793,15 +1110,12 @@ export function StudyVideoPlayer({
     }
   }, []);
 
-  const speakSceneNarration = useCallback(
-    (idx: number) => {
-      if (isMutedRef.current) return;
-      const scene = scenes[idx];
-      if (!scene?.narration) return;
+  const speakBrowserNarration = useCallback(
+    (narration: string) => {
       if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
       try {
         window.speechSynthesis.cancel();
-        const utter = new SpeechSynthesisUtterance(scene.narration);
+        const utter = new SpeechSynthesisUtterance(narration);
         utter.lang = getSpeechLangCode(storyboard.language);
         utter.volume = 1.0;
         utter.rate = 0.98;
@@ -810,15 +1124,79 @@ export function StudyVideoPlayer({
         // ignore speech synthesis errors
       }
     },
-    [scenes, storyboard.language]
+    [storyboard.language]
   );
 
-  // Main 60fps canvas animation loop
+  const speakSceneNarration = useCallback(
+    (idx: number) => {
+      if (isMutedRef.current) return;
+      const scene = scenes[idx];
+      if (!scene?.narration) return;
+
+      stopNarration();
+      const myRun = narrationRunIdRef.current;
+
+      // Offline immediate loud browser speech
+      if (typeof navigator !== "undefined" && !navigator.onLine) {
+        speakBrowserNarration(scene.narration);
+        return;
+      }
+
+      const playWavBase64 = (b64: string) => {
+        if (narrationRunIdRef.current !== myRun || isMutedRef.current) return;
+        const audio = new Audio(`data:audio/wav;base64,${b64}`);
+        audio.muted = false;
+        audio.volume = 1.0;
+        ttsAudioRef.current = audio;
+        audio.play().catch(() => {
+          if (narrationRunIdRef.current === myRun && !isMutedRef.current) {
+            speakBrowserNarration(scene.narration);
+          }
+        });
+      };
+
+      const cached = ttsCacheRef.current.get(idx);
+      if (cached) {
+        playWavBase64(cached);
+        return;
+      }
+
+      // Fetch loud broadcast-mastered voice from /api/tts with fast fallback to browser TTS
+      void fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: scene.narration,
+          voiceName: "Kore",
+          role: "student",
+          language: storyboard.language || "Auto-Detect",
+        }),
+      })
+        .then((res) => (res.ok ? res.json() : Promise.reject(new Error("TTS unavailable"))))
+        .then((data: { audioBase64?: string }) => {
+          if (!data?.audioBase64) throw new Error("Empty TTS");
+          ttsCacheRef.current.set(idx, data.audioBase64);
+          playWavBase64(data.audioBase64);
+        })
+        .catch(() => {
+          if (narrationRunIdRef.current === myRun && !isMutedRef.current) {
+            speakBrowserNarration(scene.narration);
+          }
+        });
+    },
+    [scenes, storyboard.language, stopNarration, speakBrowserNarration]
+  );
+
+  // Main 3D Cinema + 2D composite animation loop
   useEffect(() => {
     let rafId = 0;
+    let timerId = 0;
     let lastTs = performance.now();
+    let cancelled = false;
 
-    const tick = (now: number) => {
+    const tick = () => {
+      if (cancelled) return;
+      const now = performance.now();
       const dt = Math.min(0.1, (now - lastTs) / 1000);
       lastTs = now;
       globalTimeRef.current += dt;
@@ -855,15 +1233,39 @@ export function StudyVideoPlayer({
         const progress = isPlayingRef.current
           ? Math.min(1, sceneElapsedRef.current / dur)
           : Math.max(0.55, Math.min(1, sceneElapsedRef.current / dur));
-        drawStudyVideoFrame(ctx, storyboard, idx, progress, globalTimeRef.current);
+
+        let webglCanvas: HTMLCanvasElement | null = null;
+        if (renderModeRef.current === "3d" && engine3dRef.current) {
+          engine3dRef.current.renderCinematicFrame(
+            globalTimeRef.current,
+            idx,
+            progress
+          );
+          webglCanvas = engine3dRef.current.domElement;
+        }
+
+        drawStudyVideoFrame(
+          ctx,
+          storyboard,
+          idx,
+          progress,
+          globalTimeRef.current,
+          webglCanvas
+        );
       }
 
-      rafId = window.requestAnimationFrame(tick);
+      if (engine3dRef.current?.isSoftwareGl && renderModeRef.current === "3d") {
+        timerId = window.setTimeout(tick, 90);
+      } else {
+        rafId = window.requestAnimationFrame(tick);
+      }
     };
 
     rafId = window.requestAnimationFrame(tick);
     return () => {
+      cancelled = true;
       window.cancelAnimationFrame(rafId);
+      window.clearTimeout(timerId);
       stopNarration();
     };
   }, [scenes, storyboard, speakSceneNarration, stopNarration]);
@@ -874,7 +1276,6 @@ export function StudyVideoPlayer({
       stopNarration();
       return;
     }
-    // Restart if at the end
     const lastIdx = scenes.length - 1;
     const lastDur = Math.max(4, Math.min(10, scenes[lastIdx]?.durationSec || 6));
     if (sceneIndexRef.current >= lastIdx && sceneElapsedRef.current >= lastDur - 0.1) {
@@ -900,8 +1301,8 @@ export function StudyVideoPlayer({
   const handleDownloadWebm = async () => {
     if (isExporting || scenes.length === 0) return;
     const canvas = document.createElement("canvas");
-    canvas.width = 960;
-    canvas.height = 540;
+    canvas.width = 1280;
+    canvas.height = 720;
     const ctx = canvas.getContext("2d");
     if (!ctx || typeof canvas.captureStream !== "function" || typeof MediaRecorder === "undefined") {
       return;
@@ -912,7 +1313,21 @@ export function StudyVideoPlayer({
     setIsPlaying(false);
     stopNarration();
 
+    let export3dEngine: Study3DViewportEngine | null = null;
     try {
+      if (renderModeRef.current === "3d") {
+        try {
+          export3dEngine = new Study3DViewportEngine({
+            width: 1280,
+            height: 720,
+            interactive: false,
+          });
+          export3dEngine.loadBlueprint(resolvedBlueprint);
+        } catch {
+          export3dEngine = null;
+        }
+      }
+
       const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9")
         ? "video/webm;codecs=vp9"
         : MediaRecorder.isTypeSupported("video/webm;codecs=vp8")
@@ -922,7 +1337,7 @@ export function StudyVideoPlayer({
       const stream = canvas.captureStream(30);
       const recorder = new MediaRecorder(stream, {
         mimeType,
-        videoBitsPerSecond: 2_200_000,
+        videoBitsPerSecond: 3_600_000,
       });
       const chunks: Blob[] = [];
       recorder.ondataavailable = (ev) => {
@@ -935,8 +1350,7 @@ export function StudyVideoPlayer({
 
       recorder.start();
 
-      // Render every scene cleanly at ~3.8s per scene for comfortable reading in exported video
-      const secPerScene = 3.8;
+      const secPerScene = 4.0;
       const totalDuration = scenes.length * secPerScene;
       const startTime = performance.now();
 
@@ -950,7 +1364,17 @@ export function StudyVideoPlayer({
           }
           const idx = Math.min(scenes.length - 1, Math.floor(elapsed / secPerScene));
           const progress = (elapsed - idx * secPerScene) / secPerScene;
-          drawStudyVideoFrame(ctx, storyboard, idx, progress, elapsed);
+          if (export3dEngine) {
+            export3dEngine.renderCinematicFrame(elapsed, idx, progress);
+          }
+          drawStudyVideoFrame(
+            ctx,
+            storyboard,
+            idx,
+            progress,
+            elapsed,
+            export3dEngine?.domElement || null
+          );
           setExportPercent(Math.min(99, Math.round((elapsed / totalDuration) * 100)));
           window.requestAnimationFrame(renderStep);
         };
@@ -962,10 +1386,11 @@ export function StudyVideoPlayer({
       const url = URL.createObjectURL(videoBlob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${slugifyFilename(storyboard.title, "study-video")}.webm`;
+      a.download = `${slugifyFilename(storyboard.title, "3d-real-video")}-3d.webm`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 2000);
     } finally {
+      export3dEngine?.dispose();
       setIsExporting(false);
       setExportPercent(0);
     }
@@ -982,31 +1407,59 @@ export function StudyVideoPlayer({
               {storyboard.title}
             </p>
             <p className="text-[11px] text-slate-400 truncate">
-              Animated Study Video · {scenes.length} narrated scenes
+              {renderMode === "3d" ? "3D Real Cinema Video" : "2D Slide Video"} · {scenes.length} narrated scenes
             </p>
           </div>
         </div>
-        <button
-          type="button"
-          disabled={isExporting}
-          onClick={() => void handleDownloadWebm()}
-          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold bg-sky-600 hover:bg-sky-500 text-white disabled:opacity-60 transition-colors whitespace-nowrap shrink-0"
-        >
-          {isExporting ? (
-            <>
-              <Loader2 className="h-3 w-3 animate-spin" />
-              <span>Exporting {exportPercent}%…</span>
-            </>
-          ) : (
-            <>
-              <Download className="h-3 w-3" />
-              <span>Download Video (.webm)</span>
-            </>
-          )}
-        </button>
+        <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
+          <div className="inline-flex items-center rounded-md bg-slate-800 p-0.5">
+            <button
+              type="button"
+              onClick={() => setRenderMode("3d")}
+              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold transition-colors ${
+                renderMode === "3d"
+                  ? "bg-sky-500 text-slate-950"
+                  : "text-slate-300 hover:text-white"
+              }`}
+            >
+              <Box className="h-3 w-3" />
+              <span>3D Cinema</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setRenderMode("2d")}
+              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold transition-colors ${
+                renderMode === "2d"
+                  ? "bg-blue-600 text-white"
+                  : "text-slate-300 hover:text-white"
+              }`}
+            >
+              <Layers className="h-3 w-3" />
+              <span>2D</span>
+            </button>
+          </div>
+          <button
+            type="button"
+            disabled={isExporting}
+            onClick={() => void handleDownloadWebm()}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold bg-sky-600 hover:bg-sky-500 text-white disabled:opacity-60 transition-colors whitespace-nowrap shrink-0"
+          >
+            {isExporting ? (
+              <>
+                <Loader2 className="h-3 w-3 animate-spin" />
+                <span>Rendering 3D {exportPercent}%…</span>
+              </>
+            ) : (
+              <>
+                <Download className="h-3 w-3" />
+                <span>Download 3D Video (.webm)</span>
+              </>
+            )}
+          </button>
+        </div>
       </div>
 
-      {/* 16:9 Animated Video Viewport */}
+      {/* 16:9 3D Animated Video Viewport */}
       <div className="relative bg-slate-950 cursor-pointer" onClick={handleTogglePlay}>
         <canvas
           ref={canvasRef}
@@ -1039,7 +1492,7 @@ export function StudyVideoPlayer({
             ) : (
               <>
                 <Play className="h-3.5 w-3.5 fill-white" />
-                <span>Play Video</span>
+                <span>Play 3D Video</span>
               </>
             )}
           </button>

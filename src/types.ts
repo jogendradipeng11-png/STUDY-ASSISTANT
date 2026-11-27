@@ -59,10 +59,64 @@ export interface StudyPhotoResult {
   credit?: string;
 }
 
+export type Study3DArchetype =
+  | "solar"
+  | "atom"
+  | "dna"
+  | "heart"
+  | "plant"
+  | "watercycle"
+  | "rocket"
+  | "circuit"
+  | "earth"
+  | "volcano"
+  | "wave"
+  | "architecture"
+  | "custom";
+
+export type Study3DEnvironment =
+  | "studio"
+  | "space"
+  | "outdoor"
+  | "lab"
+  | "sunset";
+
+export interface Study3DPartSpec {
+  shape:
+    | "sphere"
+    | "box"
+    | "cylinder"
+    | "cone"
+    | "torus"
+    | "capsule"
+    | "icosahedron"
+    | "ring";
+  position: [number, number, number];
+  rotation?: [number, number, number];
+  scale: [number, number, number];
+  color: string;
+  metalness?: number;
+  roughness?: number;
+  emissive?: string;
+  opacity?: number;
+  animate?: "spin" | "orbit" | "pulse" | "float" | "none";
+}
+
+export interface Study3DSceneBlueprint {
+  archetype: Study3DArchetype;
+  environment: Study3DEnvironment;
+  primaryColor: string;
+  accentColor: string;
+  title: string;
+  subtitle?: string;
+  customParts?: Study3DPartSpec[];
+}
+
 export interface StudyDiagramMedia {
   title: string;
   caption: string;
   svgCode: string;
+  scene3d?: Study3DSceneBlueprint;
 }
 
 export interface StudyVideoScene {
@@ -91,6 +145,7 @@ export interface StudyVideoStoryboard {
   language?: string;
   themeColor: string;
   scenes: StudyVideoScene[];
+  scene3d?: Study3DSceneBlueprint;
 }
 
 export interface StudyVideoLink {

@@ -17,6 +17,7 @@ import {
   type LocalLlmProgress,
 } from "./localLlm";
 import { loadNotes } from "./storage";
+import { infer3DSceneBlueprint } from "./study3dEngine";
 
 type DiagramLayout = "cycle" | "flow" | "anatomy" | "comparison" | "concept";
 
@@ -893,6 +894,7 @@ export async function generateLocalStudyPicture(options: {
     title: plan.title,
     caption: plan.caption,
     svgCode,
+    scene3d: infer3DSceneBlueprint(plan.title, options.subject, plan.accentColor),
   };
 
   const photos = await fetchWikimediaPhotosIfOnline(cleanTopic);
@@ -1247,6 +1249,13 @@ export async function generateLocalStudyVideo(options: {
       options.prompt,
       resolvedSubject,
       options.language
+    );
+  }
+  if (!storyboard.scene3d) {
+    storyboard.scene3d = infer3DSceneBlueprint(
+      storyboard.title,
+      storyboard.subject,
+      storyboard.themeColor
     );
   }
 
