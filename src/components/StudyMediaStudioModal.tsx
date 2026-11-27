@@ -24,6 +24,15 @@ import {
   StudyVideoLinksStrip,
   StudyVideoPlayer,
 } from "./StudyMediaCards";
+import {
+  getSavedLocalModelKey,
+  isLocalBrowserEnginePreferred,
+} from "../utils/localLlm";
+import {
+  generateLocalStudyPicture,
+  generateLocalStudySearch,
+  generateLocalStudyVideo,
+} from "../utils/localStudyMedia";
 
 export type StudyMediaMode = "search" | "picture" | "video";
 
@@ -59,7 +68,7 @@ export function StudyMediaQuickButtons({
       <button
         type="button"
         onClick={() => onOpen("search")}
-        title="Free Web Search with photos & videos"
+        title="Free Search (works online & offline with Local AI)"
         className={`inline-flex items-center gap-1 ${btnPadding} rounded-md font-medium text-slate-700 hover:bg-white hover:text-blue-700 hover:shadow-2xs transition-colors whitespace-nowrap shrink-0`}
       >
         <Search className="h-3.5 w-3.5 text-blue-700 shrink-0" />
@@ -69,7 +78,7 @@ export function StudyMediaQuickButtons({
       <button
         type="button"
         onClick={() => onOpen("picture")}
-        title="Generate free labeled Picture / Diagram + reference photos"
+        title="Generate free labeled Picture / Diagram (works online & offline)"
         className={`inline-flex items-center gap-1 ${btnPadding} rounded-md font-medium text-slate-700 hover:bg-white hover:text-emerald-700 hover:shadow-2xs transition-colors whitespace-nowrap shrink-0`}
       >
         <ImageIcon className="h-3.5 w-3.5 text-emerald-700 shrink-0" />
@@ -79,7 +88,7 @@ export function StudyMediaQuickButtons({
       <button
         type="button"
         onClick={() => onOpen("video")}
-        title="Generate free 5-scene narrated Video (.webm download)"
+        title="Generate free 5-scene narrated Video (.webm download — works online & offline)"
         className={`inline-flex items-center gap-1 ${btnPadding} rounded-md font-medium text-slate-700 hover:bg-white hover:text-indigo-700 hover:shadow-2xs transition-colors whitespace-nowrap shrink-0`}
       >
         <Film className="h-3.5 w-3.5 text-indigo-700 shrink-0" />
@@ -112,10 +121,10 @@ const MODE_META: Record<
   }
 > = {
   search: {
-    label: "Web Search",
-    buttonLabel: "Search Web",
-    placeholder: "Search live web facts, study photos & videos on any topic...",
-    loadingText: "Searching live web facts, study photos & videos...",
+    label: "Search",
+    buttonLabel: "Search",
+    placeholder: "Search live web facts, study photos & videos (works offline with Local AI too)...",
+    loadingText: "Searching facts, study photos & visual breakdown...",
     examples: [
       "Photosynthesis process for students",
       "Solar system planets latest facts",
@@ -125,8 +134,8 @@ const MODE_META: Record<
   picture: {
     label: "Picture",
     buttonLabel: "Generate Picture",
-    placeholder: "Describe any diagram or picture to draw (e.g. Human Heart, Plant Cell)...",
-    loadingText: "Drawing labeled study picture & fetching reference photos...",
+    placeholder: "Describe any diagram or picture to draw (works online & offline)...",
+    loadingText: "Drawing labeled study picture & visual diagram...",
     examples: [
       "Labeled diagram of Human Heart",
       "Structure of a Plant Cell",
@@ -136,7 +145,7 @@ const MODE_META: Record<
   video: {
     label: "Video",
     buttonLabel: "Generate Video",
-    placeholder: "Enter a topic for a 5-scene narrated animated video...",
+    placeholder: "Enter a topic for a 5-scene narrated animated video (works offline too)...",
     loadingText: "Creating 5-scene narrated animated explainer video...",
     examples: [
       "How Newton's 3 Laws of Motion work",
@@ -180,7 +189,72 @@ export function StudyMediaStudioModal({
       setIsLoading(true);
       setErrorMsg(null);
 
+      const isOfflineNow =
+        typeof navigator !== "undefined" && !navigator.onLine;
+      const preferLocal = isOfflineNow || isLocalBrowserEnginePreferred();
+      const resolvedSubject =
+        subject || (profile.role === "student" ? "General" : undefined);
+      const resolvedLanguage =
+        language || profile.preferredLanguage || "Auto-Detect";
+
+      const runOnDevice = async (): Promise<StudioResult> => {
+        const modelKey = getSavedLocalModelKey();
+        if (targetMode === "picture") {
+          const pic = await generateLocalStudyPicture({
+            prompt: cleanPrompt,
+            profile,
+            subject: resolvedSubject,
+            language: resolvedLanguage,
+            modelKey,
+          });
+          return {
+            promptKey: cleanPrompt,
+            reply: pic.reply,
+            diagram: pic.diagram,
+            photos: pic.photos.length > 0 ? pic.photos : undefined,
+          };
+        }
+        if (targetMode === "video") {
+          const vid = await generateLocalStudyVideo({
+            prompt: cleanPrompt,
+            profile,
+            subject: resolvedSubject,
+            language: resolvedLanguage,
+            modelKey,
+          });
+          return {
+            promptKey: cleanPrompt,
+            reply: vid.reply,
+            storyboard: vid.storyboard,
+            videoLinks: vid.videoLinks.length > 0 ? vid.videoLinks : undefined,
+          };
+        }
+        const searchRes = await generateLocalStudySearch({
+          query: cleanPrompt,
+          profile,
+          subject: resolvedSubject,
+          language: resolvedLanguage,
+          modelKey,
+        });
+        return {
+          promptKey: cleanPrompt,
+          reply: searchRes.reply,
+          diagram: searchRes.diagram,
+          photos: searchRes.photos.length > 0 ? searchRes.photos : undefined,
+          videoLinks:
+            searchRes.videoLinks.length > 0 ? searchRes.videoLinks : undefined,
+          sources: searchRes.sources,
+        };
+      };
+
       try {
+        if (preferLocal) {
+          const localResult = await runOnDevice();
+          if (controller.signal.aborted) return;
+          setResultsByMode((prev) => ({ ...prev, [targetMode]: localResult }));
+          return;
+        }
+
         const endpoint =
           targetMode === "picture"
             ? "/api/study/picture"
@@ -194,9 +268,10 @@ export function StudyMediaStudioModal({
           signal: controller.signal,
           body: JSON.stringify({
             prompt: cleanPrompt,
+            query: cleanPrompt,
             profile,
-            subject: subject || (profile.role === "student" ? "General" : undefined),
-            language: language || profile.preferredLanguage || "Auto-Detect",
+            subject: resolvedSubject,
+            language: resolvedLanguage,
           }),
         });
 
@@ -234,11 +309,21 @@ export function StudyMediaStudioModal({
         if (err instanceof DOMException && err.name === "AbortError") {
           return;
         }
-        setErrorMsg(
-          err instanceof Error
-            ? err.message
-            : "Something went wrong while generating media."
-        );
+        // Seamless on-device / offline fallback so Picture, Video, and Search ALWAYS work!
+        try {
+          const fallbackResult = await runOnDevice();
+          if (controller.signal.aborted) return;
+          setResultsByMode((prev) => ({
+            ...prev,
+            [targetMode]: fallbackResult,
+          }));
+        } catch (fallbackErr) {
+          setErrorMsg(
+            fallbackErr instanceof Error
+              ? fallbackErr.message
+              : "Something went wrong while generating media."
+          );
+        }
       } finally {
         if (abortRef.current === controller) {
           setIsLoading(false);

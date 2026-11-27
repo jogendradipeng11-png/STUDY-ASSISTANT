@@ -26,6 +26,11 @@ import {
   StudyMediaStudioModal,
   type StudyMediaMode,
 } from "./StudyMediaStudioModal";
+import {
+  getSavedLocalModelKey,
+  isLocalBrowserEnginePreferred,
+} from "../utils/localLlm";
+import { generateLocalStudyNote } from "../utils/localStudyMedia";
 
 interface StudyNotesViewProps {
   notes: StudyNote[];
@@ -134,6 +139,13 @@ export function StudyNotesView({
       audioRef.current.pause();
       audioRef.current = null;
     }
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        // ignore
+      }
+    }
     setIsReadingAloud(false);
   };
 
@@ -176,43 +188,66 @@ export function StudyNotesView({
     try {
       const targetProfile =
         profiles.find((p) => p.id === newTargetProfileId) || activeProfile;
+      const isOfflineNow =
+        typeof navigator !== "undefined" && !navigator.onLine;
+      const preferLocal = isOfflineNow || isLocalBrowserEnginePreferred();
+      const targetLang =
+        newNoteLanguage || targetProfile.preferredLanguage || "Auto-Detect";
 
-      const res = await fetch("/api/notes/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          topicHint: newTopic.trim(),
-          profile: targetProfile,
-          subject: newSubject,
-          language: newNoteLanguage || targetProfile.preferredLanguage || "Auto-Detect",
-        }),
-      });
+      let created: StudyNote | null = null;
 
-      const data = await res.json();
-      if (!res.ok || !data.note) {
-        throw new Error(data.error || "Could not create study note.");
+      if (!preferLocal) {
+        try {
+          const res = await fetch("/api/notes/generate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              topicHint: newTopic.trim(),
+              profile: targetProfile,
+              subject: newSubject,
+              language: targetLang,
+            }),
+          });
+
+          const data = await res.json();
+          if (res.ok && data.note) {
+            const now = new Date().toISOString();
+            created = {
+              id: `note-topic-${Date.now()}`,
+              profileId: targetProfile.id,
+              profileName: targetProfile.name,
+              title: data.note.title || newTopic.trim().slice(0, 60),
+              subject: data.note.subject || newSubject,
+              summary: data.note.summary || "",
+              keyPoints: Array.isArray(data.note.keyPoints)
+                ? data.note.keyPoints
+                : [],
+              definitions: Array.isArray(data.note.definitions)
+                ? data.note.definitions
+                : [],
+              practiceQuestions: Array.isArray(data.note.practiceQuestions)
+                ? data.note.practiceQuestions
+                : [],
+              teacherTip: data.note.teacherTip || "",
+              createdAt: now,
+              updatedAt: now,
+              sourceMode: "topic",
+            };
+          }
+        } catch {
+          // Fall through to on-device Local LLM / offline note generator
+        }
       }
 
-      const now = new Date().toISOString();
-      const created: StudyNote = {
-        id: `note-topic-${Date.now()}`,
-        profileId: targetProfile.id,
-        profileName: targetProfile.name,
-        title: data.note.title || newTopic.trim().slice(0, 60),
-        subject: data.note.subject || newSubject,
-        summary: data.note.summary || "",
-        keyPoints: Array.isArray(data.note.keyPoints) ? data.note.keyPoints : [],
-        definitions: Array.isArray(data.note.definitions)
-          ? data.note.definitions
-          : [],
-        practiceQuestions: Array.isArray(data.note.practiceQuestions)
-          ? data.note.practiceQuestions
-          : [],
-        teacherTip: data.note.teacherTip || "",
-        createdAt: now,
-        updatedAt: now,
-        sourceMode: "topic",
-      };
+      if (!created) {
+        created = await generateLocalStudyNote({
+          topic: newTopic.trim(),
+          profile: targetProfile,
+          subject: newSubject,
+          language: targetLang,
+          modelKey: getSavedLocalModelKey(),
+        });
+      }
 
       onAddNote(created);
       onSelectNote(created.id);
@@ -248,33 +283,64 @@ export function StudyNotesView({
         .filter(Boolean)
         .join(" ");
 
-      const res = await fetch("/api/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: narration,
-          voiceName: owner.voiceName,
-          role: owner.role,
-          language: owner.preferredLanguage || "Auto-Detect",
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || "Could not generate voice summary.");
+      const speakOffline = (): boolean => {
+        if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+          return false;
+        }
+        try {
+          window.speechSynthesis.cancel();
+          const utter = new SpeechSynthesisUtterance(narration.slice(0, 2200));
+          utter.rate = 0.96;
+          utter.onend = () => setIsReadingAloud(false);
+          utter.onerror = () => setIsReadingAloud(false);
+          setIsReadingAloud(true);
+          window.speechSynthesis.speak(utter);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+
+      if (typeof navigator !== "undefined" && !navigator.onLine) {
+        if (!speakOffline()) {
+          throw new Error("Offline voice synthesis is unavailable in this browser.");
+        }
+        return;
       }
 
-      const audio = new Audio(`data:audio/wav;base64,${data.audioBase64}`);
-      audioRef.current = audio;
-      setIsReadingAloud(true);
-      audio.onended = () => {
-        setIsReadingAloud(false);
-        audioRef.current = null;
-      };
-      audio.onerror = () => {
-        setIsReadingAloud(false);
-        audioRef.current = null;
-      };
-      await audio.play();
+      try {
+        const res = await fetch("/api/tts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: narration,
+            voiceName: owner.voiceName,
+            role: owner.role,
+            language: owner.preferredLanguage || "Auto-Detect",
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.audioBase64) {
+          throw new Error(data.error || "Could not generate voice summary.");
+        }
+
+        const audio = new Audio(`data:audio/wav;base64,${data.audioBase64}`);
+        audioRef.current = audio;
+        setIsReadingAloud(true);
+        audio.onended = () => {
+          setIsReadingAloud(false);
+          audioRef.current = null;
+        };
+        audio.onerror = () => {
+          setIsReadingAloud(false);
+          audioRef.current = null;
+        };
+        await audio.play();
+      } catch {
+        if (!speakOffline()) {
+          throw new Error("Audio playback failed.");
+        }
+      }
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Audio playback failed.");
     } finally {

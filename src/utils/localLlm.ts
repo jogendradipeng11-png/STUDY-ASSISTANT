@@ -860,3 +860,131 @@ export async function streamLocalLlmChat(options: {
     }
   }
 }
+
+export function getSavedLocalModelKey(): string {
+  try {
+    const saved = localStorage.getItem("jogi_jarvis_local_model_v1");
+    if (saved && LOCAL_LLM_MODELS.some((m) => m.key === saved)) {
+      return saved;
+    }
+  } catch {
+    // ignore
+  }
+  return "llama-3.2-1b";
+}
+
+export function isLocalBrowserEnginePreferred(): boolean {
+  try {
+    return localStorage.getItem("jogi_jarvis_engine_v1") === "local-browser";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Returns the best Local LLM model key that can actually run right now.
+ * When offline, only returns an already-loaded or already-downloaded cached model
+ * so it never stalls trying to download weights without internet.
+ */
+export function getReadyLocalModelKey(preferredKey?: string): string | null {
+  if (loadedModelKey) return loadedModelKey;
+  const cached = getRecordedDownloadedModels();
+  const desired = preferredKey || getSavedLocalModelKey();
+  if (cached.includes(desired)) return desired;
+  if (cached.length > 0) return cached[0];
+  const isOnline = typeof navigator === "undefined" ? true : navigator.onLine;
+  return isOnline ? desired : null;
+}
+
+/**
+ * Runs a single structured or free-text prompt against the On-Device Local LLM
+ * with automatic WebGPU device-lost recovery.
+ */
+export async function generateLocalLlmPrompt(options: {
+  modelKey?: string;
+  systemPrompt: string;
+  userPrompt: string;
+  maxTokens?: number;
+  temperature?: number;
+  onProgress?: (info: LocalLlmProgress) => void;
+}): Promise<string> {
+  if (activeInferencePromise) {
+    try {
+      await activeInferencePromise;
+    } catch {
+      // ignore previous failure
+    }
+  }
+
+  const targetKey = options.modelKey || getSavedLocalModelKey();
+  const modelMeta =
+    LOCAL_LLM_MODELS.find((m) => m.key === targetKey) || LOCAL_LLM_MODELS[2];
+
+  const runOnce = async (lowMemoryMode: boolean, forceReload: boolean) => {
+    const engine = await loadLocalLlmModel(modelMeta.key, options.onProgress, {
+      forceReload,
+      lowMemoryMode,
+    });
+
+    if (typeof engine.resetChat === "function") {
+      try {
+        await engine.resetChat(false);
+      } catch {
+        // ignore
+      }
+    }
+
+    const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> =
+      /gemma/i.test(modelMeta.key)
+        ? [
+            {
+              role: "user",
+              content: `Instructions: ${options.systemPrompt}\n\nRequest: ${options.userPrompt}`,
+            },
+          ]
+        : [
+            { role: "system", content: options.systemPrompt },
+            { role: "user", content: options.userPrompt },
+          ];
+
+    const completion = await engine.chat.completions.create({
+      messages,
+      stream: true,
+      temperature: options.temperature ?? 0.4,
+      max_tokens: lowMemoryMode ? Math.min(options.maxTokens ?? 700, 550) : (options.maxTokens ?? 900),
+    });
+
+    let raw = "";
+    for await (const chunk of completion) {
+      const delta = chunk.choices?.[0]?.delta?.content;
+      if (delta) raw += delta;
+    }
+    return stripLocalThinkingTags(raw);
+  };
+
+  const task = (async (): Promise<string> => {
+    try {
+      return await runOnce(false, false);
+    } catch (firstErr) {
+      if (!isWebGpuContextError(firstErr)) throw firstErr;
+      await unloadLocalLlmModel();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      try {
+        return await runOnce(true, true);
+      } catch (retryErr) {
+        await unloadLocalLlmModel();
+        throw retryErr;
+      }
+    }
+  })();
+
+  activeInferencePromise = task;
+  try {
+    return await task;
+  } finally {
+    if (activeInferencePromise === task) {
+      activeInferencePromise = null;
+    }
+  }
+}
+

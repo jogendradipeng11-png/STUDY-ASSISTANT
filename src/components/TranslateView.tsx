@@ -39,6 +39,11 @@ import {
   StudyMediaStudioModal,
   type StudyMediaMode,
 } from "./StudyMediaStudioModal";
+import {
+  generateLocalLlmPrompt,
+  getReadyLocalModelKey,
+  isLocalBrowserEnginePreferred,
+} from "../utils/localLlm";
 
 type SessionStatus = "idle" | "connecting" | "connected" | "error";
 type TransportMode = "live-ws" | "handsfree-https";
@@ -1208,29 +1213,85 @@ export function TranslateView({ profile }: TranslateViewProps) {
     }
 
     try {
-      const res = await fetch("/api/translate/conversation", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: clean,
-          myLanguage: effectiveMyLanguage,
-          otherLanguage: effectiveOtherLanguage,
-          lastOtherLanguage: lastDetectedOtherLang,
-          direction: "me_to_them",
-          sameLanguageAnswer: sameLanguageReplyMode || isSameLanguage,
-        }),
-      });
-      const data = (await res.json()) as {
-        originalText?: string;
-        detectedLanguage?: string;
-        targetLanguage?: string;
-        translatedText?: string;
-        pronunciation?: string;
-        suggestedReplies?: string[];
-        error?: string;
-      };
-      if (!res.ok || !data.translatedText) {
-        throw new Error(data.error || "Could not interpret right now.");
+      const isOfflineNow =
+        typeof navigator !== "undefined" && !navigator.onLine;
+      const preferLocal = isOfflineNow || isLocalBrowserEnginePreferred();
+      const targetLang =
+        isOtherAuto && lastDetectedOtherLang
+          ? lastDetectedOtherLang
+          : isOtherAuto
+            ? effectiveMyLanguage
+            : effectiveOtherLanguage;
+
+      let translatedText = "";
+      let originalText = clean;
+      let detectedLanguage = effectiveMyLanguage;
+      let resolvedTargetLanguage = targetLang;
+      let pronunciation = "";
+      let suggestedReplies: string[] = [];
+
+      if (!preferLocal) {
+        try {
+          const res = await fetch("/api/translate/conversation", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              text: clean,
+              myLanguage: effectiveMyLanguage,
+              otherLanguage: effectiveOtherLanguage,
+              lastOtherLanguage: lastDetectedOtherLang,
+              direction: "me_to_them",
+              sameLanguageAnswer: sameLanguageReplyMode || isSameLanguage,
+            }),
+          });
+          const data = (await res.json()) as {
+            originalText?: string;
+            detectedLanguage?: string;
+            targetLanguage?: string;
+            translatedText?: string;
+            pronunciation?: string;
+            suggestedReplies?: string[];
+            error?: string;
+          };
+          if (res.ok && data.translatedText) {
+            translatedText = data.translatedText;
+            originalText = data.originalText || clean;
+            detectedLanguage = data.detectedLanguage || effectiveMyLanguage;
+            resolvedTargetLanguage = data.targetLanguage || targetLang;
+            pronunciation = data.pronunciation || "";
+            suggestedReplies = Array.isArray(data.suggestedReplies)
+              ? data.suggestedReplies
+              : [];
+          }
+        } catch {
+          // Fall through to on-device Local LLM translation
+        }
+      }
+
+      if (!translatedText) {
+        const localKey = getReadyLocalModelKey();
+        if (localKey) {
+          const localOut = await generateLocalLlmPrompt({
+            modelKey: localKey,
+            systemPrompt: `You are an expert translator. Translate the user's text naturally into ${targetLang}. Return ONLY the translated sentence(s) without extra commentary.`,
+            userPrompt: clean,
+            maxTokens: 320,
+            temperature: 0.2,
+          });
+          if (localOut.trim()) {
+            translatedText = localOut.trim();
+            detectedLanguage = "On-Device Local AI";
+            resolvedTargetLanguage = targetLang;
+          }
+        }
+      }
+
+      if (!translatedText) {
+        throw new Error(
+          isOfflineNow
+            ? "Offline translation needs a downloaded Local AI model. Download Llama 3.2 1B or Qwen 2.5 1.5B in Assistant Desk once while online to translate 100% offline."
+            : "Could not interpret right now."
+        );
       }
 
       const nowTime = new Date().toLocaleTimeString([], {
@@ -1240,14 +1301,12 @@ export function TranslateView({ profile }: TranslateViewProps) {
       const entry: InterpreterEntry = {
         id: `typed-${Date.now()}`,
         speaker: "interpreter",
-        text: data.translatedText,
-        secondaryText: data.originalText || clean,
-        pronunciation: data.pronunciation || "",
-        metaLabel: `${data.detectedLanguage || effectiveMyLanguage} → ${data.targetLanguage || effectiveOtherLanguage}`,
-        targetLanguage: data.targetLanguage || effectiveOtherLanguage,
-        suggestedReplies: Array.isArray(data.suggestedReplies)
-          ? data.suggestedReplies
-          : [],
+        text: translatedText,
+        secondaryText: originalText,
+        pronunciation,
+        metaLabel: `${detectedLanguage} → ${resolvedTargetLanguage}`,
+        targetLanguage: resolvedTargetLanguage,
+        suggestedReplies,
         timestamp: nowTime,
       };
       setEntries((prev) => [...prev, entry]);

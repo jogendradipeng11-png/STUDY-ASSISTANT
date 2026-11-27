@@ -74,6 +74,7 @@ import {
   checkWebGpuSupport,
   deleteCachedLocalModel,
   getLoadedLocalModelKey,
+  getReadyLocalModelKey,
   getRecordedDownloadedModels,
   loadLocalLlmModel,
   streamLocalLlmChat,
@@ -82,6 +83,13 @@ import {
   type LocalLlmProgress,
   type WebGpuSupportInfo,
 } from "../utils/localLlm";
+import {
+  buildInstantOfflineChatFallback,
+  generateLocalStudyNote,
+  generateLocalStudyPicture,
+  generateLocalStudySearch,
+  generateLocalStudyVideo,
+} from "../utils/localStudyMedia";
 import { LanguagePicker } from "./LanguagePicker";
 import {
   MobileTaskModal,
@@ -739,6 +747,16 @@ export function AssistantView({
     setLoadingTtsId(messageId);
     setErrorMsg(null);
 
+    // Offline immediate browser voice playback (no 15s wait for /api/tts)
+    if (typeof navigator !== "undefined" && !navigator.onLine) {
+      window.clearTimeout(timeoutId);
+      const ok = speakWithBrowserFallback(messageId, text, myToken);
+      if (!ok) {
+        setLoadingTtsId(null);
+      }
+      return;
+    }
+
     try {
       const res = await fetch("/api/tts", {
         method: "POST",
@@ -843,46 +861,70 @@ export function AssistantView({
     setErrorMsg(null);
 
     try {
-      const res = await fetch("/api/notes/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          content,
-          profile,
-          subject:
-            profile.role === "parent"
-              ? "Personal"
-              : subject === "All Subjects"
-                ? "General"
-                : subject,
-          language: activeLanguage,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok || !data.note) {
-        throw new Error(data.error || "Could not create study note.");
+      const targetSubject =
+        profile.role === "parent"
+          ? "Personal"
+          : subject === "All Subjects"
+            ? "General"
+            : subject;
+      const isOfflineNow =
+        typeof navigator !== "undefined" && !navigator.onLine;
+      const preferLocal = engine === "local-browser" || isOfflineNow;
+
+      let newNote: StudyNote | null = null;
+
+      if (!preferLocal) {
+        try {
+          const res = await fetch("/api/notes/generate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              content,
+              profile,
+              subject: targetSubject,
+              language: activeLanguage,
+            }),
+          });
+          const data = await res.json();
+          if (res.ok && data.note) {
+            const now = new Date().toISOString();
+            newNote = {
+              id: `note-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              profileId: profile.id,
+              profileName: profile.name,
+              title: data.note.title || "Study Note",
+              subject: data.note.subject || subject || "General",
+              summary: data.note.summary || "",
+              keyPoints: Array.isArray(data.note.keyPoints)
+                ? data.note.keyPoints
+                : [],
+              definitions: Array.isArray(data.note.definitions)
+                ? data.note.definitions
+                : [],
+              practiceQuestions: Array.isArray(data.note.practiceQuestions)
+                ? data.note.practiceQuestions
+                : [],
+              teacherTip: data.note.teacherTip || "",
+              createdAt: now,
+              updatedAt: now,
+              sourceMode: "chat",
+            };
+          }
+        } catch {
+          // Fall through to on-device Local LLM / offline note builder
+        }
       }
 
-      const now = new Date().toISOString();
-      const newNote: StudyNote = {
-        id: `note-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        profileId: profile.id,
-        profileName: profile.name,
-        title: data.note.title || "Study Note",
-        subject: data.note.subject || subject || "General",
-        summary: data.note.summary || "",
-        keyPoints: Array.isArray(data.note.keyPoints) ? data.note.keyPoints : [],
-        definitions: Array.isArray(data.note.definitions)
-          ? data.note.definitions
-          : [],
-        practiceQuestions: Array.isArray(data.note.practiceQuestions)
-          ? data.note.practiceQuestions
-          : [],
-        teacherTip: data.note.teacherTip || "",
-        createdAt: now,
-        updatedAt: now,
-        sourceMode: "chat",
-      };
+      if (!newNote) {
+        const localNote = await generateLocalStudyNote({
+          topic: content.slice(0, 600),
+          profile,
+          subject: targetSubject,
+          language: activeLanguage,
+          modelKey: localModelKey,
+        });
+        newNote = { ...localNote, sourceMode: "chat" };
+      }
 
       onSaveNote(newNote);
 
@@ -1047,33 +1089,69 @@ export function AssistantView({
     setActiveMediaTask(effectiveMode === "chat" ? null : effectiveMode);
 
     try {
-      // Dedicated Study Media modes: Search (Web + Photos + Videos), Picture/Diagram, or Narrated Explainer Video
+      const isOfflineNow =
+        typeof navigator !== "undefined" && !navigator.onLine;
+      const preferLocalMedia = engine === "local-browser" || isOfflineNow;
+
+      const handleLocalProgress = (info: LocalLlmProgress) => {
+        setLocalProgress(info);
+        setLocalStatus(info.progress >= 1 ? "ready" : "loading");
+      };
+
+      // Dedicated Study Media modes: Picture/Diagram, Narrated Explainer Video, or Search (works in Cloud, Local AI, AND Offline!)
       if (effectiveMode === "picture") {
-        const res = await fetch("/api/study/picture", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
+        let replyContent = "";
+        let diagram: ChatMessage["studyDiagram"];
+        let photos: ChatMessage["studyPhotos"];
+
+        if (!preferLocalMedia) {
+          try {
+            const res = await fetch("/api/study/picture", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                prompt: promptText,
+                profile,
+                subject: profile.role === "student" ? subject : undefined,
+                language: activeLanguage,
+              }),
+            });
+            const data = await res.json();
+            if (res.ok && data.diagram) {
+              replyContent =
+                data.reply ||
+                `Here is your visual study diagram for **${promptText}**.`;
+              diagram = data.diagram;
+              photos = Array.isArray(data.photos) ? data.photos : undefined;
+            }
+          } catch {
+            // Fall through to on-device Local LLM / offline generator
+          }
+        }
+
+        if (!diagram) {
+          const localPic = await generateLocalStudyPicture({
             prompt: promptText,
             profile,
             subject: profile.role === "student" ? subject : undefined,
             language: activeLanguage,
-          }),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(
-            data.error || "Could not generate the study picture right now."
-          );
+            modelKey: localModelKey,
+            onProgress: handleLocalProgress,
+          });
+          replyContent = localPic.reply;
+          diagram = localPic.diagram;
+          photos = localPic.photos.length > 0 ? localPic.photos : undefined;
+          if (localPic.usedLocalLlm) setLocalStatus("ready");
         }
+
         const assistantMsg: ChatMessage = {
           id: `a-${Date.now()}`,
           role: "assistant",
-          content:
-            data.reply || `Here is your visual study diagram for **${promptText}**.`,
+          content: replyContent,
           timestamp: new Date().toISOString(),
           subject: profile.role === "student" ? subject : undefined,
-          studyDiagram: data.diagram,
-          studyPhotos: Array.isArray(data.photos) ? data.photos : undefined,
+          studyDiagram: diagram,
+          studyPhotos: photos,
         };
         onUpdateMessages(profile.id, [...nextMessages, assistantMsg]);
         if (autoSpeakRef.current) {
@@ -1083,34 +1161,61 @@ export function AssistantView({
       }
 
       if (effectiveMode === "video") {
-        const res = await fetch("/api/study/video", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
+        let replyContent = "";
+        let storyboard: ChatMessage["studyVideo"];
+        let videoLinks: ChatMessage["studyVideoLinks"];
+
+        if (!preferLocalMedia) {
+          try {
+            const res = await fetch("/api/study/video", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                prompt: promptText,
+                profile,
+                subject: profile.role === "student" ? subject : undefined,
+                language: activeLanguage,
+              }),
+            });
+            const data = await res.json();
+            if (res.ok && data.storyboard) {
+              replyContent =
+                data.reply ||
+                `Here is your animated study explainer video for **${promptText}**.`;
+              storyboard = data.storyboard;
+              videoLinks = Array.isArray(data.videoLinks)
+                ? data.videoLinks
+                : undefined;
+            }
+          } catch {
+            // Fall through to on-device Local LLM / offline video generator
+          }
+        }
+
+        if (!storyboard) {
+          const localVid = await generateLocalStudyVideo({
             prompt: promptText,
             profile,
             subject: profile.role === "student" ? subject : undefined,
             language: activeLanguage,
-          }),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(
-            data.error || "Could not create the study video right now."
-          );
+            modelKey: localModelKey,
+            onProgress: handleLocalProgress,
+          });
+          replyContent = localVid.reply;
+          storyboard = localVid.storyboard;
+          videoLinks =
+            localVid.videoLinks.length > 0 ? localVid.videoLinks : undefined;
+          if (localVid.usedLocalLlm) setLocalStatus("ready");
         }
+
         const assistantMsg: ChatMessage = {
           id: `a-${Date.now()}`,
           role: "assistant",
-          content:
-            data.reply ||
-            `Here is your animated study explainer video for **${promptText}**.`,
+          content: replyContent,
           timestamp: new Date().toISOString(),
           subject: profile.role === "student" ? subject : undefined,
-          studyVideo: data.storyboard,
-          studyVideoLinks: Array.isArray(data.videoLinks)
-            ? data.videoLinks
-            : undefined,
+          studyVideo: storyboard,
+          studyVideoLinks: videoLinks,
         };
         onUpdateMessages(profile.id, [...nextMessages, assistantMsg]);
         if (autoSpeakRef.current) {
@@ -1120,31 +1225,69 @@ export function AssistantView({
       }
 
       if (effectiveMode === "search") {
-        const res = await fetch("/api/study/search", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
+        let replyContent = "";
+        let sources: Array<{ uri: string; title: string }> = [];
+        let photos: ChatMessage["studyPhotos"];
+        let videoLinks: ChatMessage["studyVideoLinks"];
+        let diagram: ChatMessage["studyDiagram"];
+
+        if (!preferLocalMedia) {
+          try {
+            const res = await fetch("/api/study/search", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                query: promptText,
+                profile,
+                subject: profile.role === "student" ? subject : undefined,
+                language: activeLanguage,
+              }),
+            });
+            const data = await res.json();
+            if (res.ok && data.reply) {
+              replyContent = data.reply;
+              sources = Array.isArray(data.sources) ? data.sources : [];
+              photos = Array.isArray(data.photos) ? data.photos : undefined;
+              videoLinks = Array.isArray(data.videoLinks)
+                ? data.videoLinks
+                : undefined;
+            }
+          } catch {
+            // Fall through to on-device Local LLM / offline search
+          }
+        }
+
+        if (!replyContent) {
+          const localSearch = await generateLocalStudySearch({
             query: promptText,
             profile,
             subject: profile.role === "student" ? subject : undefined,
             language: activeLanguage,
-          }),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.error || "Web search could not complete right now.");
+            modelKey: localModelKey,
+            onProgress: handleLocalProgress,
+          });
+          replyContent = localSearch.reply;
+          sources = localSearch.sources;
+          photos =
+            localSearch.photos.length > 0 ? localSearch.photos : undefined;
+          videoLinks =
+            localSearch.videoLinks.length > 0
+              ? localSearch.videoLinks
+              : undefined;
+          diagram = localSearch.diagram;
+          if (localSearch.usedLocalLlm) setLocalStatus("ready");
         }
+
         const assistantMsg: ChatMessage = {
           id: `a-${Date.now()}`,
           role: "assistant",
-          content: data.reply || "Here is what I found from live web search.",
+          content: replyContent,
           timestamp: new Date().toISOString(),
           subject: profile.role === "student" ? subject : undefined,
-          sources: Array.isArray(data.sources) ? data.sources : [],
-          studyPhotos: Array.isArray(data.photos) ? data.photos : undefined,
-          studyVideoLinks: Array.isArray(data.videoLinks)
-            ? data.videoLinks
-            : undefined,
+          sources,
+          studyDiagram: diagram,
+          studyPhotos: photos,
+          studyVideoLinks: videoLinks,
         };
         onUpdateMessages(profile.id, [...nextMessages, assistantMsg]);
         if (autoSpeakRef.current) {
@@ -1152,78 +1295,124 @@ export function AssistantView({
         }
         return;
       }
-      // Unlimited On-Device Local AI (WebGPU / WebLLM — runs in dedicated Web Worker, zero API key, zero quota)
+
+      // Unlimited On-Device Local AI (or automatic offline takeover when internet is disconnected!)
       let effectiveRequestEngine: AiEngine = engine;
-      if (engine === "local-browser") {
-        const assistantId = `a-${Date.now()}`;
-        try {
-          const replyText = await streamLocalLlmChat({
-            modelKey: localModelKey,
-            messages: nextMessages,
-            profile,
-            subject: profile.role === "student" ? subject : undefined,
-            language: activeLanguage,
-            spokenMode: autoSpeakRef.current,
-            onProgress: (info) => {
-              setLocalProgress(info);
-              setLocalStatus(info.progress >= 1 ? "ready" : "loading");
-            },
-            onDelta: (acc) => {
-              const liveMsg: ChatMessage = {
-                id: assistantId,
+      const shouldTryLocalChat =
+        engine === "local-browser" || isOfflineNow;
+
+      if (shouldTryLocalChat) {
+        const runnableKey =
+          engine === "local-browser"
+            ? isOfflineNow
+              ? getReadyLocalModelKey(localModelKey)
+              : localModelKey
+            : getReadyLocalModelKey(localModelKey);
+
+        if (runnableKey) {
+          const assistantId = `a-${Date.now()}`;
+          try {
+            const replyText = await streamLocalLlmChat({
+              modelKey: runnableKey,
+              messages: nextMessages,
+              profile,
+              subject: profile.role === "student" ? subject : undefined,
+              language: activeLanguage,
+              spokenMode: autoSpeakRef.current,
+              onProgress: handleLocalProgress,
+              onDelta: (acc) => {
+                const liveMsg: ChatMessage = {
+                  id: assistantId,
+                  role: "assistant",
+                  content: acc,
+                  timestamp: new Date().toISOString(),
+                  subject: profile.role === "student" ? subject : undefined,
+                };
+                onUpdateMessages(profile.id, [...nextMessages, liveMsg]);
+              },
+            });
+
+            if (!replyText.trim()) {
+              throw new Error("Local AI returned an empty response.");
+            }
+
+            setLocalStatus("ready");
+            setDownloadingModelKey(null);
+            setDownloadedModels((prev) =>
+              prev.includes(runnableKey) ? prev : [...prev, runnableKey]
+            );
+            const assistantMsg: ChatMessage = {
+              id: assistantId,
+              role: "assistant",
+              content: replyText,
+              timestamp: new Date().toISOString(),
+              subject: profile.role === "student" ? subject : undefined,
+              actions:
+                parsedMobile.actions.length > 0
+                  ? parsedMobile.actions
+                  : undefined,
+            };
+            const updatedMessages = [...nextMessages, assistantMsg];
+            onUpdateMessages(profile.id, updatedMessages);
+
+            if (autoSpeakRef.current) {
+              void speakText(assistantMsg.id, assistantMsg.content, true);
+            }
+            return;
+          } catch (localErr) {
+            setDownloadingModelKey(null);
+            setLocalProgress(null);
+            setLocalStatus(
+              gpuInfo?.supported === false ? "unsupported" : "idle"
+            );
+
+            if (isOfflineNow) {
+              const offlineFallback =
+                buildInstantOfflineChatFallback(promptText);
+              const assistantMsg: ChatMessage = {
+                id: `a-${Date.now()}`,
                 role: "assistant",
-                content: acc,
+                content: offlineFallback.reply,
                 timestamp: new Date().toISOString(),
                 subject: profile.role === "student" ? subject : undefined,
+                studyDiagram: offlineFallback.diagram,
               };
-              onUpdateMessages(profile.id, [...nextMessages, liveMsg]);
-            },
-          });
+              onUpdateMessages(profile.id, [...nextMessages, assistantMsg]);
+              if (autoSpeakRef.current) {
+                void speakText(assistantMsg.id, assistantMsg.content, true);
+              }
+              return;
+            }
 
-          if (!replyText.trim()) {
-            throw new Error("Local AI returned an empty response.");
+            const suggestedKey =
+              localErr instanceof LocalLlmGpuError
+                ? localErr.suggestedModelKey
+                : "llama-3.2-1b";
+            const suggestedLabel =
+              LOCAL_LLM_MODELS.find((m) => m.key === suggestedKey)?.label ||
+              "Llama 3.2 1B";
+
+            showToast(
+              `${activeLocalModel.label} hit your device's WebGPU memory limit — answering seamlessly via Cloud Auto. For reliable on-device Local AI, select ${suggestedLabel}.`
+            );
+            effectiveRequestEngine = "auto";
           }
-
-          setLocalStatus("ready");
-          setDownloadingModelKey(null);
-          setDownloadedModels((prev) =>
-            prev.includes(localModelKey) ? prev : [...prev, localModelKey]
-          );
+        } else if (isOfflineNow) {
+          // Offline and no local model cached yet -> instant offline answer + diagram!
+          const offlineFallback = buildInstantOfflineChatFallback(promptText);
           const assistantMsg: ChatMessage = {
-            id: assistantId,
+            id: `a-${Date.now()}`,
             role: "assistant",
-            content: replyText,
+            content: offlineFallback.reply,
             timestamp: new Date().toISOString(),
             subject: profile.role === "student" ? subject : undefined,
-            actions:
-              parsedMobile.actions.length > 0 ? parsedMobile.actions : undefined,
+            studyDiagram: offlineFallback.diagram,
           };
-          const updatedMessages = [...nextMessages, assistantMsg];
-          onUpdateMessages(profile.id, updatedMessages);
-
+          onUpdateMessages(profile.id, [...nextMessages, assistantMsg]);
           if (autoSpeakRef.current) {
             void speakText(assistantMsg.id, assistantMsg.content, true);
           }
           return;
-        } catch (localErr) {
-          // GPU buffer/device lost even after fresh-worker low-VRAM retry:
-          // Reset local engine cleanly and seamlessly answer via Cloud Auto so the user is never stranded!
-          setDownloadingModelKey(null);
-          setLocalProgress(null);
-          setLocalStatus(gpuInfo?.supported === false ? "unsupported" : "idle");
-
-          const suggestedKey =
-            localErr instanceof LocalLlmGpuError
-              ? localErr.suggestedModelKey
-              : "llama-3.2-1b";
-          const suggestedLabel =
-            LOCAL_LLM_MODELS.find((m) => m.key === suggestedKey)?.label ||
-            "Llama 3.2 1B";
-
-          showToast(
-            `${activeLocalModel.label} hit your device's WebGPU memory limit — answering seamlessly via Cloud Auto. For reliable on-device Local AI, select ${suggestedLabel}.`
-          );
-          effectiveRequestEngine = "auto";
         }
       }
 
@@ -1395,6 +1584,78 @@ export function AssistantView({
         }
       }
     } catch (err) {
+      // Network drop / offline safety net: automatically answer on-device so chat never breaks!
+      const rawErr = err instanceof Error ? err.message : String(err);
+      const looksOffline =
+        (typeof navigator !== "undefined" && !navigator.onLine) ||
+        /failed to fetch|networkerror|load failed|network request failed|err_internet_disconnected/i.test(
+          rawErr
+        );
+
+      if (looksOffline) {
+        const cachedKey = getReadyLocalModelKey(localModelKey);
+        if (cachedKey) {
+          try {
+            const assistantId = `a-${Date.now()}`;
+            const localReply = await streamLocalLlmChat({
+              modelKey: cachedKey,
+              messages: nextMessages,
+              profile,
+              subject: profile.role === "student" ? subject : undefined,
+              language: activeLanguage,
+              spokenMode: autoSpeakRef.current,
+              onDelta: (acc) => {
+                onUpdateMessages(profile.id, [
+                  ...nextMessages,
+                  {
+                    id: assistantId,
+                    role: "assistant",
+                    content: acc,
+                    timestamp: new Date().toISOString(),
+                    subject: profile.role === "student" ? subject : undefined,
+                  },
+                ]);
+              },
+            });
+            if (localReply.trim()) {
+              onUpdateMessages(profile.id, [
+                ...nextMessages,
+                {
+                  id: assistantId,
+                  role: "assistant",
+                  content: localReply,
+                  timestamp: new Date().toISOString(),
+                  subject: profile.role === "student" ? subject : undefined,
+                },
+              ]);
+              showToast("Internet offline — answered automatically using your on-device Local AI.");
+              if (autoSpeakRef.current) {
+                void speakText(assistantId, localReply, true);
+              }
+              return;
+            }
+          } catch {
+            // Fall through to instant offline fallback below
+          }
+        }
+
+        const offlineFallback = buildInstantOfflineChatFallback(promptText);
+        const assistantMsg: ChatMessage = {
+          id: `a-${Date.now()}`,
+          role: "assistant",
+          content: offlineFallback.reply,
+          timestamp: new Date().toISOString(),
+          subject: profile.role === "student" ? subject : undefined,
+          studyDiagram: offlineFallback.diagram,
+        };
+        onUpdateMessages(profile.id, [...nextMessages, assistantMsg]);
+        showToast("Internet offline — answered directly on your device.");
+        if (autoSpeakRef.current) {
+          void speakText(assistantMsg.id, assistantMsg.content, true);
+        }
+        return;
+      }
+
       if (autoSpeakRef.current) {
         stopPlayback();
       }
