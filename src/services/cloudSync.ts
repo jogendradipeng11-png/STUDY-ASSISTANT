@@ -503,6 +503,12 @@ export function subscribeToFamilyCloud(
         listeners.onProfiles(list);
       },
       (error) => {
+        if (error.code === "unavailable") {
+          listeners.onSyncError?.(
+            "Cloud Sync is temporarily offline and will reconnect automatically."
+          );
+          return;
+        }
         listeners.onSyncError?.(error.message);
         handleFirestoreError(error, OperationType.LIST, profilesPath);
       }
@@ -559,6 +565,12 @@ export function subscribeToFamilyCloud(
         listeners.onNotes(list);
       },
       (error) => {
+        if (error.code === "unavailable") {
+          listeners.onSyncError?.(
+            "Cloud Sync is temporarily offline and will reconnect automatically."
+          );
+          return;
+        }
         listeners.onSyncError?.(error.message);
         handleFirestoreError(error, OperationType.LIST, notesPath);
       }
@@ -596,6 +608,12 @@ export function subscribeToFamilyCloud(
         listeners.onChats(mapped);
       },
       (error) => {
+        if (error.code === "unavailable") {
+          listeners.onSyncError?.(
+            "Cloud Sync is temporarily offline and will reconnect automatically."
+          );
+          return;
+        }
         listeners.onSyncError?.(error.message);
         handleFirestoreError(error, OperationType.LIST, chatsPath);
       }
@@ -626,6 +644,12 @@ export function subscribeToFamilyCloud(
         listeners.onAlarms(list);
       },
       (error) => {
+        if (error.code === "unavailable") {
+          listeners.onSyncError?.(
+            "Cloud Sync is temporarily offline and will reconnect automatically."
+          );
+          return;
+        }
         listeners.onSyncError?.(error.message);
         handleFirestoreError(error, OperationType.LIST, alarmsPath);
       }

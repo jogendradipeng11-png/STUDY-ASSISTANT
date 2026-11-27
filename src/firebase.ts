@@ -5,18 +5,25 @@ import {
   getDocFromServer,
   getFirestore,
   initializeFirestore,
+  setLogLevel,
   type Firestore,
 } from "firebase/firestore";
 import firebaseConfig from "../firebase-applet-config.json";
 
 const app = initializeApp(firebaseConfig);
 
+// Prevent noisy transient SDK offline logs in console; real Firestore errors are handled via handleFirestoreError
+setLogLevel("silent");
+
 function createFirestoreClient(): Firestore {
   try {
     return initializeFirestore(
       app,
       {
-        experimentalForceLongPolling: true,
+        experimentalAutoDetectLongPolling: true,
+        experimentalLongPollingOptions: {
+          timeoutSeconds: 15,
+        },
       },
       firebaseConfig.firestoreDatabaseId
     );
@@ -83,6 +90,9 @@ export function handleFirestoreError(
 }
 
 async function testConnection() {
+  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    return;
+  }
   try {
     await getDocFromServer(doc(db, "test", "connection"));
   } catch (error) {
@@ -90,7 +100,9 @@ async function testConnection() {
       error instanceof Error &&
       error.message.includes("the client is offline")
     ) {
-      console.error("Please check your Firebase configuration.");
+      console.warn(
+        "Cloud Firestore is temporarily offline; local data remains available until reconnected."
+      );
     }
   }
 }

@@ -65,12 +65,24 @@ import {
   generateStudySummaryFromSession,
   isLongStudySession,
 } from "../utils/studySummary";
+import {
+  LOCAL_LLM_MODELS,
+  checkWebGpuSupport,
+  getLoadedLocalModelKey,
+  loadLocalLlmModel,
+  streamLocalLlmChat,
+  unloadLocalLlmModel,
+  type LocalLlmProgress,
+  type WebGpuSupportInfo,
+} from "../utils/localLlm";
 import { LanguagePicker } from "./LanguagePicker";
 import {
   MobileTaskModal,
   type MobileTaskModalMode,
 } from "./MobileTaskModal";
 import { ProfileAvatar } from "./ProfileAvatar";
+
+type AiEngine = "auto" | "local-browser" | "gemini" | "nvidia" | "local-server";
 
 interface AssistantViewProps {
   profile: FamilyProfile;
@@ -135,10 +147,45 @@ export function AssistantView({
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [speedMode, setSpeedMode] = useState<"fast" | "detailed">("fast");
-  const [engine, setEngine] = useState<"auto" | "gemini" | "nvidia">("auto");
+  const [engine, setEngine] = useState<AiEngine>(() => {
+    try {
+      const saved = localStorage.getItem("jogi_jarvis_engine_v1");
+      if (
+        saved === "auto" ||
+        saved === "local-browser" ||
+        saved === "gemini" ||
+        saved === "nvidia" ||
+        saved === "local-server"
+      ) {
+        return saved;
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return "auto";
+  });
   const [nvidiaAvailable, setNvidiaAvailable] = useState(false);
+  const [localServerAvailable, setLocalServerAvailable] = useState(false);
   const [fallbackPoolAvailable, setFallbackPoolAvailable] = useState(false);
   const [totalActiveModels, setTotalActiveModels] = useState(2);
+  const [localModelKey, setLocalModelKey] = useState<string>(() => {
+    try {
+      const saved = localStorage.getItem("jogi_jarvis_local_model_v1");
+      if (saved && LOCAL_LLM_MODELS.some((m) => m.key === saved)) {
+        return saved;
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return "llama-3.2-1b";
+  });
+  const [localStatus, setLocalStatus] = useState<
+    "idle" | "loading" | "ready" | "unsupported"
+  >(() => (getLoadedLocalModelKey() ? "ready" : "idle"));
+  const [localProgress, setLocalProgress] = useState<LocalLlmProgress | null>(
+    null
+  );
+  const [gpuInfo, setGpuInfo] = useState<WebGpuSupportInfo | null>(null);
   const [useSearch, setUseSearch] = useState(true);
   const [autoSpeak, setAutoSpeak] = useState<boolean>(() => {
     try {
@@ -207,6 +254,49 @@ export function AssistantView({
   }, [profile.id, profile.role]);
 
   useEffect(() => {
+    try {
+      localStorage.setItem("jogi_jarvis_engine_v1", engine);
+    } catch {
+      // ignore storage errors
+    }
+  }, [engine]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("jogi_jarvis_local_model_v1", localModelKey);
+    } catch {
+      // ignore storage errors
+    }
+    setLocalStatus((prev) => {
+      if (prev === "unsupported" || prev === "loading") return prev;
+      return getLoadedLocalModelKey() === localModelKey ? "ready" : "idle";
+    });
+  }, [localModelKey]);
+
+  useEffect(() => {
+    if (engine !== "local-browser") return;
+    let cancelled = false;
+    void checkWebGpuSupport().then((info) => {
+      if (cancelled) return;
+      setGpuInfo(info);
+      if (!info.supported) {
+        setLocalStatus("unsupported");
+      } else {
+        setLocalStatus((prev) =>
+          prev === "loading"
+            ? "loading"
+            : getLoadedLocalModelKey() === localModelKey
+              ? "ready"
+              : "idle"
+        );
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [engine, localModelKey]);
+
+  useEffect(() => {
     let cancelled = false;
     fetch("/api/providers")
       .then((res) => (res.ok ? res.json() : null))
@@ -214,15 +304,24 @@ export function AssistantView({
         (
           data: {
             nvidiaConfigured?: boolean;
+            localServerConfigured?: boolean;
             fallbackPoolConfigured?: boolean;
             totalActiveModels?: number;
           } | null
         ) => {
           if (!cancelled && data) {
-            setNvidiaAvailable(Boolean(data.nvidiaConfigured));
+            const hasNvidia = Boolean(data.nvidiaConfigured);
+            const hasLocalSrv = Boolean(data.localServerConfigured);
+            setNvidiaAvailable(hasNvidia);
+            setLocalServerAvailable(hasLocalSrv);
             setFallbackPoolAvailable(
-              Boolean(data.fallbackPoolConfigured || data.nvidiaConfigured)
+              Boolean(data.fallbackPoolConfigured || hasNvidia)
             );
+            setEngine((prev) => {
+              if (prev === "nvidia" && !hasNvidia) return "auto";
+              if (prev === "local-server" && !hasLocalSrv) return "auto";
+              return prev;
+            });
             if (typeof data.totalActiveModels === "number" && data.totalActiveModels > 0) {
               setTotalActiveModels(data.totalActiveModels);
             }
@@ -263,6 +362,47 @@ export function AssistantView({
     setTimeout(() => {
       setToast((prev) => (prev?.message === message ? null : prev));
     }, 5500);
+  };
+
+  const activeLocalModel =
+    LOCAL_LLM_MODELS.find((m) => m.key === localModelKey) || LOCAL_LLM_MODELS[1];
+
+  const handleLoadLocalModel = async (targetKey = localModelKey) => {
+    const targetMeta =
+      LOCAL_LLM_MODELS.find((m) => m.key === targetKey) || activeLocalModel;
+    setErrorMsg(null);
+    setLocalStatus("loading");
+    setLocalProgress({
+      progress: 0.02,
+      text: `Preparing ${targetMeta.label}…`,
+    });
+    try {
+      await loadLocalLlmModel(targetKey, (info) => {
+        setLocalProgress(info);
+        if (info.progress >= 1) {
+          setLocalStatus("ready");
+        }
+      });
+      setLocalStatus("ready");
+      showToast(
+        `${targetMeta.label} is ready on your device — unlimited chats with zero API quota.`
+      );
+    } catch (err) {
+      setLocalStatus(gpuInfo?.supported === false ? "unsupported" : "idle");
+      setLocalProgress(null);
+      setErrorMsg(
+        err instanceof Error
+          ? err.message
+          : "Could not load the on-device Local AI model."
+      );
+    }
+  };
+
+  const handleUnloadLocalModel = async () => {
+    await unloadLocalLlmModel();
+    setLocalStatus("idle");
+    setLocalProgress(null);
+    showToast("Unloaded Local AI model from device GPU memory.");
   };
 
   const releaseWakeLock = () => {
@@ -658,6 +798,13 @@ export function AssistantView({
     const promptText = (overrideText ?? input).trim();
     if ((!promptText && !attachedImage) || isSending) return;
 
+    if (engine === "local-browser" && attachedImage) {
+      setErrorMsg(
+        "Homework photo reading uses Cloud Vision. Switch AI Engine to Auto or Gemini to analyze photos."
+      );
+      return;
+    }
+
     if (autoSpeakRef.current) {
       startBackgroundAudioKeepAlive(
         promptText ? `Replying to: ${promptText.slice(0, 48)}` : "Jogi Jarvis is replying…"
@@ -766,6 +913,53 @@ export function AssistantView({
     setIsSending(true);
 
     try {
+      // Unlimited On-Device Local AI (WebGPU / WebLLM — runs directly in browser, zero API key, zero quota)
+      if (engine === "local-browser") {
+        const assistantId = `a-${Date.now()}`;
+        const replyText = await streamLocalLlmChat({
+          modelKey: localModelKey,
+          messages: nextMessages,
+          profile,
+          subject: profile.role === "student" ? subject : undefined,
+          language: activeLanguage,
+          spokenMode: autoSpeakRef.current,
+          onProgress: (info) => {
+            setLocalProgress(info);
+            setLocalStatus(info.progress >= 1 ? "ready" : "loading");
+          },
+          onDelta: (acc) => {
+            const liveMsg: ChatMessage = {
+              id: assistantId,
+              role: "assistant",
+              content: acc,
+              timestamp: new Date().toISOString(),
+              subject: profile.role === "student" ? subject : undefined,
+            };
+            onUpdateMessages(profile.id, [...nextMessages, liveMsg]);
+          },
+        });
+
+        setLocalStatus("ready");
+        const assistantMsg: ChatMessage = {
+          id: assistantId,
+          role: "assistant",
+          content:
+            replyText ||
+            "I heard you, but I could not form a response. Please try asking again.",
+          timestamp: new Date().toISOString(),
+          subject: profile.role === "student" ? subject : undefined,
+          actions:
+            parsedMobile.actions.length > 0 ? parsedMobile.actions : undefined,
+        };
+        const updatedMessages = [...nextMessages, assistantMsg];
+        onUpdateMessages(profile.id, updatedMessages);
+
+        if (autoSpeakRef.current) {
+          void speakText(assistantMsg.id, assistantMsg.content, true);
+        }
+        return;
+      }
+
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1224,30 +1418,36 @@ export function AssistantView({
             <span>{speedMode === "fast" ? "Fast Mode" : "Deep Math"}</span>
           </button>
 
-          {fallbackPoolAvailable && (
-            <label
-              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium bg-white border border-slate-200 text-slate-700 whitespace-nowrap shrink-0"
-              title={`Choose AI Engine (Auto rotates across ${totalActiveModels} models automatically if any model hits a rate limit)`}
+          <label
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium border whitespace-nowrap shrink-0 transition-colors ${
+              engine === "local-browser" || engine === "local-server"
+                ? "bg-emerald-50 border-emerald-300 text-emerald-900"
+                : "bg-white border-slate-200 text-slate-700"
+            }`}
+            title="Choose AI Engine — use Local AI (On-Device) for unlimited chats with zero API quota"
+          >
+            <Cpu className="h-3.5 w-3.5 text-emerald-700 shrink-0" />
+            <select
+              aria-label="AI Engine"
+              value={engine}
+              onChange={(e) => setEngine(e.target.value as AiEngine)}
+              className="bg-transparent text-xs font-medium text-slate-800 focus:outline-none cursor-pointer"
             >
-              <Cpu className="h-3.5 w-3.5 text-emerald-700 shrink-0" />
-              <select
-                aria-label="AI Engine"
-                value={engine}
-                onChange={(e) =>
-                  setEngine(e.target.value as "auto" | "gemini" | "nvidia")
-                }
-                className="bg-transparent text-xs font-medium text-slate-800 focus:outline-none cursor-pointer"
-              >
-                <option value="auto">
-                  Auto ({totalActiveModels} Models)
-                </option>
-                <option value="gemini">Gemini</option>
-                {nvidiaAvailable && (
-                  <option value="nvidia">NVIDIA NIM (12 Models)</option>
-                )}
-              </select>
-            </label>
-          )}
+              <option value="auto">
+                {fallbackPoolAvailable
+                  ? `Auto (${totalActiveModels} Cloud Models)`
+                  : "Auto (Cloud)"}
+              </option>
+              <option value="local-browser">Local AI (Unlimited · On-Device)</option>
+              <option value="gemini">Gemini Cloud</option>
+              {nvidiaAvailable && (
+                <option value="nvidia">NVIDIA NIM (12 Models)</option>
+              )}
+              {localServerAvailable && (
+                <option value="local-server">Local Server (Ollama / LM Studio)</option>
+              )}
+            </select>
+          </label>
 
           <button
             type="button"
@@ -1366,6 +1566,94 @@ export function AssistantView({
         </div>
       </div>
 
+      {/* On-Device Unlimited Local AI Control Strip */}
+      {engine === "local-browser" && (
+        <div className="bg-slate-50 border-b border-slate-200 px-5 sm:px-8 py-2.5 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-2.5 min-w-0">
+            <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-800">
+              <Cpu className="h-3.5 w-3.5 shrink-0" />
+              <span>Local AI · Unlimited · Runs on Your Device</span>
+            </span>
+            <select
+              aria-label="Local AI Model"
+              disabled={localStatus === "loading" || isSending}
+              value={localModelKey}
+              onChange={(e) => setLocalModelKey(e.target.value)}
+              className="px-2.5 py-1 rounded-md text-xs font-medium bg-white border border-slate-300 text-slate-800 focus:outline-none focus:border-emerald-600 disabled:opacity-60"
+            >
+              {LOCAL_LLM_MODELS.map((m) => (
+                <option key={m.key} value={m.key}>
+                  {m.label} ({m.sizeLabel})
+                </option>
+              ))}
+            </select>
+            <span className="text-[11px] text-slate-500 hidden md:inline">
+              {activeLocalModel.bestFor} · Cached offline after first download
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2.5 shrink-0">
+            {localStatus === "unsupported" ? (
+              <div className="flex flex-wrap items-center gap-2 text-xs text-amber-900">
+                <span>
+                  {gpuInfo?.reason ||
+                    "WebGPU is unavailable in this browser for on-device Local AI."}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setEngine("auto")}
+                  className="px-2.5 py-1 rounded-md bg-white border border-amber-300 text-amber-900 font-semibold hover:bg-amber-50 whitespace-nowrap"
+                >
+                  Switch to Auto
+                </button>
+              </div>
+            ) : localStatus === "loading" ? (
+              <div className="flex items-center gap-2.5 min-w-[200px]">
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-700 shrink-0" />
+                <div className="flex-1 min-w-[120px]">
+                  <div className="h-1.5 w-full rounded-full bg-slate-200 overflow-hidden">
+                    <div
+                      className="h-full bg-emerald-600 transition-all duration-200"
+                      style={{
+                        width: `${Math.max(4, Math.round((localProgress?.progress || 0) * 100))}%`,
+                      }}
+                    />
+                  </div>
+                  <p className="text-[11px] text-slate-600 truncate max-w-[240px] mt-0.5">
+                    {Math.round((localProgress?.progress || 0) * 100)}% ·{" "}
+                    {localProgress?.text || `Loading ${activeLocalModel.label}…`}
+                  </p>
+                </div>
+              </div>
+            ) : localStatus === "ready" ? (
+              <div className="flex items-center gap-2">
+                <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-800">
+                  <Check className="h-3.5 w-3.5" />
+                  <span>Ready on Device</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void handleUnloadLocalModel()}
+                  className="px-2.5 py-1 rounded-md text-xs font-medium bg-white border border-slate-300 text-slate-700 hover:bg-slate-100 whitespace-nowrap"
+                >
+                  Unload
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                disabled={isSending}
+                onClick={() => void handleLoadLocalModel()}
+                className="inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white disabled:opacity-50 transition-colors whitespace-nowrap"
+              >
+                <Download className="h-3.5 w-3.5" />
+                <span>Load Model Now</span>
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Inline notification banners */}
       {toast && (
         <div className="bg-emerald-50 border-b border-emerald-200 px-6 py-2.5 text-xs font-medium text-emerald-900 flex items-center justify-between gap-4">
@@ -1396,15 +1684,33 @@ export function AssistantView({
       )}
 
       {errorMsg && (
-        <div className="bg-red-50 border-b border-red-200 px-6 py-2.5 text-xs font-medium text-red-800 flex items-center justify-between gap-4">
-          <span>{errorMsg}</span>
-          <button
-            type="button"
-            onClick={() => setErrorMsg(null)}
-            className="text-red-700 hover:text-red-900 shrink-0"
-          >
-            Close
-          </button>
+        <div className="bg-red-50 border-b border-red-200 px-6 py-2.5 text-xs font-medium text-red-800 flex flex-wrap items-center justify-between gap-3">
+          <span className="min-w-0 flex-1">{errorMsg}</span>
+          <div className="flex items-center gap-3 shrink-0">
+            {engine !== "local-browser" &&
+              /(quota|rate limit|429|exhausted|busy|limit)/i.test(errorMsg) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEngine("local-browser");
+                    setErrorMsg(null);
+                    showToast(
+                      "Switched to Unlimited On-Device Local AI — zero API limits."
+                    );
+                  }}
+                  className="px-2.5 py-1 rounded-md bg-emerald-700 hover:bg-emerald-800 text-white font-semibold whitespace-nowrap transition-colors"
+                >
+                  Use Unlimited Local AI
+                </button>
+              )}
+            <button
+              type="button"
+              onClick={() => setErrorMsg(null)}
+              className="text-red-700 hover:text-red-900 shrink-0"
+            >
+              Close
+            </button>
+          </div>
         </div>
       )}
 
@@ -1816,7 +2122,13 @@ export function AssistantView({
               {isSending && (
                 <div className="flex items-center gap-2.5 text-sm text-slate-600 px-2 py-2">
                   <Loader2 className="h-4 w-4 animate-spin text-blue-700" />
-                  <span>Jogi Jarvis is thinking...</span>
+                  <span>
+                    {engine === "local-browser" && localStatus === "loading"
+                      ? `Downloading ${activeLocalModel.label} to your device (${Math.round((localProgress?.progress || 0) * 100)}%)...`
+                      : engine === "local-browser"
+                        ? `Jogi Jarvis (${activeLocalModel.label} · Local AI) is replying on your device...`
+                        : "Jogi Jarvis is thinking..."}
+                  </span>
                 </div>
               )}
               <div ref={bottomRef} />

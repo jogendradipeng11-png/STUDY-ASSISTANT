@@ -39,7 +39,8 @@ type FallbackProviderId =
   | "openrouter"
   | "cerebras"
   | "mistral"
-  | "openai";
+  | "openai"
+  | "local";
 
 interface ModelCandidate {
   provider: FallbackProviderId;
@@ -104,6 +105,14 @@ const CEREBRAS_MODELS = ["llama-3.3-70b", "llama3.1-8b"];
 const MISTRAL_MODELS = ["mistral-small-latest", "open-mistral-nemo"];
 
 const OPENAI_MODELS = ["gpt-4o-mini"];
+
+const LOCAL_LLM_DEFAULT_MODELS = [
+  "llama3.2",
+  "qwen2.5",
+  "mistral",
+  "gemma3",
+  "phi4-mini",
+];
 
 // Per-model smart cooldown cache so rate-limited or retired models are skipped immediately
 const modelCooldownUntil = new Map<string, number>();
@@ -207,6 +216,24 @@ function hasMistralKey(): boolean {
 
 function hasOpenAiKey(): boolean {
   return Boolean(process.env.OPENAI_API_KEY?.trim());
+}
+
+function getLocalLlmChatUrl(): string | null {
+  const raw = process.env.LOCAL_LLM_URL?.trim();
+  if (!raw || !/^https?:\/\//i.test(raw)) return null;
+  const trimmed = raw.replace(/\/+$/, "");
+  if (/\/chat\/completions$/i.test(trimmed)) return trimmed;
+  if (/\/v1$/i.test(trimmed)) return `${trimmed}/chat/completions`;
+  return `${trimmed}/v1/chat/completions`;
+}
+
+function hasLocalLlmServer(): boolean {
+  return Boolean(getLocalLlmChatUrl());
+}
+
+function getLocalLlmModels(): string[] {
+  const custom = parseEnvModelList(process.env.LOCAL_LLM_MODELS);
+  return custom.length > 0 ? custom : LOCAL_LLM_DEFAULT_MODELS;
 }
 
 function parseEnvModelList(raw?: string): string[] {
@@ -318,6 +345,17 @@ function getFallbackPoolCandidates(
     [...parseEnvModelList(process.env.OPENAI_MODELS), ...OPENAI_MODELS]
   );
 
+  const localChatUrl = getLocalLlmChatUrl();
+  if (localChatUrl) {
+    addProvider(
+      "local",
+      "Local LLM Server",
+      localChatUrl,
+      process.env.LOCAL_LLM_API_KEY?.trim() || "local",
+      getLocalLlmModels()
+    );
+  }
+
   // Deduplicate by provider+model
   const unique = Array.from(
     new Map(candidates.map((c) => [`${c.provider}:${c.model}`, c])).values()
@@ -332,7 +370,8 @@ function hasAnyFallbackProvider(): boolean {
     hasOpenRouterKey() ||
     hasCerebrasKey() ||
     hasMistralKey() ||
-    hasOpenAiKey()
+    hasOpenAiKey() ||
+    hasLocalLlmServer()
   );
 }
 
@@ -344,6 +383,7 @@ function getProviderSummary() {
   if (hasCerebrasKey()) extraProviders.push("Cerebras");
   if (hasMistralKey()) extraProviders.push("Mistral");
   if (hasOpenAiKey()) extraProviders.push("OpenAI");
+  if (hasLocalLlmServer()) extraProviders.push("Local LLM Server");
 
   const geminiCount = hasGeminiKey() ? GEMINI_TEXT_MODELS.length : 0;
   const fallbackCount = getFallbackPoolCandidates("fast").length;
@@ -351,6 +391,7 @@ function getProviderSummary() {
   return {
     geminiConfigured: hasGeminiKey(),
     nvidiaConfigured: hasNvidiaKey(),
+    localServerConfigured: hasLocalLlmServer(),
     fallbackPoolConfigured: hasAnyFallbackProvider(),
     extraProviders,
     totalActiveModels: geminiCount + fallbackCount,
@@ -467,16 +508,20 @@ async function fetchOpenAiCandidate(
   body: Record<string, unknown>,
   acceptHeader?: string
 ): Promise<globalThis.Response> {
+  const sendAuth =
+    Boolean(candidate.apiKey) &&
+    !(candidate.provider === "local" && candidate.apiKey === "local");
+
   return fetch(candidate.apiUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       ...(acceptHeader ? { Accept: acceptHeader } : {}),
-      Authorization: `Bearer ${candidate.apiKey}`,
+      ...(sendAuth ? { Authorization: `Bearer ${candidate.apiKey}` } : {}),
       ...(candidate.extraHeaders || {}),
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(22000),
+    signal: AbortSignal.timeout(candidate.provider === "local" ? 45000 : 22000),
   });
 }
 
@@ -982,7 +1027,7 @@ async function startServer() {
       language?: string;
       speedMode?: "fast" | "detailed";
       stream?: boolean;
-      engine?: "auto" | "gemini" | "nvidia";
+      engine?: "auto" | "gemini" | "nvidia" | "local-server";
       spokenMode?: boolean;
     };
 
@@ -990,8 +1035,10 @@ async function startServer() {
       return res.status(400).json({ error: "Please provide a message to Jogi Jarvis." });
     }
 
-    const safeEngine: "auto" | "gemini" | "nvidia" =
-      engine === "gemini" || engine === "nvidia" ? engine : "auto";
+    const safeEngine: "auto" | "gemini" | "nvidia" | "local-server" =
+      engine === "gemini" || engine === "nvidia" || engine === "local-server"
+        ? engine
+        : "auto";
     const safeSpeedMode: "fast" | "detailed" =
       speedMode === "detailed" ? "detailed" : "fast";
 
@@ -1071,6 +1118,24 @@ async function startServer() {
     };
 
     try {
+      // Explicit self-hosted Local LLM server (Ollama / LM Studio / LocalAI)
+      if (safeEngine === "local-server") {
+        if (!hasLocalLlmServer()) {
+          return res.status(400).json({
+            error:
+              "LOCAL_LLM_URL is not configured yet. Add your Ollama or LM Studio URL in Settings > Secrets, or choose Local AI (Unlimited · On-Device) in the Engine selector.",
+          });
+        }
+        if (hasImage) {
+          return res.status(400).json({
+            error:
+              "Homework photo reading uses Gemini vision. Switch Engine to Auto or Gemini to analyze images.",
+          });
+        }
+        await respondWithFallbackPool("local");
+        return;
+      }
+
       // Explicit NVIDIA NIM selection (cascades across 12 NVIDIA NIM models)
       if (safeEngine === "nvidia") {
         if (!hasNvidiaKey()) {
