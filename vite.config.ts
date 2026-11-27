@@ -153,6 +153,9 @@ export default defineConfig(() => {
         },
       },
     ],
+    worker: {
+      format: 'es' as const,
+    },
     build: {
       chunkSizeWarningLimit: 1200,
     },

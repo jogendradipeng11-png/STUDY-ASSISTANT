@@ -53,33 +53,33 @@ interface ModelCandidate {
 
 const GEMINI_TEXT_MODELS = ["gemini-4-hydrogen", "gemini-3.1-flash-lite"] as const;
 
-// 12 verified NVIDIA NIM chat models (all usable under a single NVIDIA_API_KEY)
+// 12 verified NVIDIA NIM chat models (ordered with fastest proven models first)
 const NVIDIA_FAST_FALLBACKS = [
-  "google/gemma-3-12b-it",
   "nvidia/nemotron-3.5-lightning-30b-a3b",
   "meta/llama-3.3-70b-instruct",
-  "google/gemma-3-27b-it",
+  "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
   "qwen/qwen2.5-72b-instruct",
   "meta/llama-3.1-70b-instruct",
+  "meta/llama-3.1-8b-instruct",
+  "google/gemma-3-27b-it",
+  "google/gemma-3-12b-it",
   "mistralai/mistral-large-2-instruct",
   "nvidia/llama-3.3-nemotron-super-49b-v1",
-  "meta/llama-3.1-8b-instruct",
   "mistralai/mixtral-8x22b-instruct-v0.1",
   "nvidia/nemotron-3.5-bolt-e4b",
-  "z-ai/glm-5.3-flash",
 ];
 
 // 12 math/reasoning-prioritized NVIDIA NIM models
 const NVIDIA_MATH_FALLBACKS = [
+  "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+  "nvidia/nemotron-3.5-lightning-30b-a3b",
+  "meta/llama-3.3-70b-instruct",
   "qwen/qwen2.5-72b-instruct",
   "nvidia/llama-3.3-nemotron-super-49b-v1",
-  "meta/llama-3.3-70b-instruct",
   "google/gemma-3-27b-it",
   "qwen/qwen2.5-coder-32b-instruct",
-  "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
   "mistralai/mistral-large-2-instruct",
   "google/gemma-3-12b-it",
-  "nvidia/nemotron-3.5-lightning-30b-a3b",
   "meta/llama-3.1-70b-instruct",
   "deepseek-ai/deepseek-r1-distill-llama-8b",
   "nvidia/nemotron-3.5-bolt-e4b",
@@ -448,32 +448,49 @@ function formatOpenAiMessagesForModel(
   model: string,
   messages: Array<{ role: "system" | "user" | "assistant"; content: string }>
 ): Array<{ role: "system" | "user" | "assistant"; content: string }> {
-  const cleaned = messages.map((m) => ({
-    role: m.role,
-    content: normalizePromptText(m.content),
-  }));
+  const systemParts: string[] = [];
+  const dialogue: Array<{ role: "user" | "assistant"; content: string }> = [];
+
+  for (const m of messages) {
+    const content = normalizePromptText(m.content || "").trim();
+    if (!content) continue;
+    if (m.role === "system") {
+      systemParts.push(content);
+      continue;
+    }
+    const role: "user" | "assistant" =
+      m.role === "assistant" ? "assistant" : "user";
+    if (dialogue.length === 0 && role === "assistant") {
+      continue;
+    }
+    const prev = dialogue[dialogue.length - 1];
+    if (prev && prev.role === role) {
+      prev.content = `${prev.content}\n\n${content}`;
+    } else {
+      dialogue.push({ role, content });
+    }
+  }
+
+  if (dialogue.length === 0) {
+    dialogue.push({ role: "user", content: "Hello" });
+  }
+
+  const combinedSystem = systemParts.join("\n\n").trim();
 
   // Gemma chat templates work most reliably when system instructions are folded into the first user turn
   if (/gemma/i.test(model)) {
-    const systemParts = cleaned
-      .filter((m) => m.role === "system")
-      .map((m) => m.content)
-      .join("\n\n");
-    const nonSystem = cleaned.filter((m) => m.role !== "system");
-    if (systemParts && nonSystem.length > 0 && nonSystem[0].role === "user") {
-      nonSystem[0] = {
+    if (combinedSystem) {
+      dialogue[0] = {
         role: "user",
-        content: `Instructions:\n${systemParts}\n\nUser Request:\n${nonSystem[0].content}`,
+        content: `Instructions:\n${combinedSystem}\n\nUser Request:\n${dialogue[0].content}`,
       };
-      return nonSystem;
     }
-    if (systemParts) {
-      return [{ role: "user", content: systemParts }, ...nonSystem];
-    }
-    return nonSystem;
+    return dialogue;
   }
 
-  return cleaned;
+  return combinedSystem
+    ? [{ role: "system", content: combinedSystem }, ...dialogue]
+    : dialogue;
 }
 
 function buildOpenAiRequestBody(
@@ -491,11 +508,11 @@ function buildOpenAiRequestBody(
     stream,
   };
 
-  // Prevent reasoning-capable Nemotron models on NVIDIA NIM from exhausting max_tokens in hidden thinking
+  // Prevent reasoning-capable Nemotron / Qwen3 models on NVIDIA NIM from exhausting max_tokens in hidden thinking
   if (
     candidate.provider === "nvidia" &&
     speedMode === "fast" &&
-    /nemotron/i.test(candidate.model)
+    /nemotron|qwen3/i.test(candidate.model)
   ) {
     body.chat_template_kwargs = { enable_thinking: false };
   }
@@ -521,7 +538,7 @@ async function fetchOpenAiCandidate(
       ...(candidate.extraHeaders || {}),
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(candidate.provider === "local" ? 45000 : 22000),
+    signal: AbortSignal.timeout(candidate.provider === "local" ? 45000 : 15000),
   });
 }
 

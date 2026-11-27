@@ -70,6 +70,7 @@ import {
 } from "../utils/studySummary";
 import {
   LOCAL_LLM_MODELS,
+  LocalLlmGpuError,
   checkWebGpuSupport,
   deleteCachedLocalModel,
   getLoadedLocalModelKey,
@@ -1151,55 +1152,79 @@ export function AssistantView({
         }
         return;
       }
-      // Unlimited On-Device Local AI (WebGPU / WebLLM — runs directly in browser, zero API key, zero quota)
+      // Unlimited On-Device Local AI (WebGPU / WebLLM — runs in dedicated Web Worker, zero API key, zero quota)
+      let effectiveRequestEngine: AiEngine = engine;
       if (engine === "local-browser") {
         const assistantId = `a-${Date.now()}`;
-        const replyText = await streamLocalLlmChat({
-          modelKey: localModelKey,
-          messages: nextMessages,
-          profile,
-          subject: profile.role === "student" ? subject : undefined,
-          language: activeLanguage,
-          spokenMode: autoSpeakRef.current,
-          onProgress: (info) => {
-            setLocalProgress(info);
-            setLocalStatus(info.progress >= 1 ? "ready" : "loading");
-          },
-          onDelta: (acc) => {
-            const liveMsg: ChatMessage = {
-              id: assistantId,
-              role: "assistant",
-              content: acc,
-              timestamp: new Date().toISOString(),
-              subject: profile.role === "student" ? subject : undefined,
-            };
-            onUpdateMessages(profile.id, [...nextMessages, liveMsg]);
-          },
-        });
+        try {
+          const replyText = await streamLocalLlmChat({
+            modelKey: localModelKey,
+            messages: nextMessages,
+            profile,
+            subject: profile.role === "student" ? subject : undefined,
+            language: activeLanguage,
+            spokenMode: autoSpeakRef.current,
+            onProgress: (info) => {
+              setLocalProgress(info);
+              setLocalStatus(info.progress >= 1 ? "ready" : "loading");
+            },
+            onDelta: (acc) => {
+              const liveMsg: ChatMessage = {
+                id: assistantId,
+                role: "assistant",
+                content: acc,
+                timestamp: new Date().toISOString(),
+                subject: profile.role === "student" ? subject : undefined,
+              };
+              onUpdateMessages(profile.id, [...nextMessages, liveMsg]);
+            },
+          });
 
-        setLocalStatus("ready");
-        setDownloadingModelKey(null);
-        setDownloadedModels((prev) =>
-          prev.includes(localModelKey) ? prev : [...prev, localModelKey]
-        );
-        const assistantMsg: ChatMessage = {
-          id: assistantId,
-          role: "assistant",
-          content:
-            replyText ||
-            "I heard you, but I could not form a response. Please try asking again.",
-          timestamp: new Date().toISOString(),
-          subject: profile.role === "student" ? subject : undefined,
-          actions:
-            parsedMobile.actions.length > 0 ? parsedMobile.actions : undefined,
-        };
-        const updatedMessages = [...nextMessages, assistantMsg];
-        onUpdateMessages(profile.id, updatedMessages);
+          if (!replyText.trim()) {
+            throw new Error("Local AI returned an empty response.");
+          }
 
-        if (autoSpeakRef.current) {
-          void speakText(assistantMsg.id, assistantMsg.content, true);
+          setLocalStatus("ready");
+          setDownloadingModelKey(null);
+          setDownloadedModels((prev) =>
+            prev.includes(localModelKey) ? prev : [...prev, localModelKey]
+          );
+          const assistantMsg: ChatMessage = {
+            id: assistantId,
+            role: "assistant",
+            content: replyText,
+            timestamp: new Date().toISOString(),
+            subject: profile.role === "student" ? subject : undefined,
+            actions:
+              parsedMobile.actions.length > 0 ? parsedMobile.actions : undefined,
+          };
+          const updatedMessages = [...nextMessages, assistantMsg];
+          onUpdateMessages(profile.id, updatedMessages);
+
+          if (autoSpeakRef.current) {
+            void speakText(assistantMsg.id, assistantMsg.content, true);
+          }
+          return;
+        } catch (localErr) {
+          // GPU buffer/device lost even after fresh-worker low-VRAM retry:
+          // Reset local engine cleanly and seamlessly answer via Cloud Auto so the user is never stranded!
+          setDownloadingModelKey(null);
+          setLocalProgress(null);
+          setLocalStatus(gpuInfo?.supported === false ? "unsupported" : "idle");
+
+          const suggestedKey =
+            localErr instanceof LocalLlmGpuError
+              ? localErr.suggestedModelKey
+              : "llama-3.2-1b";
+          const suggestedLabel =
+            LOCAL_LLM_MODELS.find((m) => m.key === suggestedKey)?.label ||
+            "Llama 3.2 1B";
+
+          showToast(
+            `${activeLocalModel.label} hit your device's WebGPU memory limit — answering seamlessly via Cloud Auto. For reliable on-device Local AI, select ${suggestedLabel}.`
+          );
+          effectiveRequestEngine = "auto";
         }
-        return;
       }
 
       const res = await fetch("/api/chat", {
@@ -1217,7 +1242,7 @@ export function AssistantView({
           useSearch: forceLiveSearch || useSearch,
           language: activeLanguage,
           speedMode,
-          engine,
+          engine: effectiveRequestEngine,
           stream: true,
           spokenMode: autoSpeakRef.current,
         }),

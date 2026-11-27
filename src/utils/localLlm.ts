@@ -11,6 +11,9 @@ export interface LocalModelOption {
   bestFor: string;
   f16Id: string;
   f32Id: string;
+  /** Optional official 1k-context low-VRAM variant in WebLLM prebuiltAppConfig */
+  f16Id1k?: string;
+  f32Id1k?: string;
 }
 
 export const LOCAL_LLM_MODELS: LocalModelOption[] = [
@@ -64,6 +67,8 @@ export const LOCAL_LLM_MODELS: LocalModelOption[] = [
     bestFor: "Google Gemma 2 · Clear explanations & writing",
     f16Id: "gemma-2-2b-it-q4f16_1-MLC",
     f32Id: "gemma-2-2b-it-q4f32_1-MLC",
+    f16Id1k: "gemma-2-2b-it-q4f16_1-MLC-1k",
+    f32Id1k: "gemma-2-2b-it-q4f32_1-MLC-1k",
   },
 
   // Mid-Size Power (Laptops & Flagship Phones)
@@ -96,6 +101,8 @@ export const LOCAL_LLM_MODELS: LocalModelOption[] = [
     bestFor: "Microsoft 3.8B · Deep reasoning & science",
     f16Id: "Phi-3.5-mini-instruct-q4f16_1-MLC",
     f32Id: "Phi-3.5-mini-instruct-q4f32_1-MLC",
+    f16Id1k: "Phi-3.5-mini-instruct-q4f16_1-MLC-1k",
+    f32Id1k: "Phi-3.5-mini-instruct-q4f32_1-MLC-1k",
   },
 
   // Large Pro Models (Desktop / Laptop GPUs · 6–8+ GB VRAM)
@@ -128,6 +135,8 @@ export const LOCAL_LLM_MODELS: LocalModelOption[] = [
     bestFor: "Large 8B · Meta flagship on-device model",
     f16Id: "Llama-3.1-8B-Instruct-q4f16_1-MLC",
     f32Id: "Llama-3.1-8B-Instruct-q4f32_1-MLC",
+    f16Id1k: "Llama-3.1-8B-Instruct-q4f16_1-MLC-1k",
+    f32Id1k: "Llama-3.1-8B-Instruct-q4f32_1-MLC-1k",
   },
   {
     key: "deepseek-r1-7b",
@@ -161,7 +170,21 @@ export interface LocalLlmProgress {
 export interface WebGpuSupportInfo {
   supported: boolean;
   supportsF16: boolean;
+  maxBufferMB?: number;
+  isLowVramDevice?: boolean;
   reason?: string;
+}
+
+export class LocalLlmGpuError extends Error {
+  public readonly suggestedModelKey: string;
+  public readonly rawError: string;
+
+  constructor(message: string, suggestedModelKey: string, rawError: string) {
+    super(message);
+    this.name = "LocalLlmGpuError";
+    this.suggestedModelKey = suggestedModelKey;
+    this.rawError = rawError;
+  }
 }
 
 type WebLlmEngine = {
@@ -179,13 +202,45 @@ type WebLlmEngine = {
       >;
     };
   };
+  resetChat?: (keepStats?: boolean) => Promise<void>;
   unload?: () => Promise<void>;
 };
 
 let cachedEngine: WebLlmEngine | null = null;
+let cachedWorker: Worker | null = null;
 let loadedModelKey: string | null = null;
+let loadedLowMemoryMode = false;
 let loadingPromise: Promise<WebLlmEngine> | null = null;
 let loadingModelKey: string | null = null;
+let activeInferencePromise: Promise<unknown> | null = null;
+
+function isWebGpuContextError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /mapAsync|GPUBuffer|external Instance reference|device lost|GPUDevice|GPUValidationError|out of memory|oom|allocation|context lost|disposed|terminated|Wasm|memory access out of bounds/i.test(
+    msg
+  );
+}
+
+function getSuggestedLighterModelKey(currentKey: string): string {
+  const current = LOCAL_LLM_MODELS.find((m) => m.key === currentKey);
+  if (!current) return "llama-3.2-1b";
+  if (current.tier === "large") return "llama-3.2-3b";
+  if (current.tier === "mid") return "llama-3.2-1b";
+  if (current.key !== "smollm2-360m") return "smollm2-360m";
+  return "smollm2-360m";
+}
+
+function resolveModelId(
+  modelMeta: LocalModelOption,
+  supportsF16: boolean,
+  lowMemoryMode: boolean
+): string {
+  if (lowMemoryMode) {
+    if (supportsF16 && modelMeta.f16Id1k) return modelMeta.f16Id1k;
+    if (!supportsF16 && modelMeta.f32Id1k) return modelMeta.f32Id1k;
+  }
+  return supportsF16 ? modelMeta.f16Id : modelMeta.f32Id;
+}
 
 export function getRecordedDownloadedModels(): string[] {
   try {
@@ -226,9 +281,17 @@ export async function syncCachedLocalModels(): Promise<string[]> {
       await Promise.all(
         LOCAL_LLM_MODELS.map(async (m) => {
           try {
-            const hasF16 = await webllm.hasModelInCache(m.f16Id);
-            const hasF32 = hasF16 ? true : await webllm.hasModelInCache(m.f32Id);
-            if (hasF16 || hasF32) {
+            const candidateIds = [m.f16Id, m.f32Id, m.f16Id1k, m.f32Id1k].filter(
+              (id): id is string => Boolean(id)
+            );
+            let found = false;
+            for (const id of candidateIds) {
+              if (await webllm.hasModelInCache(id)) {
+                found = true;
+                break;
+              }
+            }
+            if (found) {
               recorded.add(m.key);
             } else {
               recorded.delete(m.key);
@@ -256,10 +319,13 @@ export async function deleteCachedLocalModel(modelKey: string): Promise<string[]
     try {
       const webllm = await import("@mlc-ai/web-llm");
       if (typeof webllm.deleteModelAllInfoInCache === "function") {
-        await Promise.allSettled([
-          webllm.deleteModelAllInfoInCache(modelMeta.f16Id),
-          webllm.deleteModelAllInfoInCache(modelMeta.f32Id),
-        ]);
+        const ids = [
+          modelMeta.f16Id,
+          modelMeta.f32Id,
+          modelMeta.f16Id1k,
+          modelMeta.f32Id1k,
+        ].filter((id): id is string => Boolean(id));
+        await Promise.allSettled(ids.map((id) => webllm.deleteModelAllInfoInCache(id)));
       }
     } catch {
       // ignore cache delete errors
@@ -280,8 +346,12 @@ export async function checkWebGpuSupport(): Promise<WebGpuSupportInfo> {
   }
   const nav = navigator as Navigator & {
     gpu?: {
-      requestAdapter: () => Promise<{
+      requestAdapter: (opts?: { powerPreference?: string }) => Promise<{
         features?: { has: (name: string) => boolean };
+        limits?: {
+          maxBufferSize?: number;
+          maxStorageBufferBindingSize?: number;
+        };
       } | null>;
     };
   };
@@ -291,22 +361,39 @@ export async function checkWebGpuSupport(): Promise<WebGpuSupportInfo> {
       supported: false,
       supportsF16: false,
       reason:
-        "WebGPU is not enabled in this browser. Open in Chrome/Edge 113+ or Android Chrome for direct browser Local AI, or connect Ollama / LM Studio via LOCAL_LLM_URL.",
+        "WebGPU is not enabled in this browser. Open in Chrome/Edge 113+ or Android Chrome for direct browser Local AI, or use Auto Cloud mode.",
     };
   }
 
   try {
-    const adapter = await nav.gpu.requestAdapter();
+    const adapter =
+      (await nav.gpu.requestAdapter({ powerPreference: "high-performance" })) ||
+      (await nav.gpu.requestAdapter());
     if (!adapter) {
       return {
         supported: false,
         supportsF16: false,
         reason:
-          "No compatible WebGPU adapter was found on this device. You can still use Cloud Auto mode or connect Ollama / LM Studio via LOCAL_LLM_URL.",
+          "No compatible WebGPU adapter was found on this device. You can still use Cloud Auto mode (Gemini + NVIDIA NIM).",
       };
     }
     const supportsF16 = Boolean(adapter.features?.has("shader-f16"));
-    return { supported: true, supportsF16 };
+    const maxBufferBytes = adapter.limits?.maxBufferSize || 0;
+    const maxBufferMB = maxBufferBytes
+      ? Math.round(maxBufferBytes / (1024 * 1024))
+      : undefined;
+    const isMobileUa =
+      typeof navigator !== "undefined" &&
+      /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+    const isLowVramDevice =
+      isMobileUa || (typeof maxBufferMB === "number" && maxBufferMB < 1024);
+
+    return {
+      supported: true,
+      supportsF16,
+      maxBufferMB,
+      isLowVramDevice,
+    };
   } catch {
     return {
       supported: false,
@@ -320,34 +407,73 @@ export function getLoadedLocalModelKey(): string | null {
   return loadedModelKey;
 }
 
-export async function unloadLocalLlmModel(): Promise<void> {
-  if (cachedEngine?.unload) {
+function forceResetLocalEngineState(): void {
+  if (cachedWorker) {
     try {
-      await cachedEngine.unload();
+      cachedWorker.terminate();
     } catch {
-      // ignore
+      // ignore worker termination errors
     }
+    cachedWorker = null;
   }
   cachedEngine = null;
   loadedModelKey = null;
+  loadedLowMemoryMode = false;
   loadingPromise = null;
   loadingModelKey = null;
 }
 
+export async function unloadLocalLlmModel(): Promise<void> {
+  const engineToUnload = cachedEngine;
+  const workerToStop = cachedWorker;
+
+  cachedEngine = null;
+  cachedWorker = null;
+  loadedModelKey = null;
+  loadedLowMemoryMode = false;
+  loadingPromise = null;
+  loadingModelKey = null;
+
+  if (engineToUnload?.unload) {
+    try {
+      await Promise.race([
+        engineToUnload.unload(),
+        new Promise((resolve) => setTimeout(resolve, 1500)),
+      ]);
+    } catch {
+      // ignore unload error if GPU device was already lost
+    }
+  }
+  if (workerToStop) {
+    try {
+      workerToStop.terminate();
+    } catch {
+      // ignore
+    }
+  }
+}
+
 export async function loadLocalLlmModel(
   modelKey: string,
-  onProgress?: (info: LocalLlmProgress) => void
+  onProgress?: (info: LocalLlmProgress) => void,
+  options?: { forceReload?: boolean; lowMemoryMode?: boolean }
 ): Promise<WebLlmEngine> {
   const modelMeta =
     LOCAL_LLM_MODELS.find((m) => m.key === modelKey) || LOCAL_LLM_MODELS[2];
+  const wantLowMemory = Boolean(options?.lowMemoryMode);
 
-  if (cachedEngine && loadedModelKey === modelMeta.key) {
+  if (
+    !options?.forceReload &&
+    cachedEngine &&
+    loadedModelKey === modelMeta.key &&
+    loadedLowMemoryMode === wantLowMemory
+  ) {
     recordDownloadedModel(modelMeta.key);
     onProgress?.({ progress: 1, text: `${modelMeta.label} ready on device` });
     return cachedEngine;
   }
 
-  if (loadingPromise && loadingModelKey === modelMeta.key) {
+  if (!options?.forceReload && loadingPromise && loadingModelKey === modelMeta.key) {
     return loadingPromise;
   }
 
@@ -358,42 +484,122 @@ export async function loadLocalLlmModel(
     );
   }
 
-  // Unload prior model to keep device GPU RAM clean before loading a larger model
-  if (cachedEngine && loadedModelKey !== modelMeta.key) {
+  // Always terminate prior worker / unload prior model cleanly to free GPU VRAM
+  if (cachedEngine || cachedWorker) {
     await unloadLocalLlmModel();
+    await new Promise((resolve) => setTimeout(resolve, 200));
   }
 
-  const resolvedModelId = gpu.supportsF16 ? modelMeta.f16Id : modelMeta.f32Id;
+  const effectiveLowMem = wantLowMemory || Boolean(gpu.isLowVramDevice);
+  const resolvedModelId = resolveModelId(modelMeta, gpu.supportsF16, effectiveLowMem);
+  const safeContextWindow = effectiveLowMem
+    ? 1024
+    : modelMeta.tier === "large"
+      ? 2048
+      : 2048;
+
   loadingModelKey = modelMeta.key;
 
   loadingPromise = (async () => {
+    let worker: Worker | null = null;
     try {
       onProgress?.({
         progress: 0.02,
-        text: `Downloading ${modelMeta.label} (${modelMeta.sizeLabel})…`,
+        text: effectiveLowMem
+          ? `Loading ${modelMeta.label} in safe low-VRAM mode…`
+          : `Loading ${modelMeta.label} (${modelMeta.sizeLabel})…`,
       });
       const webllm = await import("@mlc-ai/web-llm");
-      const engine = (await webllm.CreateMLCEngine(resolvedModelId, {
+
+      const engineConfig = {
         initProgressCallback: (report: { progress?: number; text?: string }) => {
           onProgress?.({
             progress: typeof report.progress === "number" ? report.progress : 0,
             text: report.text || `Loading ${modelMeta.label}…`,
           });
         },
-      })) as unknown as WebLlmEngine;
+      };
+      const chatOpts = {
+        context_window_size: safeContextWindow,
+      };
 
+      let engine: WebLlmEngine;
+      if (
+        typeof Worker !== "undefined" &&
+        typeof webllm.CreateWebWorkerMLCEngine === "function"
+      ) {
+        try {
+          worker = new Worker(new URL("./localLlmWorker.ts", import.meta.url), {
+            type: "module",
+          });
+          worker.onerror = () => {
+            if (cachedWorker === worker) {
+              forceResetLocalEngineState();
+            }
+          };
+          worker.onmessageerror = () => {
+            if (cachedWorker === worker) {
+              forceResetLocalEngineState();
+            }
+          };
+          engine = (await webllm.CreateWebWorkerMLCEngine(
+            worker,
+            resolvedModelId,
+            engineConfig,
+            chatOpts
+          )) as unknown as WebLlmEngine;
+        } catch (workerErr) {
+          if (worker) {
+            try {
+              worker.terminate();
+            } catch {
+              // ignore
+            }
+            worker = null;
+          }
+          // Only fall back to main thread if Worker instantiation itself failed (not GPU OOM)
+          if (isWebGpuContextError(workerErr)) {
+            throw workerErr;
+          }
+          engine = (await webllm.CreateMLCEngine(
+            resolvedModelId,
+            engineConfig,
+            chatOpts
+          )) as unknown as WebLlmEngine;
+        }
+      } else {
+        engine = (await webllm.CreateMLCEngine(
+          resolvedModelId,
+          engineConfig,
+          chatOpts
+        )) as unknown as WebLlmEngine;
+      }
+
+      cachedWorker = worker;
       cachedEngine = engine;
       loadedModelKey = modelMeta.key;
+      loadedLowMemoryMode = wantLowMemory;
       recordDownloadedModel(modelMeta.key);
       onProgress?.({ progress: 1, text: `${modelMeta.label} ready on device` });
       return engine;
     } catch (err) {
-      cachedEngine = null;
-      loadedModelKey = null;
+      if (worker) {
+        try {
+          worker.terminate();
+        } catch {
+          // ignore
+        }
+      }
+      forceResetLocalEngineState();
       const rawMsg = err instanceof Error ? err.message : String(err);
-      if (/out of memory|oom|allocation|buffer|device lost/i.test(rawMsg)) {
-        throw new Error(
-          `${modelMeta.label} (${modelMeta.vramLabel}) exceeded this device's GPU memory. Try a smaller model like Qwen 2.5 3B, Llama 3.2 3B, or Llama 3.2 1B.`
+      if (isWebGpuContextError(err)) {
+        const suggested = getSuggestedLighterModelKey(modelMeta.key);
+        const suggestedLabel =
+          LOCAL_LLM_MODELS.find((m) => m.key === suggested)?.label || "Llama 3.2 1B";
+        throw new LocalLlmGpuError(
+          `${modelMeta.label} (${modelMeta.vramLabel}) exceeded this device's WebGPU buffer/memory limit. Try ${suggestedLabel} or Cloud Auto mode.`,
+          suggested,
+          rawMsg
         );
       }
       throw err;
@@ -407,9 +613,7 @@ export async function loadLocalLlmModel(
 }
 
 function stripLocalThinkingTags(raw: string): string {
-  // Remove complete <think>...</think> blocks
   const withoutComplete = raw.replace(/<think>[\s\S]*?<\/think>/gi, "");
-  // While a reasoning model is still inside an open <think> block, keep UI clean
   const openIdx = withoutComplete.toLowerCase().indexOf("<think>");
   if (openIdx !== -1) {
     return withoutComplete.slice(0, openIdx).trim();
@@ -452,20 +656,69 @@ function buildLocalSystemPrompt(options: {
   ].join(" ");
 }
 
-export async function streamLocalLlmChat(options: {
+function buildSafeLocalMessages(options: {
   modelKey: string;
+  systemPrompt: string;
+  messages: ChatMessage[];
+  maxHistory: number;
+  maxCharsPerMsg: number;
+}): Array<{ role: "system" | "user" | "assistant"; content: string }> {
+  const recent = options.messages.slice(-options.maxHistory);
+  const normalized: Array<{ role: "user" | "assistant"; content: string }> = [];
+
+  for (const m of recent) {
+    const role: "user" | "assistant" =
+      m.role === "assistant" ? "assistant" : "user";
+    const text = (m.content || "").trim().slice(0, options.maxCharsPerMsg);
+    if (!text) continue;
+
+    // Ensure history starts with a user turn (required by Gemma / Mistral / Llama templates)
+    if (normalized.length === 0 && role === "assistant") {
+      continue;
+    }
+
+    // Merge consecutive messages of the same role so templates never fail
+    const last = normalized[normalized.length - 1];
+    if (last && last.role === role) {
+      last.content = `${last.content}\n\n${text}`.slice(0, options.maxCharsPerMsg);
+    } else {
+      normalized.push({ role, content: text });
+    }
+  }
+
+  if (normalized.length === 0) {
+    normalized.push({ role: "user", content: "Hello" });
+  }
+
+  // Gemma 2 chat templates reject or break on standalone system role in WebLLM
+  if (/gemma/i.test(options.modelKey)) {
+    const first = normalized[0];
+    normalized[0] = {
+      role: "user",
+      content: `Instructions: ${options.systemPrompt}\n\nRequest: ${first.content}`,
+    };
+    return normalized;
+  }
+
+  return [{ role: "system", content: options.systemPrompt }, ...normalized];
+}
+
+async function runSingleLocalCompletion(options: {
+  modelMeta: LocalModelOption;
   messages: ChatMessage[];
   profile: FamilyProfile;
   subject?: string;
   language?: string;
   spokenMode?: boolean;
+  lowMemoryMode: boolean;
+  forceReload: boolean;
   onProgress?: (info: LocalLlmProgress) => void;
   onDelta: (accumulated: string) => void;
 }): Promise<string> {
-  const modelMeta =
-    LOCAL_LLM_MODELS.find((m) => m.key === options.modelKey) ||
-    LOCAL_LLM_MODELS[2];
-  const engine = await loadLocalLlmModel(modelMeta.key, options.onProgress);
+  const engine = await loadLocalLlmModel(options.modelMeta.key, options.onProgress, {
+    forceReload: options.forceReload,
+    lowMemoryMode: options.lowMemoryMode,
+  });
 
   const systemPrompt = buildLocalSystemPrompt({
     profile: options.profile,
@@ -474,17 +727,32 @@ export async function streamLocalLlmChat(options: {
     spokenMode: options.spokenMode,
   });
 
-  const historyLimit = modelMeta.tier === "large" ? 14 : 10;
-  const recent = options.messages.slice(-historyLimit).map((m) => ({
-    role: (m.role === "assistant" ? "assistant" : "user") as "user" | "assistant",
-    content: (m.content || "").trim().slice(0, 2400),
-  }));
+  const chatMessages = buildSafeLocalMessages({
+    modelKey: options.modelMeta.key,
+    systemPrompt,
+    messages: options.messages,
+    maxHistory: options.lowMemoryMode ? 4 : options.modelMeta.tier === "large" ? 8 : 6,
+    maxCharsPerMsg: options.lowMemoryMode ? 900 : 1600,
+  });
+
+  // Reset KV cache cleanly before each completion so stale GPU buffers don't accumulate
+  if (typeof engine.resetChat === "function") {
+    try {
+      await engine.resetChat(false);
+    } catch {
+      // ignore if engine doesn't need reset
+    }
+  }
 
   const completion = await engine.chat.completions.create({
-    messages: [{ role: "system", content: systemPrompt }, ...recent],
+    messages: chatMessages,
     stream: true,
     temperature: 0.6,
-    max_tokens: modelMeta.tier === "mobile" ? 900 : 1400,
+    max_tokens: options.lowMemoryMode
+      ? 512
+      : options.modelMeta.tier === "mobile"
+        ? 768
+        : 1024,
   });
 
   let rawAccumulated = "";
@@ -500,4 +768,95 @@ export async function streamLocalLlmChat(options: {
   }
 
   return stripLocalThinkingTags(rawAccumulated);
+}
+
+export async function streamLocalLlmChat(options: {
+  modelKey: string;
+  messages: ChatMessage[];
+  profile: FamilyProfile;
+  subject?: string;
+  language?: string;
+  spokenMode?: boolean;
+  onProgress?: (info: LocalLlmProgress) => void;
+  onDelta: (accumulated: string) => void;
+}): Promise<string> {
+  // Serialize inference so two WebGPU passes can never race on the same GPUBuffer
+  if (activeInferencePromise) {
+    try {
+      await activeInferencePromise;
+    } catch {
+      // ignore previous error
+    }
+  }
+
+  const modelMeta =
+    LOCAL_LLM_MODELS.find((m) => m.key === options.modelKey) ||
+    LOCAL_LLM_MODELS[2];
+
+  const task = (async (): Promise<string> => {
+    try {
+      return await runSingleLocalCompletion({
+        modelMeta,
+        messages: options.messages,
+        profile: options.profile,
+        subject: options.subject,
+        language: options.language,
+        spokenMode: options.spokenMode,
+        lowMemoryMode: false,
+        forceReload: false,
+        onProgress: options.onProgress,
+        onDelta: options.onDelta,
+      });
+    } catch (firstErr) {
+      if (!isWebGpuContextError(firstErr)) {
+        throw firstErr;
+      }
+
+      // GPU device / GPUBuffer external Instance reference was lost:
+      // Hard-terminate dead Web Worker, wait briefly for browser Dawn cleanup, and auto-retry ONCE in safe low-VRAM mode.
+      await unloadLocalLlmModel();
+      options.onProgress?.({
+        progress: 0.15,
+        text: `GPU reset detected — recovering ${modelMeta.label} in safe low-VRAM mode…`,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 350));
+
+      try {
+        return await runSingleLocalCompletion({
+          modelMeta,
+          messages: options.messages,
+          profile: options.profile,
+          subject: options.subject,
+          language: options.language,
+          spokenMode: options.spokenMode,
+          lowMemoryMode: true,
+          forceReload: true,
+          onProgress: options.onProgress,
+          onDelta: options.onDelta,
+        });
+      } catch (retryErr) {
+        await unloadLocalLlmModel();
+        const rawMsg =
+          retryErr instanceof Error ? retryErr.message : String(retryErr);
+        const suggested = getSuggestedLighterModelKey(modelMeta.key);
+        const suggestedLabel =
+          LOCAL_LLM_MODELS.find((m) => m.key === suggested)?.label ||
+          "Llama 3.2 1B";
+        throw new LocalLlmGpuError(
+          `${modelMeta.label} could not stay loaded in this device's WebGPU memory (${rawMsg.slice(0, 90)}). Try ${suggestedLabel} or Cloud Auto.`,
+          suggested,
+          rawMsg
+        );
+      }
+    }
+  })();
+
+  activeInferencePromise = task;
+  try {
+    return await task;
+  } finally {
+    if (activeInferencePromise === task) {
+      activeInferencePromise = null;
+    }
+  }
 }
