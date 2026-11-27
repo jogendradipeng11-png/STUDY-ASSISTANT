@@ -52,6 +52,53 @@ export interface ActiveAlarm {
   ringing?: boolean;
 }
 
+export interface StudyPhotoResult {
+  title: string;
+  imageUrl: string;
+  pageUrl: string;
+  credit?: string;
+}
+
+export interface StudyDiagramMedia {
+  title: string;
+  caption: string;
+  svgCode: string;
+}
+
+export interface StudyVideoScene {
+  heading: string;
+  narration: string;
+  keyFact: string;
+  visualAccent:
+    | "sun"
+    | "atom"
+    | "globe"
+    | "wave"
+    | "chart"
+    | "book"
+    | "leaf"
+    | "rocket"
+    | "circuit"
+    | "heart";
+  bulletPoints: string[];
+  durationSec: number;
+}
+
+export interface StudyVideoStoryboard {
+  title: string;
+  subtitle: string;
+  subject: string;
+  language?: string;
+  themeColor: string;
+  scenes: StudyVideoScene[];
+}
+
+export interface StudyVideoLink {
+  title: string;
+  url: string;
+  source: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -63,6 +110,10 @@ export interface ChatMessage {
   imageMimeType?: string;
   sources?: GroundingSource[];
   actions?: MobileAction[];
+  studyDiagram?: StudyDiagramMedia;
+  studyPhotos?: StudyPhotoResult[];
+  studyVideo?: StudyVideoStoryboard;
+  studyVideoLinks?: StudyVideoLink[];
   noteSavedId?: string;
 }
 

@@ -2571,6 +2571,540 @@ async function startServer() {
     }
   });
 
+  // Helper: sanitize generated SVG diagrams strictly (no scripts, event handlers, or external frames)
+  const sanitizeSvgMarkup = (raw: string): string => {
+    const match = raw.match(/<svg[\s\S]*?<\/svg>/i);
+    if (!match) return "";
+    let svg = match[0]
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<foreignObject[\s\S]*?<\/foreignObject>/gi, "")
+      .replace(/<(iframe|object|embed|link|meta)[^>]*>[\s\S]*?<\/\1>/gi, "")
+      .replace(/<(iframe|object|embed|link|meta)[^>]*\/?>/gi, "")
+      .replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+      .replace(/javascript\s*:/gi, "")
+      .replace(/data\s*:\s*text\/html/gi, "");
+
+    if (!/xmlns=/i.test(svg)) {
+      svg = svg.replace(/<svg/i, '<svg xmlns="http://www.w3.org/2000/svg"');
+    }
+    if (!/viewBox=/i.test(svg)) {
+      svg = svg.replace(/<svg/i, '<svg viewBox="0 0 800 520"');
+    }
+    return svg.trim();
+  };
+
+  // Helper: fetch free verified educational reference photos from Wikimedia Commons (no API key needed)
+  const searchWikimediaPhotos = async (
+    queryText: string
+  ): Promise<
+    Array<{ title: string; imageUrl: string; pageUrl: string; credit?: string }>
+  > => {
+    const cleanQuery = queryText
+      .replace(/[^\p{L}\p{N}\s-]/gu, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 80);
+    if (!cleanQuery) return [];
+    try {
+      const url = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6&gsrlimit=8&gsrsearch=${encodeURIComponent(
+        cleanQuery
+      )}&prop=imageinfo&iiprop=url|mime|extmetadata&iiurlwidth=760&format=json&origin=*`;
+      const resp = await fetch(url, {
+        headers: { "User-Agent": "JogiJarvisStudyAssistant/1.0" },
+        signal: AbortSignal.timeout(7000),
+      });
+      if (!resp.ok) return [];
+      const data = (await resp.json()) as {
+        query?: {
+          pages?: Record<
+            string,
+            {
+              title?: string;
+              imageinfo?: Array<{
+                url?: string;
+                thumburl?: string;
+                descriptionurl?: string;
+                mime?: string;
+                extmetadata?: { Artist?: { value?: string } };
+              }>;
+            }
+          >;
+        };
+      };
+      const pages = Object.values(data.query?.pages || {});
+      const results: Array<{
+        title: string;
+        imageUrl: string;
+        pageUrl: string;
+        credit?: string;
+      }> = [];
+
+      for (const page of pages) {
+        const info = page.imageinfo?.[0];
+        if (!info) continue;
+        const mime = (info.mime || "").toLowerCase();
+        if (
+          !["image/jpeg", "image/png", "image/webp", "image/svg+xml"].includes(mime)
+        ) {
+          continue;
+        }
+        const imgUrl = info.thumburl || info.url;
+        if (!imgUrl || !/^https:\/\//i.test(imgUrl)) continue;
+        const title = (page.title || "Study Picture")
+          .replace(/^File:/i, "")
+          .replace(/\.[a-z0-9]+$/i, "")
+          .replace(/_/g, " ")
+          .trim()
+          .slice(0, 90);
+        results.push({
+          title,
+          imageUrl: imgUrl,
+          pageUrl: info.descriptionurl || imgUrl,
+          credit: "Wikimedia Commons",
+        });
+        if (results.length >= 4) break;
+      }
+      return results;
+    } catch {
+      return [];
+    }
+  };
+
+  const buildStudyVideoLinks = (topic: string, subject?: string) => {
+    const cleanTopic = topic.trim().slice(0, 90);
+    const subjectSuffix =
+      subject && subject !== "All Subjects" ? ` ${subject}` : "";
+    const ytQuery = encodeURIComponent(`${cleanTopic}${subjectSuffix} explained`);
+    const khanQuery = encodeURIComponent(cleanTopic);
+    const wikiQuery = encodeURIComponent(cleanTopic);
+    return [
+      {
+        title: `YouTube: ${cleanTopic.slice(0, 32)} Explained`,
+        url: `https://www.youtube.com/results?search_query=${ytQuery}`,
+        source: "YouTube",
+      },
+      {
+        title: "Khan Academy Lessons",
+        url: `https://www.khanacademy.org/search?page_search_query=${khanQuery}`,
+        source: "Khan Academy",
+      },
+      {
+        title: "Wikimedia Educational Media",
+        url: `https://commons.wikimedia.org/w/index.php?search=${wikiQuery}&title=Special:MediaSearch&type=video`,
+        source: "Wikimedia",
+      },
+    ];
+  };
+
+  // 6a. Free Study Picture & Labeled Diagram Generator (+ Real Wikimedia Photos)
+  app.post("/api/study/picture", async (req, res) => {
+    try {
+      const { prompt, profile, subject, language } = req.body as {
+        prompt?: string;
+        profile?: ProfilePayload;
+        subject?: string;
+        language?: string;
+      };
+
+      const cleanPrompt = prompt?.trim();
+      if (!cleanPrompt) {
+        return res
+          .status(400)
+          .json({ error: "Please describe the picture or diagram you want." });
+      }
+
+      const langRule = buildLanguageGuidance(
+        language || profile?.preferredLanguage
+      );
+      const diagramSystem =
+        "You are Jogi Jarvis, an expert textbook illustrator and AI teacher. Create clean, accurate, colorful, well-labeled educational SVG illustrations and diagrams.";
+      const diagramPrompt = [
+        `Create a clear, colorful, textbook-quality SVG diagram/picture illustrating: "${cleanPrompt}".`,
+        subject && subject !== "All Subjects" ? `Subject: ${subject}.` : "",
+        profile?.grade ? `Student level: ${profile.grade}.` : "",
+        "SVG Requirements:",
+        "- Root element MUST be <svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 800 520\">.",
+        "- Clean light background rectangle (#F8FAFC or subtle soft sky/card gradient) with a crisp title banner at top.",
+        "- Use rich vector shapes (circles, paths, arrows, rounded callout boxes, legends) and clear readable text labels (font-family=\"sans-serif\", font-size 13-22px) with plenty of spacing so labels NEVER overlap.",
+        "- Keep SVG self-contained (no external URLs, no scripts, no foreignObject).",
+        "- Also provide a short concise English searchQuery (2-4 words) for finding real reference photos on Wikimedia Commons, plus a warm 2-3 sentence teacher explanation.",
+        langRule,
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      const schemaHint =
+        '{"title":"string","caption":"string","explanation":"string","searchQuery":"2-4 English keywords","svgCode":"<svg xmlns=\\"http://www.w3.org/2000/svg\\" viewBox=\\"0 0 800 520\\">...</svg>"}';
+
+      const diagramSchema = {
+        type: Type.OBJECT,
+        properties: {
+          title: { type: Type.STRING },
+          caption: { type: Type.STRING },
+          explanation: { type: Type.STRING },
+          searchQuery: { type: Type.STRING },
+          svgCode: { type: Type.STRING },
+        },
+        required: ["title", "caption", "explanation", "searchQuery", "svgCode"],
+      };
+
+      let generated: {
+        title?: string;
+        caption?: string;
+        explanation?: string;
+        searchQuery?: string;
+        svgCode?: string;
+      } = {};
+
+      if (!hasGeminiKey() && hasAnyFallbackProvider()) {
+        generated = (await callFallbackPoolJson(
+          diagramSystem,
+          diagramPrompt,
+          schemaHint
+        )) as typeof generated;
+      } else {
+        try {
+          const ai = getAiClient();
+          const { response } = await generateGeminiTextWithFallback(
+            ai,
+            diagramPrompt,
+            (model) => ({
+              systemInstruction: diagramSystem,
+              ...(model === "gemini-4-hydrogen"
+                ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                : {}),
+              responseMimeType: "application/json",
+              responseSchema: diagramSchema,
+            })
+          );
+          generated = parseJsonFromText<typeof generated>(response.text || "{}");
+        } catch (geminiErr) {
+          if (hasAnyFallbackProvider()) {
+            generated = (await callFallbackPoolJson(
+              diagramSystem,
+              diagramPrompt,
+              schemaHint
+            )) as typeof generated;
+          } else {
+            throw geminiErr;
+          }
+        }
+      }
+
+      const sanitizedSvg = sanitizeSvgMarkup(String(generated.svgCode || ""));
+      const photoQuery =
+        String(generated.searchQuery || "").trim() || cleanPrompt;
+      const photos = await searchWikimediaPhotos(photoQuery);
+
+      return res.json({
+        reply:
+          String(generated.explanation || "").trim() ||
+          `Here is a visual study diagram and reference pictures for **${cleanPrompt}**.`,
+        diagram: sanitizedSvg
+          ? {
+              title: String(generated.title || cleanPrompt).slice(0, 100),
+              caption: String(generated.caption || "AI Study Illustration").slice(
+                0,
+                160
+              ),
+              svgCode: sanitizedSvg,
+            }
+          : undefined,
+        photos,
+      });
+    } catch (err) {
+      const formatted = formatApiError(err);
+      return res.status(formatted.status).json({ error: formatted.message });
+    }
+  });
+
+  // 6b. Free Animated Narrated Study Video Generator (+ Educational Video Links)
+  app.post("/api/study/video", async (req, res) => {
+    try {
+      const { prompt, profile, subject, language } = req.body as {
+        prompt?: string;
+        profile?: ProfilePayload;
+        subject?: string;
+        language?: string;
+      };
+
+      const cleanPrompt = prompt?.trim();
+      if (!cleanPrompt) {
+        return res
+          .status(400)
+          .json({ error: "Please enter a topic for the study video." });
+      }
+
+      const activeLang = language || profile?.preferredLanguage || "Auto-Detect";
+      const langRule = buildLanguageGuidance(activeLang);
+      const videoSystem =
+        "You are Jogi Jarvis, an engaging educational video director and AI teacher. Design crisp 5-scene animated study explainer videos with warm narration and memorable takeaways.";
+      const videoPrompt = [
+        `Design a 5-scene animated study explainer video about: "${cleanPrompt}".`,
+        subject && subject !== "All Subjects" ? `Subject: ${subject}.` : "",
+        profile?.grade ? `Student level: ${profile.grade}.` : "",
+        "Requirements:",
+        "- Create exactly 5 clear sequential scenes (Intro -> Core Mechanism -> Key Example -> Real-World Connection -> Quick Recap).",
+        "- For each scene, provide: heading (short, <= 6 words), narration (warm spoken teacher voiceover, 16-24 words), keyFact (1 crisp formula/takeaway <= 90 chars), bulletPoints (2-3 short scannable points), visualAccent (one of: sun, atom, globe, wave, chart, book, leaf, rocket, circuit, heart), durationSec (5 to 7).",
+        "- Choose a vibrant hex themeColor (e.g. #2563EB, #059669, #7C3AED, #EA580C, #0284C7).",
+        "- Also include a short 2-sentence written summary in replyText and a clean 2-4 word English searchTopic for related study video links.",
+        langRule,
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      const schemaHint =
+        '{"title":"string","subtitle":"string","themeColor":"#2563EB","replyText":"string","searchTopic":"string","scenes":[{"heading":"string","narration":"string","keyFact":"string","visualAccent":"atom","bulletPoints":["string"],"durationSec":6}]}';
+
+      const videoSchema = {
+        type: Type.OBJECT,
+        properties: {
+          title: { type: Type.STRING },
+          subtitle: { type: Type.STRING },
+          themeColor: { type: Type.STRING },
+          replyText: { type: Type.STRING },
+          searchTopic: { type: Type.STRING },
+          scenes: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                heading: { type: Type.STRING },
+                narration: { type: Type.STRING },
+                keyFact: { type: Type.STRING },
+                visualAccent: { type: Type.STRING },
+                bulletPoints: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                },
+                durationSec: { type: Type.INTEGER },
+              },
+              required: [
+                "heading",
+                "narration",
+                "keyFact",
+                "visualAccent",
+                "bulletPoints",
+                "durationSec",
+              ],
+            },
+          },
+        },
+        required: [
+          "title",
+          "subtitle",
+          "themeColor",
+          "replyText",
+          "searchTopic",
+          "scenes",
+        ],
+      };
+
+      let generated: {
+        title?: string;
+        subtitle?: string;
+        themeColor?: string;
+        replyText?: string;
+        searchTopic?: string;
+        scenes?: Array<{
+          heading?: string;
+          narration?: string;
+          keyFact?: string;
+          visualAccent?: string;
+          bulletPoints?: string[];
+          durationSec?: number;
+        }>;
+      } = {};
+
+      if (!hasGeminiKey() && hasAnyFallbackProvider()) {
+        generated = (await callFallbackPoolJson(
+          videoSystem,
+          videoPrompt,
+          schemaHint
+        )) as typeof generated;
+      } else {
+        try {
+          const ai = getAiClient();
+          const { response } = await generateGeminiTextWithFallback(
+            ai,
+            videoPrompt,
+            (model) => ({
+              systemInstruction: videoSystem,
+              ...(model === "gemini-4-hydrogen"
+                ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                : {}),
+              responseMimeType: "application/json",
+              responseSchema: videoSchema,
+            })
+          );
+          generated = parseJsonFromText<typeof generated>(response.text || "{}");
+        } catch (geminiErr) {
+          if (hasAnyFallbackProvider()) {
+            generated = (await callFallbackPoolJson(
+              videoSystem,
+              videoPrompt,
+              schemaHint
+            )) as typeof generated;
+          } else {
+            throw geminiErr;
+          }
+        }
+      }
+
+      const allowedAccents = new Set([
+        "sun",
+        "atom",
+        "globe",
+        "wave",
+        "chart",
+        "book",
+        "leaf",
+        "rocket",
+        "circuit",
+        "heart",
+      ]);
+
+      const normalizedScenes = (Array.isArray(generated.scenes) ? generated.scenes : [])
+        .slice(0, 6)
+        .map((sc, idx) => ({
+          heading: String(sc?.heading || `Part ${idx + 1}`).slice(0, 80),
+          narration: String(sc?.narration || "").slice(0, 240),
+          keyFact: String(sc?.keyFact || "").slice(0, 120),
+          visualAccent: (allowedAccents.has(String(sc?.visualAccent || ""))
+            ? String(sc?.visualAccent)
+            : "book") as
+            | "sun"
+            | "atom"
+            | "globe"
+            | "wave"
+            | "chart"
+            | "book"
+            | "leaf"
+            | "rocket"
+            | "circuit"
+            | "heart",
+          bulletPoints: Array.isArray(sc?.bulletPoints)
+            ? sc.bulletPoints.slice(0, 3).map((b) => String(b).slice(0, 110))
+            : [],
+          durationSec: Math.max(4, Math.min(9, Number(sc?.durationSec) || 6)),
+        }));
+
+      const searchTopic =
+        String(generated.searchTopic || "").trim() || cleanPrompt;
+      const videoLinks = buildStudyVideoLinks(searchTopic, subject);
+
+      return res.json({
+        reply:
+          String(generated.replyText || "").trim() ||
+          `I created a ${normalizedScenes.length}-scene animated explainer video for **${cleanPrompt}**. Press **Play Video** to watch with narration or click **Download Video (.webm)** to save it.`,
+        storyboard: {
+          title: String(generated.title || cleanPrompt).slice(0, 90),
+          subtitle: String(generated.subtitle || "Interactive Study Video").slice(
+            0,
+            120
+          ),
+          subject: subject || "General",
+          language: activeLang,
+          themeColor: /^#[0-9a-fA-F]{6}$/.test(String(generated.themeColor || ""))
+            ? String(generated.themeColor)
+            : "#2563EB",
+          scenes: normalizedScenes,
+        },
+        videoLinks,
+      });
+    } catch (err) {
+      const formatted = formatApiError(err);
+      return res.status(formatted.status).json({ error: formatted.message });
+    }
+  });
+
+  // 6c. Free Live Study Web Search (+ Real Educational Photos + Related Video Links)
+  app.post("/api/study/search", async (req, res) => {
+    try {
+      const { query, profile, subject, language } = req.body as {
+        query?: string;
+        profile?: ProfilePayload;
+        subject?: string;
+        language?: string;
+      };
+
+      const cleanQuery = query?.trim();
+      if (!cleanQuery) {
+        return res.status(400).json({ error: "Please enter a topic to search." });
+      }
+
+      const langRule = buildLanguageGuidance(
+        language || profile?.preferredLanguage
+      );
+      const searchSystem = [
+        buildSystemInstruction(profile, subject, "chat", language),
+        `LIVE WEB SEARCH MODE (Current UTC: ${new Date().toUTCString()}): Use Google Search to gather accurate, up-to-date study facts, definitions, dates, and clear explanations. Structure the answer cleanly with key bullet points.`,
+        langRule,
+      ].join("\n\n");
+
+      const [photos, searchResult] = await Promise.all([
+        searchWikimediaPhotos(cleanQuery),
+        (async () => {
+          if (!hasGeminiKey() && hasAnyFallbackProvider()) {
+            const fallback = await callFallbackPoolChat([
+              { role: "system", content: searchSystem },
+              { role: "user", content: cleanQuery },
+            ]);
+            return { reply: fallback.text, sources: [] as Array<{ uri: string; title: string }> };
+          }
+          try {
+            const ai = getAiClient();
+            const { response } = await generateGeminiTextWithFallback(
+              ai,
+              cleanQuery,
+              (model) => ({
+                systemInstruction: searchSystem,
+                ...(model === "gemini-4-hydrogen"
+                  ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                  : {}),
+                tools: [{ googleSearch: {} }],
+              })
+            );
+            const chunks =
+              response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+            const sources = chunks
+              .map((chunk) => {
+                const web = (chunk as { web?: { uri?: string; title?: string } }).web;
+                return web?.uri ? { uri: web.uri, title: web.title || web.uri } : null;
+              })
+              .filter((s): s is { uri: string; title: string } => s !== null);
+            const uniqueSources = Array.from(
+              new Map(sources.map((s) => [s.uri, s])).values()
+            ).slice(0, 6);
+            return {
+              reply: response.text?.trim() || "Here is what I found on that topic.",
+              sources: uniqueSources,
+            };
+          } catch (geminiErr) {
+            if (hasAnyFallbackProvider()) {
+              const fallback = await callFallbackPoolChat([
+                { role: "system", content: searchSystem },
+                { role: "user", content: cleanQuery },
+              ]);
+              return { reply: fallback.text, sources: [] as Array<{ uri: string; title: string }> };
+            }
+            throw geminiErr;
+          }
+        })(),
+      ]);
+
+      return res.json({
+        reply: searchResult.reply,
+        sources: searchResult.sources,
+        photos,
+        videoLinks: buildStudyVideoLinks(cleanQuery, subject),
+      });
+    } catch (err) {
+      const formatted = formatApiError(err);
+      return res.status(formatted.status).json({ error: formatted.message });
+    }
+  });
+
   // Create HTTP server so we can attach WebSocket for Gemini Live API (/api/live)
   const server = http.createServer(app);
   const wss = new WebSocketServer({ noServer: true });

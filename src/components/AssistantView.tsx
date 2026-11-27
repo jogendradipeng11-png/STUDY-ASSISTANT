@@ -14,7 +14,9 @@ import {
   ExternalLink,
   FileCode2,
   FileText,
+  Film,
   Globe,
+  Image as ImageIcon,
   ImagePlus,
   Loader2,
   Mail,
@@ -24,6 +26,7 @@ import {
   Newspaper,
   Phone,
   Play,
+  Search,
   Send,
   Square,
   Timer,
@@ -84,8 +87,48 @@ import {
   type MobileTaskModalMode,
 } from "./MobileTaskModal";
 import { ProfileAvatar } from "./ProfileAvatar";
+import {
+  StudyDiagramCard,
+  StudyPhotoGallery,
+  StudyVideoLinksStrip,
+  StudyVideoPlayer,
+} from "./StudyMediaCards";
 
 type AiEngine = "auto" | "local-browser" | "gemini" | "nvidia" | "local-server";
+type ComposerMode = "chat" | "search" | "picture" | "video";
+
+function detectStudyMediaIntent(
+  prompt: string,
+  currentMode: ComposerMode,
+  hasAttachedPhoto: boolean
+): ComposerMode {
+  if (currentMode !== "chat") return currentMode;
+  if (hasAttachedPhoto) return "chat";
+  const text = prompt.trim();
+  if (!text) return "chat";
+  if (
+    /\b(generate|create|make|build|show|render)\s+(me\s+)?(a\s+|an\s+)?(short\s+|animated\s+|study\s+|explainer\s+|educational\s+)?video\b/i.test(
+      text
+    )
+  ) {
+    return "video";
+  }
+  if (
+    /\b(draw|generate|create|make|show|sketch|illustrate)\s+(me\s+)?(a\s+|an\s+)?(labeled\s+|labelled\s+|study\s+|science\s+|educational\s+)?(picture|image|photo|diagram|illustration|drawing|sketch|infographic|flowchart)\b/i.test(
+      text
+    )
+  ) {
+    return "picture";
+  }
+  if (
+    /^(search|google|look\s+up|find\s+(pictures|photos|videos|info|information)\s+(of|about|for))\b/i.test(
+      text
+    )
+  ) {
+    return "search";
+  }
+  return "chat";
+}
 
 interface AssistantViewProps {
   profile: FamilyProfile;
@@ -148,6 +191,10 @@ export function AssistantView({
 }: AssistantViewProps) {
   const activeLanguage = profile.preferredLanguage || "Auto-Detect";
   const [input, setInput] = useState("");
+  const [composerMode, setComposerMode] = useState<ComposerMode>("chat");
+  const [activeMediaTask, setActiveMediaTask] = useState<
+    "search" | "picture" | "video" | null
+  >(null);
   const [isSending, setIsSending] = useState(false);
   const [speedMode, setSpeedMode] = useState<"fast" | "detailed">("fast");
   const [engine, setEngine] = useState<AiEngine>(() => {
@@ -858,11 +905,21 @@ export function AssistantView({
     }
   };
 
-  const handleSend = async (overrideText?: string, forceLiveSearch = false) => {
+  const handleSend = async (
+    overrideText?: string,
+    forceLiveSearch = false,
+    overrideMode?: ComposerMode
+  ) => {
     const promptText = (overrideText ?? input).trim();
     if ((!promptText && !attachedImage) || isSending) return;
 
-    if (engine === "local-browser" && attachedImage) {
+    const effectiveMode = overrideMode
+      ? overrideMode
+      : forceLiveSearch
+        ? "chat"
+        : detectStudyMediaIntent(promptText, composerMode, Boolean(attachedImage));
+
+    if (engine === "local-browser" && attachedImage && effectiveMode === "chat") {
       setErrorMsg(
         "Homework photo reading uses Cloud Vision. Switch AI Engine to Auto or Gemini to analyze photos."
       );
@@ -877,7 +934,15 @@ export function AssistantView({
 
     const currentMessages = messagesRef.current;
     setErrorMsg(null);
-    const parsedMobile = parseMobileActions(promptText, profiles);
+    const parsedMobile =
+      effectiveMode === "chat"
+        ? parseMobileActions(promptText, profiles)
+        : {
+            actions: [],
+            isDirectCommandOnly: false,
+            autoAlarm: undefined,
+            appCommand: undefined,
+          };
     const lastAssistantReply = [...currentMessages]
       .reverse()
       .find((m) => m.role === "assistant")?.content;
@@ -946,6 +1011,9 @@ export function AssistantView({
     onUpdateMessages(profile.id, nextMessages);
     setInput("");
     setAttachedImage(null);
+    if (composerMode !== "chat") {
+      setComposerMode("chat");
+    }
 
     // For direct mobile/navigation commands (e.g. "open YouTube", "set alarm for 6:30 AM"), respond instantaneously without waiting for an LLM round-trip
     if (
@@ -975,8 +1043,114 @@ export function AssistantView({
     }
 
     setIsSending(true);
+    setActiveMediaTask(effectiveMode === "chat" ? null : effectiveMode);
 
     try {
+      // Dedicated Study Media modes: Search (Web + Photos + Videos), Picture/Diagram, or Narrated Explainer Video
+      if (effectiveMode === "picture") {
+        const res = await fetch("/api/study/picture", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            prompt: promptText,
+            profile,
+            subject: profile.role === "student" ? subject : undefined,
+            language: activeLanguage,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(
+            data.error || "Could not generate the study picture right now."
+          );
+        }
+        const assistantMsg: ChatMessage = {
+          id: `a-${Date.now()}`,
+          role: "assistant",
+          content:
+            data.reply || `Here is your visual study diagram for **${promptText}**.`,
+          timestamp: new Date().toISOString(),
+          subject: profile.role === "student" ? subject : undefined,
+          studyDiagram: data.diagram,
+          studyPhotos: Array.isArray(data.photos) ? data.photos : undefined,
+        };
+        onUpdateMessages(profile.id, [...nextMessages, assistantMsg]);
+        if (autoSpeakRef.current) {
+          void speakText(assistantMsg.id, assistantMsg.content, true);
+        }
+        return;
+      }
+
+      if (effectiveMode === "video") {
+        const res = await fetch("/api/study/video", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            prompt: promptText,
+            profile,
+            subject: profile.role === "student" ? subject : undefined,
+            language: activeLanguage,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(
+            data.error || "Could not create the study video right now."
+          );
+        }
+        const assistantMsg: ChatMessage = {
+          id: `a-${Date.now()}`,
+          role: "assistant",
+          content:
+            data.reply ||
+            `Here is your animated study explainer video for **${promptText}**.`,
+          timestamp: new Date().toISOString(),
+          subject: profile.role === "student" ? subject : undefined,
+          studyVideo: data.storyboard,
+          studyVideoLinks: Array.isArray(data.videoLinks)
+            ? data.videoLinks
+            : undefined,
+        };
+        onUpdateMessages(profile.id, [...nextMessages, assistantMsg]);
+        if (autoSpeakRef.current) {
+          void speakText(assistantMsg.id, assistantMsg.content, true);
+        }
+        return;
+      }
+
+      if (effectiveMode === "search") {
+        const res = await fetch("/api/study/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            query: promptText,
+            profile,
+            subject: profile.role === "student" ? subject : undefined,
+            language: activeLanguage,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || "Web search could not complete right now.");
+        }
+        const assistantMsg: ChatMessage = {
+          id: `a-${Date.now()}`,
+          role: "assistant",
+          content: data.reply || "Here is what I found from live web search.",
+          timestamp: new Date().toISOString(),
+          subject: profile.role === "student" ? subject : undefined,
+          sources: Array.isArray(data.sources) ? data.sources : [],
+          studyPhotos: Array.isArray(data.photos) ? data.photos : undefined,
+          studyVideoLinks: Array.isArray(data.videoLinks)
+            ? data.videoLinks
+            : undefined,
+        };
+        onUpdateMessages(profile.id, [...nextMessages, assistantMsg]);
+        if (autoSpeakRef.current) {
+          void speakText(assistantMsg.id, assistantMsg.content, true);
+        }
+        return;
+      }
       // Unlimited On-Device Local AI (WebGPU / WebLLM — runs directly in browser, zero API key, zero quota)
       if (engine === "local-browser") {
         const assistantId = `a-${Date.now()}`;
@@ -1206,6 +1380,7 @@ export function AssistantView({
       );
     } finally {
       setIsSending(false);
+      setActiveMediaTask(null);
     }
   };
 
@@ -1898,6 +2073,76 @@ export function AssistantView({
                 </button>
               </div>
 
+              {/* Study Visual & Media Studio (Search, Picture, Video — 100% Free) */}
+              <div className="pt-6 border-t border-slate-200 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-xs font-semibold text-slate-500">
+                    Study Studio · Search, Generate Pictures &amp; Animated Videos
+                  </h3>
+                  <span className="text-[11px] font-medium text-emerald-700">
+                    Free · Instant Download
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setComposerMode("search");
+                      textareaRef.current?.focus();
+                    }}
+                    className="flex items-center gap-2.5 p-3 rounded-xl bg-white border border-slate-200 hover:border-blue-300 hover:bg-blue-50/40 transition-colors text-left"
+                  >
+                    <Search className="h-4 w-4 text-blue-700 shrink-0" />
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold text-slate-900">
+                        Study Web Search
+                      </p>
+                      <p className="text-[11px] text-slate-500 truncate">
+                        Live web facts, photos &amp; videos
+                      </p>
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setComposerMode("picture");
+                      textareaRef.current?.focus();
+                    }}
+                    className="flex items-center gap-2.5 p-3 rounded-xl bg-white border border-slate-200 hover:border-emerald-300 hover:bg-emerald-50/40 transition-colors text-left"
+                  >
+                    <ImageIcon className="h-4 w-4 text-emerald-700 shrink-0" />
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold text-slate-900">
+                        Generate Study Picture
+                      </p>
+                      <p className="text-[11px] text-slate-500 truncate">
+                        Labeled diagram + reference photos
+                      </p>
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setComposerMode("video");
+                      textareaRef.current?.focus();
+                    }}
+                    className="flex items-center gap-2.5 p-3 rounded-xl bg-white border border-slate-200 hover:border-indigo-300 hover:bg-indigo-50/40 transition-colors text-left"
+                  >
+                    <Film className="h-4 w-4 text-indigo-700 shrink-0" />
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold text-slate-900">
+                        Generate Study Video
+                      </p>
+                      <p className="text-[11px] text-slate-500 truncate">
+                        Narrated 5-scene video + .webm download
+                      </p>
+                    </div>
+                  </button>
+                </div>
+              </div>
+
               {/* Live Real-Time Data Quick Access */}
               <div className="pt-6 border-t border-slate-200 space-y-3">
                 <div className="flex items-center justify-between gap-2">
@@ -2097,6 +2342,31 @@ export function AssistantView({
                           </ReactMarkdown>
                         </div>
 
+                        {/* Generated Study Picture / Diagram */}
+                        {msg.studyDiagram && (
+                          <StudyDiagramCard diagram={msg.studyDiagram} />
+                        )}
+
+                        {/* Generated Narrated Animated Study Video */}
+                        {msg.studyVideo && (
+                          <StudyVideoPlayer
+                            storyboard={msg.studyVideo}
+                            videoLinks={msg.studyVideoLinks}
+                          />
+                        )}
+
+                        {/* Verified Educational Reference Photos */}
+                        {msg.studyPhotos && msg.studyPhotos.length > 0 && (
+                          <StudyPhotoGallery photos={msg.studyPhotos} />
+                        )}
+
+                        {/* Related Study Video Links (for Web Search responses) */}
+                        {!msg.studyVideo &&
+                          msg.studyVideoLinks &&
+                          msg.studyVideoLinks.length > 0 && (
+                            <StudyVideoLinksStrip links={msg.studyVideoLinks} />
+                          )}
+
                         {/* Quick Mobile Action cards (auto-launched when Auto-Run is on, kept as fallback) */}
                         {msg.actions && msg.actions.length > 0 && (
                           <div className="pt-3 border-t border-slate-100">
@@ -2265,11 +2535,17 @@ export function AssistantView({
                 <div className="flex items-center gap-2.5 text-sm text-slate-600 px-2 py-2">
                   <Loader2 className="h-4 w-4 animate-spin text-blue-700" />
                   <span>
-                    {engine === "local-browser" && localStatus === "loading"
-                      ? `Downloading ${activeLocalModel.label} to your device (${Math.round((localProgress?.progress || 0) * 100)}%)...`
-                      : engine === "local-browser"
-                        ? `Jogi Jarvis (${activeLocalModel.label} · Local AI) is replying on your device...`
-                        : "Jogi Jarvis is thinking..."}
+                    {activeMediaTask === "picture"
+                      ? "Drawing labeled study picture & fetching reference photos..."
+                      : activeMediaTask === "video"
+                        ? "Creating 5-scene narrated study video..."
+                        : activeMediaTask === "search"
+                          ? "Searching live web, study photos & videos..."
+                          : engine === "local-browser" && localStatus === "loading"
+                            ? `Downloading ${activeLocalModel.label} to your device (${Math.round((localProgress?.progress || 0) * 100)}%)...`
+                            : engine === "local-browser"
+                              ? `Jogi Jarvis (${activeLocalModel.label} · Local AI) is replying on your device...`
+                              : "Jogi Jarvis is thinking..."}
                   </span>
                 </div>
               )}
@@ -2347,6 +2623,78 @@ export function AssistantView({
             </div>
           )}
 
+          {/* Mode selector strip: Ask · Search · Picture · Video */}
+          <div className="flex items-center justify-between gap-2 overflow-x-auto pb-0.5">
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => setComposerMode("chat")}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border transition-colors whitespace-nowrap shrink-0 ${
+                  composerMode === "chat"
+                    ? "bg-slate-900 border-slate-900 text-white"
+                    : "bg-white border-slate-200 text-slate-600 hover:bg-slate-100"
+                }`}
+              >
+                <MessageSquare className="h-3.5 w-3.5" />
+                <span>Ask</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setComposerMode("search");
+                  textareaRef.current?.focus();
+                }}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border transition-colors whitespace-nowrap shrink-0 ${
+                  composerMode === "search"
+                    ? "bg-blue-700 border-blue-700 text-white"
+                    : "bg-white border-slate-200 text-slate-700 hover:border-blue-300 hover:bg-blue-50"
+                }`}
+              >
+                <Search className="h-3.5 w-3.5" />
+                <span>Search</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setComposerMode("picture");
+                  textareaRef.current?.focus();
+                }}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border transition-colors whitespace-nowrap shrink-0 ${
+                  composerMode === "picture"
+                    ? "bg-emerald-700 border-emerald-700 text-white"
+                    : "bg-white border-slate-200 text-slate-700 hover:border-emerald-300 hover:bg-emerald-50"
+                }`}
+              >
+                <ImageIcon className="h-3.5 w-3.5" />
+                <span>Picture</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setComposerMode("video");
+                  textareaRef.current?.focus();
+                }}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border transition-colors whitespace-nowrap shrink-0 ${
+                  composerMode === "video"
+                    ? "bg-indigo-700 border-indigo-700 text-white"
+                    : "bg-white border-slate-200 text-slate-700 hover:border-indigo-300 hover:bg-indigo-50"
+                }`}
+              >
+                <Film className="h-3.5 w-3.5" />
+                <span>Video</span>
+              </button>
+            </div>
+            {composerMode !== "chat" && (
+              <span className="text-[11px] font-medium text-slate-500 hidden sm:inline whitespace-nowrap">
+                {composerMode === "search"
+                  ? "Live web facts + real photos + study videos"
+                  : composerMode === "picture"
+                    ? "AI labeled diagram (PNG/SVG) + Wikimedia photos"
+                    : "5-scene narrated explainer video (.webm download)"}
+              </span>
+            )}
+          </div>
+
           <div className="flex items-end gap-2 bg-slate-50 border border-slate-200 focus-within:border-blue-500 focus-within:bg-white rounded-xl p-2 transition-colors">
             <input
               ref={fileInputRef}
@@ -2406,9 +2754,15 @@ export function AssistantView({
                   ? "Listening... click stop when finished speaking"
                   : isTranscribing
                     ? "Transcribing your voice..."
-                    : profile.role === "parent"
-                      ? `Ask Jogi Jarvis anything, ${profile.name}...`
-                      : `Ask your teacher about ${subject === "All Subjects" ? "any subject" : subject}...`
+                    : composerMode === "picture"
+                      ? "Describe the picture or diagram to create (e.g. Water Cycle, Human Heart, Solar System)..."
+                      : composerMode === "video"
+                        ? "Enter a topic for an animated study video (e.g. Photosynthesis, Gravity, Fractions)..."
+                        : composerMode === "search"
+                          ? "Search web facts, study pictures & videos (e.g. Chandrayaan-3, DNA structure)..."
+                          : profile.role === "parent"
+                            ? `Ask Jogi Jarvis anything, ${profile.name}...`
+                            : `Ask your teacher about ${subject === "All Subjects" ? "any subject" : subject}...`
               }
               className="flex-1 resize-none bg-transparent py-2.5 px-2 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none max-h-36"
             />
@@ -2417,10 +2771,32 @@ export function AssistantView({
               type="button"
               disabled={isSending || (!input.trim() && !attachedImage)}
               onClick={() => void handleSend()}
-              className="inline-flex items-center gap-1.5 h-10 px-4 rounded-lg bg-blue-700 hover:bg-blue-800 disabled:opacity-40 text-white text-sm font-semibold transition-colors whitespace-nowrap shrink-0"
+              className={`inline-flex items-center gap-1.5 h-10 px-4 rounded-lg disabled:opacity-40 text-white text-sm font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                composerMode === "picture"
+                  ? "bg-emerald-700 hover:bg-emerald-800"
+                  : composerMode === "video"
+                    ? "bg-indigo-700 hover:bg-indigo-800"
+                    : "bg-blue-700 hover:bg-blue-800"
+              }`}
             >
-              <Send className="h-4 w-4" />
-              <span className="hidden sm:inline">Ask</span>
+              {composerMode === "search" ? (
+                <Search className="h-4 w-4" />
+              ) : composerMode === "picture" ? (
+                <ImageIcon className="h-4 w-4" />
+              ) : composerMode === "video" ? (
+                <Film className="h-4 w-4" />
+              ) : (
+                <Send className="h-4 w-4" />
+              )}
+              <span className="hidden sm:inline">
+                {composerMode === "search"
+                  ? "Search"
+                  : composerMode === "picture"
+                    ? "Create Picture"
+                    : composerMode === "video"
+                      ? "Create Video"
+                      : "Ask"}
+              </span>
             </button>
           </div>
         </div>

@@ -41,9 +41,12 @@ export function saveChats(chats: Record<string, ChatMessage[]>): void {
     // Strip large raw base64 payloads from persisted localStorage to avoid quota overflow
     const sanitized: Record<string, ChatMessage[]> = {};
     for (const [profileId, list] of Object.entries(chats)) {
-      sanitized[profileId] = list.slice(-40).map((m) => ({
+      const recent = list.slice(-40);
+      sanitized[profileId] = recent.map((m, idx) => ({
         ...m,
         imageBase64: undefined,
+        // Keep generated SVG diagrams on the latest 10 messages to stay well under localStorage quota
+        studyDiagram: idx >= recent.length - 10 ? m.studyDiagram : undefined,
       }));
     }
     localStorage.setItem(CHATS_KEY, JSON.stringify(sanitized));

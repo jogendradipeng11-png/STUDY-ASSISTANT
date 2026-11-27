@@ -160,6 +160,21 @@ function buildChatPayload(uid: string, profileId: string, messages: ChatMessage[
         external: Boolean(a.external),
       }));
     }
+    if (Array.isArray(m.studyPhotos) && m.studyPhotos.length > 0) {
+      clean.studyPhotos = m.studyPhotos.slice(0, 4).map((p) => ({
+        title: clampStr(p.title, 120),
+        imageUrl: clampStr(p.imageUrl, 500),
+        pageUrl: clampStr(p.pageUrl, 500),
+        credit: p.credit ? clampStr(p.credit, 100) : "",
+      }));
+    }
+    if (Array.isArray(m.studyVideoLinks) && m.studyVideoLinks.length > 0) {
+      clean.studyVideoLinks = m.studyVideoLinks.slice(0, 4).map((v) => ({
+        title: clampStr(v.title, 120),
+        url: clampStr(v.url, 500),
+        source: clampStr(v.source, 60),
+      }));
+    }
     return clean;
   });
 
@@ -602,6 +617,10 @@ export function subscribeToFamilyCloud(
                 typeof m?.noteSavedId === "string" ? m.noteSavedId : undefined,
               sources: Array.isArray(m?.sources) ? m.sources : undefined,
               actions: Array.isArray(m?.actions) ? m.actions : undefined,
+              studyPhotos: Array.isArray(m?.studyPhotos) ? m.studyPhotos : undefined,
+              studyVideoLinks: Array.isArray(m?.studyVideoLinks)
+                ? m.studyVideoLinks
+                : undefined,
             }));
           }
         }
