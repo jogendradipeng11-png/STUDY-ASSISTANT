@@ -803,6 +803,7 @@ export function StudyVideoPlayer({
         window.speechSynthesis.cancel();
         const utter = new SpeechSynthesisUtterance(scene.narration);
         utter.lang = getSpeechLangCode(storyboard.language);
+        utter.volume = 1.0;
         utter.rate = 0.98;
         window.speechSynthesis.speak(utter);
       } catch {

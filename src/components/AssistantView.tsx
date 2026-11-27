@@ -599,7 +599,7 @@ export function AssistantView({
       el.onerror = null;
       el.loop = true;
       el.muted = false;
-      el.volume = 0.01;
+      el.volume = 1.0;
       el.src = getSilentKeepAliveWavUrl();
       void el
         .play()

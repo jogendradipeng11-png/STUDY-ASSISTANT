@@ -290,6 +290,7 @@ export function StudyNotesView({
         try {
           window.speechSynthesis.cancel();
           const utter = new SpeechSynthesisUtterance(narration.slice(0, 2200));
+          utter.volume = 1.0;
           utter.rate = 0.96;
           utter.onend = () => setIsReadingAloud(false);
           utter.onerror = () => setIsReadingAloud(false);
@@ -325,6 +326,8 @@ export function StudyNotesView({
         }
 
         const audio = new Audio(`data:audio/wav;base64,${data.audioBase64}`);
+        audio.muted = false;
+        audio.volume = 1.0;
         audioRef.current = audio;
         setIsReadingAloud(true);
         audio.onended = () => {

@@ -391,6 +391,8 @@ export function LiveVoiceView({
             const audio = new Audio(
               `data:audio/wav;base64,${ttsData.audioBase64}`
             );
+            audio.muted = false;
+            audio.volume = 1.0;
             fallbackAudioElRef.current = audio;
             setIsJarvisSpeaking(true);
             setAudioLevel(0.45);
@@ -950,6 +952,8 @@ export function LiveVoiceView({
       }
 
       const audio = new Audio(`data:audio/wav;base64,${data.audioBase64}`);
+      audio.muted = false;
+      audio.volume = 1.0;
       revisionAudioElRef.current = audio;
       audio.onended = () => {
         setIsPlayingRevision(false);

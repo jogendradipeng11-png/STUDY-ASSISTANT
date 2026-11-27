@@ -34,12 +34,36 @@ export function base64ToPcm16Float32(base64: string): Float32Array<ArrayBuffer> 
   return samples;
 }
 
+function createSoftLimiterCurve(): Float32Array<ArrayBuffer> {
+  const samples = 2048;
+  const curve = new Float32Array(new ArrayBuffer(samples * 4));
+  const kneeStart = 0.8;
+  const headroom = 0.18; // Smoothly caps inside [-0.98, 0.98]
+  for (let i = 0; i < samples; i++) {
+    // Input u in [-1, 1] represents scaled signal s = u * 2 (handles up to +6 dB peaks cleanly)
+    const u = (i * 2) / (samples - 1) - 1;
+    const s = u * 2;
+    const absS = Math.abs(s);
+    if (absS <= kneeStart) {
+      curve[i] = s;
+    } else {
+      const limited =
+        kneeStart + headroom * Math.tanh((absS - kneeStart) / headroom);
+      curve[i] = s < 0 ? -limited : limited;
+    }
+  }
+  return curve;
+}
+
 export class LiveAudioPlayer {
   private ctx: AudioContext | null = null;
+  private inputNode: AudioNode | null = null;
+  private makeupGainNode: GainNode | null = null;
   private analyser: AnalyserNode | null = null;
   private nextStartTime = 0;
   private activeSources = new Set<AudioBufferSourceNode>();
   private onSpeakingChange?: (speaking: boolean) => void;
+  private boostMultiplier = 1.0;
 
   constructor(onSpeakingChange?: (speaking: boolean) => void) {
     this.onSpeakingChange = onSpeakingChange;
@@ -47,15 +71,66 @@ export class LiveAudioPlayer {
 
   private ensureContext(): AudioContext {
     if (!this.ctx) {
-      this.ctx = new AudioContext({ sampleRate: 24000 });
-      this.analyser = this.ctx.createAnalyser();
-      this.analyser.fftSize = 256;
-      this.analyser.connect(this.ctx.destination);
+      const ctx = new AudioContext({ sampleRate: 24000 });
+      this.ctx = ctx;
+
+      // Broadcast voice processing chain:
+      // source -> 85Hz HPF -> 2.8kHz clarity EQ -> preGain (2.1x) -> compressor -> makeupGain -> softLimiter -> analyser -> destination
+      const highPass = ctx.createBiquadFilter();
+      highPass.type = "highpass";
+      highPass.frequency.value = 85;
+      highPass.Q.value = 0.707;
+
+      const presenceEq = ctx.createBiquadFilter();
+      presenceEq.type = "peaking";
+      presenceEq.frequency.value = 2800;
+      presenceEq.Q.value = 0.9;
+      presenceEq.gain.value = 3.2;
+
+      const preGain = ctx.createGain();
+      preGain.gain.value = 2.5;
+
+      const compressor = ctx.createDynamicsCompressor();
+      compressor.threshold.value = -24;
+      compressor.knee.value = 14;
+      compressor.ratio.value = 6;
+      compressor.attack.value = 0.003;
+      compressor.release.value = 0.1;
+
+      // Scaled by 0.5 entering WaveShaperNode (which maps [-1, 1] -> signal [-2, 2] smoothly)
+      const makeupGain = ctx.createGain();
+      makeupGain.gain.value = 1.95 * 0.5 * this.boostMultiplier;
+      this.makeupGainNode = makeupGain;
+
+      const softLimiter = ctx.createWaveShaper();
+      softLimiter.curve = createSoftLimiterCurve();
+      softLimiter.oversample = "2x";
+
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      this.analyser = analyser;
+
+      highPass.connect(presenceEq);
+      presenceEq.connect(preGain);
+      preGain.connect(compressor);
+      compressor.connect(makeupGain);
+      makeupGain.connect(softLimiter);
+      softLimiter.connect(analyser);
+      analyser.connect(ctx.destination);
+
+      this.inputNode = highPass;
     }
     if (this.ctx.state === "suspended") {
       void this.ctx.resume();
     }
     return this.ctx;
+  }
+
+  public setBoostMultiplier(mult: number): void {
+    this.boostMultiplier = Math.max(0.5, Math.min(1.6, mult));
+    if (this.makeupGainNode) {
+      this.makeupGainNode.gain.value = 1.95 * 0.5 * this.boostMultiplier;
+    }
   }
 
   public unlock(): void {
@@ -72,7 +147,9 @@ export class LiveAudioPlayer {
 
     const source = ctx.createBufferSource();
     source.buffer = buffer;
-    if (this.analyser) {
+    if (this.inputNode) {
+      source.connect(this.inputNode);
+    } else if (this.analyser) {
       source.connect(this.analyser);
     } else {
       source.connect(ctx.destination);
@@ -106,7 +183,7 @@ export class LiveAudioPlayer {
       const normalized = (data[i] - 128) / 128;
       sum += normalized * normalized;
     }
-    return Math.min(1, Math.sqrt(sum / data.length) * 3.2);
+    return Math.min(1, Math.sqrt(sum / data.length) * 2.2);
   }
 
   public interrupt(): void {
@@ -131,6 +208,8 @@ export class LiveAudioPlayer {
     if (this.ctx) {
       await this.ctx.close().catch(() => {});
       this.ctx = null;
+      this.inputNode = null;
+      this.makeupGainNode = null;
       this.analyser = null;
     }
   }

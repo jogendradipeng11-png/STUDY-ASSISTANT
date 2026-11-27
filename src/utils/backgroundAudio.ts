@@ -96,12 +96,17 @@ export async function playAudioBlobReliably(
     audio.load();
   });
 
+  audio.muted = false;
+  audio.volume = 1.0;
+
   try {
     await audio.play();
   } catch (err) {
     // Retry once if interrupted by media load timing
     if (err instanceof DOMException && err.name === "AbortError") {
       await new Promise((r) => window.setTimeout(r, 150));
+      audio.muted = false;
+      audio.volume = 1.0;
       await audio.play();
       return;
     }
@@ -204,6 +209,7 @@ export function speakWithChunkedBrowserTts(options: {
       const utter = new SpeechSynthesisUtterance(chunks[idx]);
       utter.lang = preferredVoice?.lang || targetLang;
       if (preferredVoice) utter.voice = preferredVoice;
+      utter.volume = 1.0;
       utter.rate = 0.98;
       utter.pitch = 1.0;
 

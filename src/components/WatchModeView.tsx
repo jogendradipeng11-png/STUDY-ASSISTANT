@@ -145,6 +145,8 @@ export function WatchModeView({
         const audio = new Audio(
           `data:audio/wav;base64,${ttsData.audioBase64}`
         );
+        audio.muted = false;
+        audio.volume = 1.0;
         audioRef.current = audio;
         setIsSpeaking(true);
         void requestWakeLock();

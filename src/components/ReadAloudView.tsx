@@ -279,6 +279,7 @@ export function ReadAloudView({
           window.speechSynthesis.cancel();
           const utter = new SpeechSynthesisUtterance(sentence);
           utter.lang = getSpeechLangCode(lang);
+          utter.volume = 1.0;
           utter.rate = Math.min(1.5, Math.max(0.6, rate));
           utter.onend = () => resolve();
           utter.onerror = () => resolve();
@@ -336,6 +337,8 @@ export function ReadAloudView({
         if (audioBase64) {
           await new Promise<void>((resolve) => {
             const audio = new Audio(`data:audio/wav;base64,${audioBase64}`);
+            audio.muted = false;
+            audio.volume = 1.0;
             audio.playbackRate = currentSpeed;
             audioRef.current = audio;
             audio.onended = () => {

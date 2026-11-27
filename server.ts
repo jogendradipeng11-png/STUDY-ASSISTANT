@@ -1568,6 +1568,204 @@ async function startServer() {
     }
   });
 
+  // Broadcast-grade voice loudness maximizer for Gemini TTS 16-bit PCM WAV output.
+  // Applies 85Hz rumble filter + 2.8kHz speech presence EQ + envelope compressor + soft-knee limiter
+  // so voices sound ~2.5x–3x louder and crystal-clear on phone and laptop speakers with zero clipping.
+  function masterTtsWavLoudness(
+    audioBase64: string,
+    inlineMimeType?: string
+  ): string {
+    try {
+      let buf = Buffer.from(audioBase64, "base64");
+      if (buf.length < 16) return audioBase64;
+
+      let sampleRate = 24000;
+      let numChannels = 1;
+      let dataOffset = 0;
+      let dataLength = buf.length;
+
+      const isRiffWave =
+        buf.length >= 44 &&
+        buf.subarray(0, 4).toString("ascii") === "RIFF" &&
+        buf.subarray(8, 12).toString("ascii") === "WAVE";
+
+      if (isRiffWave) {
+        let off = 12;
+        let audioFormat = 1;
+        let bitsPerSample = 16;
+        let foundData = false;
+
+        while (off + 8 <= buf.length) {
+          const chunkId = buf.subarray(off, off + 4).toString("ascii");
+          const chunkSize = buf.readUInt32LE(off + 4);
+          if (chunkId === "fmt " && off + 24 <= buf.length) {
+            audioFormat = buf.readUInt16LE(off + 8);
+            numChannels = Math.max(1, buf.readUInt16LE(off + 10));
+            sampleRate = Math.max(8000, buf.readUInt32LE(off + 12));
+            bitsPerSample = buf.readUInt16LE(off + 22);
+          } else if (chunkId === "data") {
+            dataOffset = off + 8;
+            dataLength = Math.min(chunkSize, buf.length - dataOffset);
+            foundData = true;
+            break;
+          }
+          off += 8 + chunkSize + (chunkSize % 2);
+        }
+
+        // Only process uncompressed 16-bit PCM WAV
+        if (!foundData || audioFormat !== 1 || bitsPerSample !== 16) {
+          return audioBase64;
+        }
+      } else {
+        // Raw 16-bit LE PCM fallback: wrap with a standard WAV header so browsers play it reliably
+        const rateMatch = inlineMimeType?.match(/rate=(\d+)/i);
+        if (rateMatch) {
+          const parsed = Number(rateMatch[1]);
+          if (Number.isFinite(parsed) && parsed >= 8000 && parsed <= 96000) {
+            sampleRate = parsed;
+          }
+        }
+        const pcmBytes = buf.length - (buf.length % 2);
+        const wav = Buffer.alloc(44 + pcmBytes);
+        wav.write("RIFF", 0, "ascii");
+        wav.writeUInt32LE(36 + pcmBytes, 4);
+        wav.write("WAVE", 8, "ascii");
+        wav.write("fmt ", 12, "ascii");
+        wav.writeUInt32LE(16, 16);
+        wav.writeUInt16LE(1, 20); // PCM
+        wav.writeUInt16LE(1, 22); // Mono
+        wav.writeUInt32LE(sampleRate, 24);
+        wav.writeUInt32LE(sampleRate * 2, 28);
+        wav.writeUInt16LE(2, 32);
+        wav.writeUInt16LE(16, 34);
+        wav.write("data", 36, "ascii");
+        wav.writeUInt32LE(pcmBytes, 40);
+        buf.copy(wav, 44, 0, pcmBytes);
+        buf = wav;
+        dataOffset = 44;
+        dataLength = pcmBytes;
+      }
+
+      const totalSamples = Math.floor(dataLength / 2);
+      const frames = Math.floor(totalSamples / numChannels);
+      if (frames < 64) return buf.toString("base64");
+
+      // High-pass filter (~85Hz) to remove sub-bass rumble that wastes speaker headroom
+      const rc = 1 / (2 * Math.PI * 85);
+      const dt = 1 / sampleRate;
+      const hpAlpha = rc / (rc + dt);
+
+      // Speech clarity peaking EQ (+3.0 dB around 2.8 kHz, Q = 0.9) for crisp phone/laptop projection
+      const f0 = Math.min(2800, sampleRate * 0.38);
+      const Q = 0.9;
+      const eqGainDb = 3.0;
+      const A = Math.pow(10, eqGainDb / 40);
+      const w0 = (2 * Math.PI * f0) / sampleRate;
+      const cosW0 = Math.cos(w0);
+      const alpha = Math.sin(w0) / (2 * Q);
+      const a0 = 1 + alpha / A;
+      const b0 = (1 + alpha * A) / a0;
+      const b1 = (-2 * cosW0) / a0;
+      const b2 = (1 - alpha * A) / a0;
+      const a1 = (-2 * cosW0) / a0;
+      const a2 = (1 - alpha / A) / a0;
+
+      // Envelope compressor parameters (smooth smart-speaker broadcast speech leveler)
+      const attackCoeff = Math.exp(-1 / (0.003 * sampleRate));
+      const releaseCoeff = Math.exp(-1 / (0.08 * sampleRate));
+      const compThreshold = 0.26;
+      const compRatio = 5.5;
+      const makeupGain = 2.15;
+      const softKneeStart = 0.84;
+      const softKneeHeadroom = 0.14; // Smoothly caps below 0.98
+
+      // Process each channel independently
+      const work = new Float32Array(frames);
+      for (let ch = 0; ch < numChannels; ch++) {
+        let hpPrevX = 0;
+        let hpPrevY = 0;
+        let eqX1 = 0;
+        let eqX2 = 0;
+        let eqY1 = 0;
+        let eqY2 = 0;
+
+        let activeSqSum = 0;
+        let activeCount = 0;
+
+        // Pass 1: Read Int16 -> HPF -> Presence EQ -> measure active speech RMS
+        for (let i = 0; i < frames; i++) {
+          const bytePos = dataOffset + (i * numChannels + ch) * 2;
+          const raw = buf.readInt16LE(bytePos) / 32768;
+
+          const hpY = hpAlpha * (hpPrevY + raw - hpPrevX);
+          hpPrevX = raw;
+          hpPrevY = hpY;
+
+          const eqY =
+            b0 * hpY + b1 * eqX1 + b2 * eqX2 - a1 * eqY1 - a2 * eqY2;
+          eqX2 = eqX1;
+          eqX1 = hpY;
+          eqY2 = eqY1;
+          eqY1 = eqY;
+
+          work[i] = eqY;
+          const absVal = Math.abs(eqY);
+          if (absVal > 0.015) {
+            activeSqSum += eqY * eqY;
+            activeCount += 1;
+          }
+        }
+
+        if (activeCount < 32) continue;
+        const activeRms = Math.sqrt(activeSqSum / activeCount);
+        if (activeRms < 0.002) continue;
+
+        // Pre-gain targets strong active speech RMS (~0.48) while capping max boost on whisper-quiet audio
+        const preGain = Math.min(5.5, Math.max(1.8, 0.48 / activeRms));
+
+        // Pass 2: Envelope compressor + makeup gain + smooth soft-knee peak limiter -> Int16
+        let env = 0;
+        for (let i = 0; i < frames; i++) {
+          const driven = work[i] * preGain;
+          const absDriven = Math.abs(driven);
+          if (absDriven > env) {
+            env = attackCoeff * env + (1 - attackCoeff) * absDriven;
+          } else {
+            env = releaseCoeff * env + (1 - releaseCoeff) * absDriven;
+          }
+
+          let compGain = 1.0;
+          if (env > compThreshold) {
+            const compressedEnv =
+              compThreshold + (env - compThreshold) / compRatio;
+            compGain = compressedEnv / env;
+          }
+
+          let out = driven * compGain * makeupGain;
+          const absOut = Math.abs(out);
+          if (absOut > softKneeStart) {
+            const limited =
+              softKneeStart +
+              softKneeHeadroom *
+                Math.tanh((absOut - softKneeStart) / softKneeHeadroom);
+            out = out < 0 ? -limited : limited;
+          }
+
+          const clampedInt = Math.max(
+            -32767,
+            Math.min(32767, Math.round(out * 32767))
+          );
+          const bytePos = dataOffset + (i * numChannels + ch) * 2;
+          buf.writeInt16LE(clampedInt, bytePos);
+        }
+      }
+
+      return buf.toString("base64");
+    } catch {
+      return audioBase64;
+    }
+  }
+
   // 3. Natural Text-to-Speech Endpoint (gemini-3.8-flash-lite-tts)
   app.post("/api/tts", async (req, res) => {
     try {
@@ -1602,18 +1800,18 @@ async function startServer() {
 
       const paceCue =
         readingStyle === "slow"
-          ? " at a slow, extra-clear, word-by-word student learning pace with gentle pauses"
+          ? " at a slow, extra-clear, word-by-word student learning pace with clear pauses"
           : readingStyle === "explain"
-            ? " like a warm classroom teacher explaining clearly to a student"
+            ? " like a confident classroom teacher projecting clearly to a student"
             : "";
 
       const style = conversational
         ? role === "student"
-          ? `Warm, expressive, lifelike human mentor speaking naturally face-to-face with genuine warmth, natural breathing rhythm, friendly intonation, and clear pacing${langCue}${paceCue}`
-          : `Warm, natural, lifelike human companion speaking conversationally like a trusted family member, with genuine human inflection, relaxed natural pauses, and effortless clarity${langCue}${paceCue}`
+          ? `Warm, expressive, well-projected human mentor speaking clearly face-to-face with genuine warmth, natural breathing rhythm, friendly intonation, and crisp clarity${langCue}${paceCue}`
+          : `Warm, confident, well-projected human companion speaking clearly like a trusted family member, with genuine human inflection, natural pauses, and effortless clarity${langCue}${paceCue}`
         : role === "student"
-          ? `Warm, patient, encouraging personal teacher${langCue}${paceCue}`
-          : `Calm, articulate, helpful personal assistant${langCue}${paceCue}`;
+          ? `Warm, confident, encouraging personal teacher speaking with clear projection${langCue}${paceCue}`
+          : `Clear, confident, well-projected, articulate personal assistant${langCue}${paceCue}`;
 
       const ai = getAiClient();
       const ttsModels = orderByCooldown(
@@ -1622,6 +1820,7 @@ async function startServer() {
       );
 
       let audioBase64: string | undefined;
+      let inlineMimeType: string | undefined;
       let lastTtsErr: unknown = null;
 
       for (const ttsModel of ttsModels) {
@@ -1648,10 +1847,11 @@ async function startServer() {
               },
             },
           });
-          const data =
-            response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-          if (data) {
-            audioBase64 = data;
+          const inlineData =
+            response.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+          if (inlineData?.data) {
+            audioBase64 = inlineData.data;
+            inlineMimeType = inlineData.mimeType;
             break;
           }
         } catch (err) {
@@ -1665,8 +1865,13 @@ async function startServer() {
         return res.status(502).json({ error: "Speech audio was not returned by Gemini." });
       }
 
-      return res.json({
+      const boostedAudioBase64 = masterTtsWavLoudness(
         audioBase64,
+        inlineMimeType
+      );
+
+      return res.json({
+        audioBase64: boostedAudioBase64,
         mimeType: "audio/wav",
       });
     } catch (err) {

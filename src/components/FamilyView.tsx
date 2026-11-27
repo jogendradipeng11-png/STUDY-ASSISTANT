@@ -205,6 +205,8 @@ export function FamilyView({
       }
 
       const audio = new Audio(`data:audio/wav;base64,${data.audioBase64}`);
+      audio.muted = false;
+      audio.volume = 1.0;
       audioRef.current = audio;
       audio.onended = () => setTestingVoice(null);
       audio.onerror = () => setTestingVoice(null);
