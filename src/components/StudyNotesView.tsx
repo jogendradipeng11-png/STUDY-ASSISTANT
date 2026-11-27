@@ -21,6 +21,11 @@ import { LANGUAGE_OPTIONS, SUBJECT_LIST } from "../data/defaults";
 import { formatShortDate, noteToMarkdown } from "../utils/storage";
 import { exportStudyNotesToPdf } from "../utils/pdfExport";
 import { LanguagePicker } from "./LanguagePicker";
+import {
+  StudyMediaQuickButtons,
+  StudyMediaStudioModal,
+  type StudyMediaMode,
+} from "./StudyMediaStudioModal";
 
 interface StudyNotesViewProps {
   notes: StudyNote[];
@@ -80,6 +85,32 @@ export function StudyNotesView({
   const [isReadingAloud, setIsReadingAloud] = useState(false);
   const [isLoadingAudio, setIsLoadingAudio] = useState(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  // Free Search / Picture / Video Studio modal
+  const [mediaStudio, setMediaStudio] = useState<{
+    isOpen: boolean;
+    mode: StudyMediaMode;
+    prompt: string;
+    autoRun: boolean;
+  }>({
+    isOpen: false,
+    mode: "picture",
+    prompt: "",
+    autoRun: false,
+  });
+
+  const openMediaStudio = (mode: StudyMediaMode, customTopic?: string) => {
+    const topic = (
+      customTopic ??
+      (activeNote ? `${activeNote.title} (${activeNote.subject})` : searchQuery)
+    ).trim();
+    setMediaStudio({
+      isOpen: true,
+      mode,
+      prompt: topic,
+      autoRun: Boolean(topic),
+    });
+  };
 
   useEffect(() => {
     setNewTargetProfileId(activeProfile.id);
@@ -503,6 +534,17 @@ export function StudyNotesView({
               </option>
             ))}
           </select>
+
+          {/* Direct Free Search / Picture / Video triggers */}
+          <div className="flex items-center justify-between gap-2 pt-1">
+            <span className="text-[11px] font-semibold text-slate-500">
+              Free Media
+            </span>
+            <StudyMediaQuickButtons
+              compact
+              onOpen={(mode) => openMediaStudio(mode)}
+            />
+          </div>
         </div>
 
         {/* Inline AI Note Generator Drawer */}
@@ -714,6 +756,16 @@ export function StudyNotesView({
                       <span>Read Tab</span>
                     </button>
                   )}
+
+                  <StudyMediaQuickButtons
+                    compact
+                    onOpen={(mode) =>
+                      openMediaStudio(
+                        mode,
+                        `${activeNote.title} (${activeNote.subject})`
+                      )
+                    }
+                  />
 
                   <div className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-slate-200 bg-white text-xs font-medium text-slate-700">
                     {isTranslating ? (
@@ -1009,6 +1061,30 @@ export function StudyNotesView({
           </article>
         )}
       </div>
+
+      <StudyMediaStudioModal
+        isOpen={mediaStudio.isOpen}
+        initialMode={mediaStudio.mode}
+        initialPrompt={mediaStudio.prompt}
+        autoRun={mediaStudio.autoRun}
+        profile={
+          (activeNote &&
+            profiles.find((p) => p.id === activeNote.profileId)) ||
+          activeProfile
+        }
+        subject={activeNote?.subject}
+        language={
+          (activeNote &&
+            profiles.find((p) => p.id === activeNote.profileId)
+              ?.preferredLanguage) ||
+          activeProfile.preferredLanguage ||
+          "Auto-Detect"
+        }
+        contextLabel="Study Notes"
+        onClose={() =>
+          setMediaStudio((prev) => ({ ...prev, isOpen: false }))
+        }
+      />
     </div>
   );
 }

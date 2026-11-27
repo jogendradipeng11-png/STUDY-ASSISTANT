@@ -21,6 +21,11 @@ import { VOICE_OPTIONS } from "../data/defaults";
 import { blobToBase64 } from "../utils/audio";
 import { LanguagePicker } from "./LanguagePicker";
 import { ProfileAvatar } from "./ProfileAvatar";
+import {
+  StudyMediaQuickButtons,
+  StudyMediaStudioModal,
+  type StudyMediaMode,
+} from "./StudyMediaStudioModal";
 
 interface ReadAloudViewProps {
   profile: FamilyProfile;
@@ -130,6 +135,19 @@ export function ReadAloudView({
   const [activeSentenceIdx, setActiveSentenceIdx] = useState<number | null>(
     null
   );
+
+  // Free Search / Picture / Video Studio modal
+  const [mediaStudio, setMediaStudio] = useState<{
+    isOpen: boolean;
+    mode: StudyMediaMode;
+    prompt: string;
+    autoRun: boolean;
+  }>({
+    isOpen: false,
+    mode: "picture",
+    prompt: "",
+    autoRun: false,
+  });
 
   // Prepare / OCR / Voice capture / Note save states
   const [isPreparing, setIsPreparing] = useState(false);
@@ -847,6 +865,24 @@ export function ReadAloudView({
                 </span>
               </button>
 
+              <StudyMediaQuickButtons
+                compact
+                onOpen={(targetMode) => {
+                  const raw = (preparedText || sourceText).trim();
+                  const firstLine = raw.split(/\n+/)[0] || "";
+                  const snippet = firstLine
+                    .replace(/[#*_`]/g, "")
+                    .trim()
+                    .slice(0, 120);
+                  setMediaStudio({
+                    isOpen: true,
+                    mode: targetMode,
+                    prompt: snippet,
+                    autoRun: Boolean(snippet),
+                  });
+                }}
+              />
+
               {notes.length > 0 && (
                 <select
                   aria-label="Load saved study note"
@@ -1102,6 +1138,19 @@ export function ReadAloudView({
           </div>
         )}
       </div>
+
+      <StudyMediaStudioModal
+        isOpen={mediaStudio.isOpen}
+        initialMode={mediaStudio.mode}
+        initialPrompt={mediaStudio.prompt}
+        autoRun={mediaStudio.autoRun}
+        profile={profile}
+        language={readLanguage}
+        contextLabel="Read Aloud Studio"
+        onClose={() =>
+          setMediaStudio((prev) => ({ ...prev, isOpen: false }))
+        }
+      />
     </div>
   );
 }

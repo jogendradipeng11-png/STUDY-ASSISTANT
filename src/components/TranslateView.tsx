@@ -34,6 +34,11 @@ import {
   updateJarvisMediaSession,
   type WakeLockHandle,
 } from "../utils/backgroundAudio";
+import {
+  StudyMediaQuickButtons,
+  StudyMediaStudioModal,
+  type StudyMediaMode,
+} from "./StudyMediaStudioModal";
 
 type SessionStatus = "idle" | "connecting" | "connected" | "error";
 type TransportMode = "live-ws" | "handsfree-https";
@@ -112,6 +117,17 @@ export function TranslateView({ profile }: TranslateViewProps) {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [fullscreenEntry, setFullscreenEntry] =
     useState<InterpreterEntry | null>(null);
+  const [mediaStudio, setMediaStudio] = useState<{
+    isOpen: boolean;
+    mode: StudyMediaMode;
+    prompt: string;
+    autoRun: boolean;
+  }>({
+    isOpen: false,
+    mode: "search",
+    prompt: "",
+    autoRun: false,
+  });
 
   const effectiveMyLanguage =
     myLanguage === "__custom__"
@@ -1305,7 +1321,28 @@ export function TranslateView({ profile }: TranslateViewProps) {
             </p>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <StudyMediaQuickButtons
+              compact
+              onOpen={(targetMode) => {
+                const latestEntry = entries[entries.length - 1];
+                const raw = (
+                  typedText.trim() ||
+                  latestEntry?.secondaryText ||
+                  latestEntry?.text ||
+                  ""
+                )
+                  .trim()
+                  .slice(0, 140);
+                setMediaStudio({
+                  isOpen: true,
+                  mode: targetMode,
+                  prompt: raw,
+                  autoRun: Boolean(raw),
+                });
+              }}
+            />
+
             {status === "connected" && (
               <span className="text-xs font-mono tabular-nums font-semibold text-blue-800 bg-blue-50 border border-blue-200 px-2.5 py-2 rounded-lg min-h-[40px] inline-flex items-center">
                 {formatTimer(elapsedSeconds)}
@@ -1745,6 +1782,25 @@ export function TranslateView({ profile }: TranslateViewProps) {
                   </p>
                 )}
 
+                {isInterpreter && (
+                  <div className="pt-1.5 flex flex-wrap items-center gap-2">
+                    <StudyMediaQuickButtons
+                      compact
+                      onOpen={(targetMode) => {
+                        const topic = (entry.secondaryText || entry.text)
+                          .trim()
+                          .slice(0, 140);
+                        setMediaStudio({
+                          isOpen: true,
+                          mode: targetMode,
+                          prompt: topic,
+                          autoRun: Boolean(topic),
+                        });
+                      }}
+                    />
+                  </div>
+                )}
+
                 {entry.suggestedReplies && entry.suggestedReplies.length > 0 && (
                   <div className="pt-2 border-t border-slate-100 flex flex-wrap items-center gap-1.5">
                     <span className="text-[11px] font-medium text-slate-500 mr-1">
@@ -1910,6 +1966,19 @@ export function TranslateView({ profile }: TranslateViewProps) {
           </div>
         </div>
       )}
+
+      <StudyMediaStudioModal
+        isOpen={mediaStudio.isOpen}
+        initialMode={mediaStudio.mode}
+        initialPrompt={mediaStudio.prompt}
+        autoRun={mediaStudio.autoRun}
+        profile={profile}
+        language={effectiveMyLanguage}
+        contextLabel="Translate"
+        onClose={() =>
+          setMediaStudio((prev) => ({ ...prev, isOpen: false }))
+        }
+      />
 
       <audio ref={audioElRef} playsInline preload="auto" className="hidden" />
     </div>

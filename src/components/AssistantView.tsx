@@ -2049,8 +2049,8 @@ export function AssistantView({
                 </h2>
                 <p className="text-sm sm:text-base text-slate-600 max-w-xl leading-relaxed">
                   {profile.role === "parent"
-                    ? "Ask anything by typing or speaking, check live facts with Web Search, or switch to Live Voice for a hands-free conversation."
-                    : "Ask any doubt, snap a photo of a homework page, or talk out loud. I will explain step-by-step and turn our lesson into clean study notes."}
+                    ? "Ask anything by typing or speaking, run free Web Search, generate labeled Pictures and narrated Videos, or switch to Live Voice."
+                    : "Ask any doubt, snap a photo of a homework page, search the web, or generate free study pictures and narrated videos with clean notes."}
                 </p>
               </div>
 
@@ -2511,6 +2511,57 @@ export function AssistantView({
                               <span>Make AI Study Note</span>
                             </button>
                           )}
+
+                          <button
+                            type="button"
+                            disabled={isSending}
+                            onClick={() => {
+                              const topic = (
+                                previousUserPrompt ||
+                                msg.content.replace(/[#*_`]/g, "").slice(0, 120)
+                              ).trim();
+                              if (topic) void handleSend(topic, false, "search");
+                            }}
+                            title="Search live web facts, study photos & videos for this answer"
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium text-blue-700 hover:bg-blue-50 disabled:opacity-45 transition-colors whitespace-nowrap shrink-0"
+                          >
+                            <Search className="h-3.5 w-3.5" />
+                            <span>Search</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            disabled={isSending}
+                            onClick={() => {
+                              const topic = (
+                                previousUserPrompt ||
+                                msg.content.replace(/[#*_`]/g, "").slice(0, 120)
+                              ).trim();
+                              if (topic) void handleSend(topic, false, "picture");
+                            }}
+                            title="Generate a free labeled picture & reference photos for this topic"
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium text-emerald-700 hover:bg-emerald-50 disabled:opacity-45 transition-colors whitespace-nowrap shrink-0"
+                          >
+                            <ImageIcon className="h-3.5 w-3.5" />
+                            <span>Picture</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            disabled={isSending}
+                            onClick={() => {
+                              const topic = (
+                                previousUserPrompt ||
+                                msg.content.replace(/[#*_`]/g, "").slice(0, 120)
+                              ).trim();
+                              if (topic) void handleSend(topic, false, "video");
+                            }}
+                            title="Generate a free 5-scene narrated explainer video for this topic"
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium text-indigo-700 hover:bg-indigo-50 disabled:opacity-45 transition-colors whitespace-nowrap shrink-0"
+                          >
+                            <Film className="h-3.5 w-3.5" />
+                            <span>Video</span>
+                          </button>
 
                           <button
                             type="button"
