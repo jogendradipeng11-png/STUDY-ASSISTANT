@@ -3634,6 +3634,182 @@ async function startServer() {
     }
   });
 
+  // 6c. Translate an existing 3D Study Video Storyboard into ANY world language
+  app.post("/api/study/video/translate", async (req, res) => {
+    try {
+      const { storyboard, targetLanguage } = req.body as {
+        storyboard?: {
+          title?: string;
+          subtitle?: string;
+          subject?: string;
+          language?: string;
+          themeColor?: string;
+          scene3d?: unknown;
+          scenes?: Array<{
+            heading?: string;
+            narration?: string;
+            keyFact?: string;
+            visualAccent?: string;
+            bulletPoints?: string[];
+            durationSec?: number;
+          }>;
+        };
+        targetLanguage?: string;
+      };
+
+      const cleanLang = (targetLanguage || "").trim();
+      if (!cleanLang) {
+        return res.status(400).json({ error: "Please choose a target language." });
+      }
+      if (!storyboard || !Array.isArray(storyboard.scenes) || storyboard.scenes.length === 0) {
+        return res.status(400).json({ error: "Valid 3D video storyboard is required." });
+      }
+
+      const compactInput = {
+        title: String(storyboard.title || ""),
+        subtitle: String(storyboard.subtitle || ""),
+        scenes: storyboard.scenes.map((sc) => ({
+          heading: String(sc?.heading || ""),
+          narration: String(sc?.narration || ""),
+          keyFact: String(sc?.keyFact || ""),
+          bulletPoints: Array.isArray(sc?.bulletPoints)
+            ? sc.bulletPoints.slice(0, 3).map((b) => String(b))
+            : [],
+        })),
+      };
+
+      const translateSystem =
+        "You are Jogi Jarvis, a warm multilingual classroom teacher translating a 5-step 3D student explainer video into another world language. Keep every explanation simple, natural, everyday, and easy for a student to understand in the target language's native script.";
+      const translatePrompt = [
+        `Translate the entire 3D study video lesson below into natural, student-friendly ${cleanLang} (use the authentic native script of ${cleanLang}).`,
+        "Rules:",
+        `- Keep the EXACT same number of scenes (${compactInput.scenes.length}) and same order.`,
+        "- Keep headings short (<= 6 words), bulletPoints concise (<= 60 chars each), keyFact crisp (<= 85 chars), and narration warm, calm, and easy to speak aloud (18-30 words).",
+        "- Translate meaning naturally so a student learning the same concept in this language understands effortlessly.",
+        `Input JSON:\n${JSON.stringify(compactInput)}`,
+      ].join("\n");
+
+      const translateSchemaHint =
+        '{"title":"string","subtitle":"string","scenes":[{"heading":"string","narration":"string","keyFact":"string","bulletPoints":["string"]}]}';
+
+      const translateSchema = {
+        type: Type.OBJECT,
+        properties: {
+          title: { type: Type.STRING },
+          subtitle: { type: Type.STRING },
+          scenes: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                heading: { type: Type.STRING },
+                narration: { type: Type.STRING },
+                keyFact: { type: Type.STRING },
+                bulletPoints: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                },
+              },
+              required: ["heading", "narration", "keyFact", "bulletPoints"],
+            },
+          },
+        },
+        required: ["title", "subtitle", "scenes"],
+      };
+
+      let translated: {
+        title?: string;
+        subtitle?: string;
+        scenes?: Array<{
+          heading?: string;
+          narration?: string;
+          keyFact?: string;
+          bulletPoints?: string[];
+        }>;
+      } = {};
+
+      if (!hasGeminiKey() && hasAnyFallbackProvider()) {
+        translated = (await callFallbackPoolJson(
+          translateSystem,
+          translatePrompt,
+          translateSchemaHint
+        )) as typeof translated;
+      } else {
+        try {
+          const ai = getAiClient();
+          // Use ultra-fast free gemini-3.1-flash-lite first with minimal thinking for instant language switching
+          try {
+            const fastRes = await ai.models.generateContent({
+              model: "gemini-3.1-flash-lite",
+              contents: translatePrompt,
+              config: {
+                systemInstruction: translateSystem,
+                thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+                responseMimeType: "application/json",
+                responseSchema: translateSchema,
+              },
+            });
+            translated = parseJsonFromText<typeof translated>(fastRes.text || "{}");
+          } catch {
+            const { response } = await generateGeminiTextWithFallback(
+              ai,
+              translatePrompt,
+              (model) => ({
+                systemInstruction: translateSystem,
+                ...(model === "gemini-4-hydrogen"
+                  ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                  : {}),
+                responseMimeType: "application/json",
+                responseSchema: translateSchema,
+              })
+            );
+            translated = parseJsonFromText<typeof translated>(response.text || "{}");
+          }
+        } catch (geminiErr) {
+          if (hasAnyFallbackProvider()) {
+            translated = (await callFallbackPoolJson(
+              translateSystem,
+              translatePrompt,
+              translateSchemaHint
+            )) as typeof translated;
+          } else {
+            throw geminiErr;
+          }
+        }
+      }
+
+      const translatedScenes = Array.isArray(translated.scenes)
+        ? translated.scenes
+        : [];
+      const mergedScenes = storyboard.scenes.map((orig, idx) => {
+        const tr = translatedScenes[idx];
+        return {
+          ...orig,
+          heading: String(tr?.heading || orig.heading || `Step ${idx + 1}`).slice(0, 90),
+          narration: String(tr?.narration || orig.narration || "").slice(0, 320),
+          keyFact: String(tr?.keyFact || orig.keyFact || "").slice(0, 140),
+          bulletPoints:
+            Array.isArray(tr?.bulletPoints) && tr.bulletPoints.length > 0
+              ? tr.bulletPoints.slice(0, 3).map((b) => String(b).slice(0, 120))
+              : orig.bulletPoints || [],
+        };
+      });
+
+      return res.json({
+        storyboard: {
+          ...storyboard,
+          title: String(translated.title || storyboard.title || "").slice(0, 100),
+          subtitle: String(translated.subtitle || storyboard.subtitle || "").slice(0, 140),
+          language: cleanLang,
+          scenes: mergedScenes,
+        },
+      });
+    } catch (err) {
+      const formatted = formatApiError(err);
+      return res.status(formatted.status).json({ error: formatted.message });
+    }
+  });
+
   // 6c. Free Live Study Web Search (+ Real Educational Photos + Related Video Links)
   app.post("/api/study/search", async (req, res) => {
     try {

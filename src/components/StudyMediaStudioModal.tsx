@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import {
   ExternalLink,
   Film,
+  Globe,
   Image as ImageIcon,
   Loader2,
   RotateCcw,
@@ -18,6 +19,7 @@ import type {
   StudyVideoLink,
   StudyVideoStoryboard,
 } from "../types";
+import { WORLD_TRANSLATION_LANGUAGES } from "../data/defaults";
 import {
   StudyDiagramCard,
   StudyPhotoGallery,
@@ -168,6 +170,22 @@ export function StudyMediaStudioModal({
 }: StudyMediaStudioModalProps) {
   const [mode, setMode] = useState<StudyMediaMode>(initialMode);
   const [prompt, setPrompt] = useState(initialPrompt);
+  const [videoLangOption, setVideoLangOption] = useState<string>(() => {
+    const pref = (language || profile.preferredLanguage || "").trim();
+    if (!pref || pref.toLowerCase() === "auto-detect") return "English";
+    const found = WORLD_TRANSLATION_LANGUAGES.find(
+      (l) => l.id.toLowerCase() === pref.toLowerCase()
+    );
+    return found ? found.id : "__custom__";
+  });
+  const [customVideoLang, setCustomVideoLang] = useState<string>(() => {
+    const pref = (language || profile.preferredLanguage || "").trim();
+    if (!pref || pref.toLowerCase() === "auto-detect") return "";
+    const found = WORLD_TRANSLATION_LANGUAGES.find(
+      (l) => l.id.toLowerCase() === pref.toLowerCase()
+    );
+    return found ? "" : pref;
+  });
   const [isLoading, setIsLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [resultsByMode, setResultsByMode] = useState<
@@ -177,8 +195,17 @@ export function StudyMediaStudioModal({
   const abortRef = useRef<AbortController | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
+  const effectiveVideoLanguage =
+    videoLangOption === "__custom__"
+      ? customVideoLang.trim() || "English"
+      : videoLangOption;
+
   const runGeneration = useCallback(
-    async (targetMode: StudyMediaMode, rawPrompt: string) => {
+    async (
+      targetMode: StudyMediaMode,
+      rawPrompt: string,
+      overrideLang?: string
+    ) => {
       const cleanPrompt = rawPrompt.trim();
       if (!cleanPrompt) return;
 
@@ -195,7 +222,9 @@ export function StudyMediaStudioModal({
       const resolvedSubject =
         subject || (profile.role === "student" ? "General" : undefined);
       const resolvedLanguage =
-        language || profile.preferredLanguage || "Auto-Detect";
+        targetMode === "video"
+          ? overrideLang || effectiveVideoLanguage
+          : language || profile.preferredLanguage || "Auto-Detect";
 
       const runOnDevice = async (): Promise<StudioResult> => {
         const modelKey = getSavedLocalModelKey();
@@ -330,7 +359,7 @@ export function StudyMediaStudioModal({
         }
       }
     },
-    [language, profile, subject]
+    [effectiveVideoLanguage, language, profile, subject]
   );
 
   // Sync open state & optional auto-run
@@ -454,34 +483,63 @@ export function StudyMediaStudioModal({
             e.preventDefault();
             void runGeneration(mode, prompt);
           }}
-          className="px-4 sm:px-6 py-3 bg-slate-50 border-b border-slate-200 flex flex-col sm:flex-row gap-2 shrink-0"
+          className="px-4 sm:px-6 py-3 bg-slate-50 border-b border-slate-200 flex flex-col gap-2 shrink-0"
         >
-          <input
-            ref={inputRef}
-            type="text"
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            placeholder={activeMeta.placeholder}
-            className="flex-1 min-w-0 px-3.5 py-2.5 text-sm bg-white border border-slate-300 rounded-xl text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-blue-600 focus:ring-2 focus:ring-blue-100"
-          />
-          <button
-            type="submit"
-            disabled={isLoading || !prompt.trim()}
-            className={`inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl text-xs sm:text-sm font-semibold text-white disabled:opacity-45 transition-colors whitespace-nowrap shrink-0 ${
-              mode === "picture"
-                ? "bg-emerald-700 hover:bg-emerald-800"
-                : mode === "video"
-                  ? "bg-indigo-700 hover:bg-indigo-800"
-                  : "bg-blue-700 hover:bg-blue-800"
-            }`}
-          >
-            {isLoading ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <Send className="h-4 w-4" />
+          <div className="flex flex-col sm:flex-row gap-2">
+            <input
+              ref={inputRef}
+              type="text"
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              placeholder={activeMeta.placeholder}
+              className="flex-1 min-w-0 px-3.5 py-2.5 text-sm bg-white border border-slate-300 rounded-xl text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-blue-600 focus:ring-2 focus:ring-blue-100"
+            />
+            {mode === "video" && (
+              <div className="inline-flex items-center gap-1.5 px-2.5 py-2 bg-white border border-slate-300 rounded-xl shrink-0">
+                <Globe className="h-4 w-4 text-indigo-600 shrink-0" />
+                <select
+                  aria-label="3D Video Lesson Language"
+                  value={videoLangOption}
+                  onChange={(e) => setVideoLangOption(e.target.value)}
+                  className="bg-transparent text-xs sm:text-sm font-medium text-slate-800 focus:outline-none max-w-[165px] cursor-pointer"
+                >
+                  {WORLD_TRANSLATION_LANGUAGES.map((lang) => (
+                    <option key={lang.id} value={lang.id}>
+                      {lang.label}
+                    </option>
+                  ))}
+                  <option value="__custom__">Other Language (Type Any)...</option>
+                </select>
+              </div>
             )}
-            <span>{isLoading ? "Generating..." : activeMeta.buttonLabel}</span>
-          </button>
+            <button
+              type="submit"
+              disabled={isLoading || !prompt.trim()}
+              className={`inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl text-xs sm:text-sm font-semibold text-white disabled:opacity-45 transition-colors whitespace-nowrap shrink-0 ${
+                mode === "picture"
+                  ? "bg-emerald-700 hover:bg-emerald-800"
+                  : mode === "video"
+                    ? "bg-indigo-700 hover:bg-indigo-800"
+                    : "bg-blue-700 hover:bg-blue-800"
+              }`}
+            >
+              {isLoading ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Send className="h-4 w-4" />
+              )}
+              <span>{isLoading ? "Generating..." : activeMeta.buttonLabel}</span>
+            </button>
+          </div>
+          {mode === "video" && videoLangOption === "__custom__" && (
+            <input
+              type="text"
+              value={customVideoLang}
+              onChange={(e) => setCustomVideoLang(e.target.value)}
+              placeholder="Type any world language (e.g. Sambalpuri, Bhojpuri, Zulu, Irish, Kazakh)..."
+              className="w-full px-3.5 py-2 text-xs sm:text-sm bg-white border border-slate-300 rounded-xl text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-indigo-600"
+            />
+          )}
         </form>
 
         {/* Scrollable Result Viewport */}

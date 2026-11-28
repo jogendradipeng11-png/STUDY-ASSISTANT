@@ -6,6 +6,7 @@ import {
   Download,
   ExternalLink,
   Film,
+  Globe,
   Image as ImageIcon,
   Layers,
   Loader2,
@@ -27,6 +28,11 @@ import type {
   StudyVideoScene,
   StudyVideoStoryboard,
 } from "../types";
+import { WORLD_TRANSLATION_LANGUAGES } from "../data/defaults";
+import {
+  generateLocalLlmPrompt,
+  getReadyLocalModelKey,
+} from "../utils/localLlm";
 import {
   infer3DSceneBlueprint,
   Study3DViewportEngine,
@@ -45,28 +51,19 @@ function slugifyFilename(text: string, fallback: string): string {
 }
 
 function getSpeechLangCode(language?: string): string {
-  const map: Record<string, string> = {
-    English: "en-IN",
-    Hindi: "hi-IN",
-    Odia: "or-IN",
-    Bengali: "bn-IN",
-    Tamil: "ta-IN",
-    Telugu: "te-IN",
-    Marathi: "mr-IN",
-    Gujarati: "gu-IN",
-    Punjabi: "pa-IN",
-    Kannada: "kn-IN",
-    Malayalam: "ml-IN",
-    Urdu: "ur-PK",
-    Spanish: "es-ES",
-    French: "fr-FR",
-    German: "de-DE",
-    Arabic: "ar-SA",
-    Japanese: "ja-JP",
-    Korean: "ko-KR",
-    Chinese: "zh-CN",
-  };
-  return (language && map[language]) || "en-IN";
+  const clean = (language || "").trim().toLowerCase();
+  if (!clean || clean === "auto-detect") return "en-IN";
+  const matched = WORLD_TRANSLATION_LANGUAGES.find(
+    (l) =>
+      l.id.toLowerCase() === clean ||
+      l.label.toLowerCase().includes(clean) ||
+      clean.includes(l.id.toLowerCase())
+  );
+  if (matched) return matched.bcp47;
+  if (clean.includes("chinese") || clean.includes("mandarin")) return "zh-CN";
+  if (clean.includes("cantonese")) return "zh-HK";
+  if (clean.includes("hinglish")) return "hi-IN";
+  return "en-IN";
 }
 
 function safeHexColor(color?: string): string {
@@ -923,7 +920,12 @@ function drawStudyVideoFrame(
   ctx.font = "700 17px Inter, system-ui, -apple-system, sans-serif";
   ctx.fillText(storyboard.title.slice(0, 52), 20, 30);
 
-  const stepBadgeText = `Step ${sceneIndex + 1} of ${scenes.length}`;
+  const cleanBadgeLang =
+    storyboard.language &&
+    storyboard.language.toLowerCase() !== "auto-detect"
+      ? `${storyboard.language.slice(0, 18)} · `
+      : "";
+  const stepBadgeText = `${cleanBadgeLang}Step ${sceneIndex + 1} of ${scenes.length}`;
   ctx.font = "600 12px Inter, system-ui, sans-serif";
   const badgeW = ctx.measureText(stepBadgeText).width + 22;
   ctx.fillStyle = "rgba(30, 41, 59, 0.95)";
@@ -1156,6 +1158,40 @@ export function StudyVideoPlayer({
   const ttsCacheRef = useRef<Map<number, string>>(new Map());
   const ttsPrefetchingRef = useRef<Set<number>>(new Set());
   const narrationRunIdRef = useRef(0);
+  const translatedCacheRef = useRef<Map<string, StudyVideoStoryboard>>(new Map());
+  const langAbortRef = useRef<AbortController | null>(null);
+
+  const normalizeInitialLang = (lang?: string) => {
+    const clean = (lang || "").trim();
+    if (!clean || clean.toLowerCase() === "auto-detect") return "English";
+    return clean;
+  };
+
+  const [activeStoryboard, setActiveStoryboard] =
+    useState<StudyVideoStoryboard>(storyboard);
+  const [selectedLangOption, setSelectedLangOption] = useState<string>(() => {
+    const initLang = normalizeInitialLang(storyboard.language);
+    return WORLD_TRANSLATION_LANGUAGES.some(
+      (l) => l.id.toLowerCase() === initLang.toLowerCase()
+    )
+      ? WORLD_TRANSLATION_LANGUAGES.find(
+          (l) => l.id.toLowerCase() === initLang.toLowerCase()
+        )!.id
+      : "__custom__";
+  });
+  const [customLangInput, setCustomLangInput] = useState<string>(() => {
+    const initLang = normalizeInitialLang(storyboard.language);
+    return WORLD_TRANSLATION_LANGUAGES.some(
+      (l) => l.id.toLowerCase() === initLang.toLowerCase()
+    )
+      ? ""
+      : initLang;
+  });
+  const [activeLangLabel, setActiveLangLabel] = useState<string>(() =>
+    normalizeInitialLang(storyboard.language)
+  );
+  const [isTranslatingLang, setIsTranslatingLang] = useState(false);
+  const [langError, setLangError] = useState<string | null>(null);
 
   const [renderMode, setRenderMode] = useState<"3d" | "2d">("3d");
   const [isPlaying, setIsPlaying] = useState(false);
@@ -1189,8 +1225,36 @@ export function StudyVideoPlayer({
   const narrationStateRef = useRef<"idle" | "loading" | "speaking" | "done">("idle");
   const narrationDoneAtRef = useRef<number>(0);
 
-  const scenes = storyboard.scenes || [];
+  // Sync when a brand-new storyboard prop is generated
+  useEffect(() => {
+    langAbortRef.current?.abort();
+    const initLang = normalizeInitialLang(storyboard.language);
+    const normalizedInitial: StudyVideoStoryboard = {
+      ...storyboard,
+      language: initLang,
+    };
+    translatedCacheRef.current.clear();
+    translatedCacheRef.current.set(initLang.toLowerCase(), normalizedInitial);
+    setActiveStoryboard(normalizedInitial);
+    setActiveLangLabel(initLang);
+    const known = WORLD_TRANSLATION_LANGUAGES.find(
+      (l) => l.id.toLowerCase() === initLang.toLowerCase()
+    );
+    setSelectedLangOption(known ? known.id : "__custom__");
+    setCustomLangInput(known ? "" : initLang);
+    setIsTranslatingLang(false);
+    setLangError(null);
+    setSceneIndex(0);
+    sceneIndexRef.current = 0;
+    sceneElapsedRef.current = 0;
+    spokenSceneRef.current = -1;
+    narrationStateRef.current = "idle";
+  }, [storyboard]);
 
+  const scenes = activeStoryboard.scenes || [];
+  const activeLanguage = activeStoryboard.language || activeLangLabel || "English";
+
+  // Keep the 3D physical blueprint anchored to the original storyboard so language switches never reload WebGL!
   const resolvedBlueprint = useMemo<Study3DSceneBlueprint>(
     () =>
       storyboard.scene3d ||
@@ -1222,11 +1286,11 @@ export function StudyVideoPlayer({
     };
   }, [resolvedBlueprint]);
 
-  // Clear TTS audio cache when storyboard changes
+  // Clear TTS audio cache whenever storyboard or selected language changes
   useEffect(() => {
     ttsCacheRef.current.clear();
     ttsPrefetchingRef.current.clear();
-  }, [storyboard]);
+  }, [activeStoryboard]);
 
   // Update active HTML5 audio speed immediately when student changes pace
   useEffect(() => {
@@ -1276,7 +1340,7 @@ export function StudyVideoPlayer({
           text: target.narration,
           voiceName: "Kore",
           role: "student",
-          language: storyboard.language || "Auto-Detect",
+          language: activeLanguage,
         }),
       })
         .then((res) => (res.ok ? res.json() : null))
@@ -1292,7 +1356,7 @@ export function StudyVideoPlayer({
           ttsPrefetchingRef.current.delete(idx);
         });
     },
-    [scenes, storyboard.language]
+    [scenes, activeLanguage]
   );
 
   const speakBrowserNarration = useCallback(
@@ -1307,7 +1371,7 @@ export function StudyVideoPlayer({
       try {
         window.speechSynthesis.cancel();
         const utter = new SpeechSynthesisUtterance(narration);
-        utter.lang = getSpeechLangCode(storyboard.language);
+        utter.lang = getSpeechLangCode(activeLanguage);
         utter.volume = 1.0;
         utter.rate = playbackSpeedRef.current;
         utter.onstart = () => {
@@ -1336,7 +1400,7 @@ export function StudyVideoPlayer({
         }
       }
     },
-    [storyboard.language]
+    [activeLanguage]
   );
 
   const speakSceneNarration = useCallback(
@@ -1408,7 +1472,7 @@ export function StudyVideoPlayer({
           text: scene.narration,
           voiceName: "Kore",
           role: "student",
-          language: storyboard.language || "Auto-Detect",
+          language: activeLanguage,
         }),
       })
         .then((res) => (res.ok ? res.json() : Promise.reject(new Error("TTS unavailable"))))
@@ -1423,7 +1487,152 @@ export function StudyVideoPlayer({
           }
         });
     },
-    [scenes, storyboard.language, stopNarration, speakBrowserNarration, prefetchSceneTts]
+    [scenes, activeLanguage, stopNarration, speakBrowserNarration, prefetchSceneTts]
+  );
+
+  // Switch the entire 3D video lesson (headings, points, takeaways, subtitles & voice) to ANY world language
+  const handleSwitchVideoLanguage = useCallback(
+    async (targetLangRaw: string) => {
+      const targetLang = targetLangRaw.trim();
+      if (!targetLang) return;
+      const cacheKey = targetLang.toLowerCase();
+
+      langAbortRef.current?.abort();
+      setLangError(null);
+      stopNarration();
+      ttsCacheRef.current.clear();
+      ttsPrefetchingRef.current.clear();
+
+      const cached = translatedCacheRef.current.get(cacheKey);
+      if (cached) {
+        setActiveLangLabel(targetLang);
+        setActiveStoryboard(cached);
+        spokenSceneRef.current = -1;
+        sceneElapsedRef.current = 0;
+        narrationStateRef.current = "idle";
+        return;
+      }
+
+      const controller = new AbortController();
+      langAbortRef.current = controller;
+      setIsTranslatingLang(true);
+
+      try {
+        let translatedStoryboard: StudyVideoStoryboard | null = null;
+        const isOfflineNow = typeof navigator !== "undefined" && !navigator.onLine;
+
+        if (!isOfflineNow) {
+          try {
+            const res = await fetch("/api/study/video/translate", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              signal: controller.signal,
+              body: JSON.stringify({
+                storyboard,
+                targetLanguage: targetLang,
+              }),
+            });
+            const data = (await res.json().catch(() => ({}))) as {
+              storyboard?: StudyVideoStoryboard;
+              error?: string;
+            };
+            if (res.ok && data.storyboard) {
+              translatedStoryboard = data.storyboard;
+            }
+          } catch (err) {
+            if (err instanceof DOMException && err.name === "AbortError") {
+              return;
+            }
+          }
+        }
+
+        // Offline Local AI fallback so language switching works even without internet
+        if (!translatedStoryboard) {
+          const localKey = getReadyLocalModelKey();
+          if (localKey) {
+            const compact = {
+              title: storyboard.title,
+              subtitle: storyboard.subtitle,
+              scenes: storyboard.scenes.map((sc) => ({
+                heading: sc.heading,
+                narration: sc.narration,
+                keyFact: sc.keyFact,
+                bulletPoints: sc.bulletPoints,
+              })),
+            };
+            const rawOut = await generateLocalLlmPrompt({
+              modelKey: localKey,
+              systemPrompt: `You are a multilingual teacher. Translate this JSON study lesson into simple, natural ${targetLang}. Return ONLY valid JSON with keys: title, subtitle, scenes (array of heading, narration, keyFact, bulletPoints).`,
+              userPrompt: JSON.stringify(compact),
+              maxTokens: 900,
+              temperature: 0.2,
+            });
+            const jsonMatch = rawOut.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+              const parsed = JSON.parse(jsonMatch[0]) as {
+                title?: string;
+                subtitle?: string;
+                scenes?: Array<{
+                  heading?: string;
+                  narration?: string;
+                  keyFact?: string;
+                  bulletPoints?: string[];
+                }>;
+              };
+              const trScenes = Array.isArray(parsed.scenes) ? parsed.scenes : [];
+              translatedStoryboard = {
+                ...storyboard,
+                title: parsed.title || storyboard.title,
+                subtitle: parsed.subtitle || storyboard.subtitle,
+                language: targetLang,
+                scenes: storyboard.scenes.map((orig, idx) => ({
+                  ...orig,
+                  heading: trScenes[idx]?.heading || orig.heading,
+                  narration: trScenes[idx]?.narration || orig.narration,
+                  keyFact: trScenes[idx]?.keyFact || orig.keyFact,
+                  bulletPoints:
+                    Array.isArray(trScenes[idx]?.bulletPoints) &&
+                    trScenes[idx]!.bulletPoints!.length > 0
+                      ? trScenes[idx]!.bulletPoints!.slice(0, 3)
+                      : orig.bulletPoints,
+                })),
+              };
+            }
+          }
+        }
+
+        if (controller.signal.aborted) return;
+
+        if (!translatedStoryboard) {
+          throw new Error(
+            isOfflineNow
+              ? `Offline language switching needs a downloaded Local AI model in Assistant Desk.`
+              : `Could not translate the 3D lesson to ${targetLang} right now.`
+          );
+        }
+
+        translatedCacheRef.current.set(cacheKey, translatedStoryboard);
+        setActiveLangLabel(targetLang);
+        setActiveStoryboard(translatedStoryboard);
+        spokenSceneRef.current = -1;
+        sceneElapsedRef.current = 0;
+        narrationStateRef.current = "idle";
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") {
+          return;
+        }
+        setLangError(
+          err instanceof Error
+            ? err.message
+            : `Could not switch video language to ${targetLang}.`
+        );
+      } finally {
+        if (langAbortRef.current === controller) {
+          setIsTranslatingLang(false);
+        }
+      }
+    },
+    [stopNarration, storyboard]
   );
 
   // Main 3D Documentary + Audio-Synced Student Pacing Loop
@@ -1517,7 +1726,7 @@ export function StudyVideoPlayer({
 
         drawStudyVideoFrame(
           ctx,
-          storyboard,
+          activeStoryboard,
           idx,
           progress,
           globalTimeRef.current,
@@ -1541,7 +1750,7 @@ export function StudyVideoPlayer({
       window.clearTimeout(timerId);
       stopNarration();
     };
-  }, [scenes, storyboard, speakSceneNarration, stopNarration]);
+  }, [scenes, activeStoryboard, speakSceneNarration, stopNarration]);
 
   const handleJumpScene = useCallback(
     (idx: number, autoStart = false) => {
@@ -1666,7 +1875,7 @@ export function StudyVideoPlayer({
           }
           drawStudyVideoFrame(
             ctx,
-            storyboard,
+            activeStoryboard,
             idx,
             progress,
             elapsed,
@@ -1685,7 +1894,7 @@ export function StudyVideoPlayer({
       const url = URL.createObjectURL(videoBlob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${slugifyFilename(storyboard.title, "3d-study-video")}-3d.webm`;
+      a.download = `${slugifyFilename(activeStoryboard.title, "3d-study-video")}-${slugifyFilename(activeLanguage, "lang")}-3d.webm`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 2000);
     } finally {
@@ -1703,14 +1912,48 @@ export function StudyVideoPlayer({
           <Film className="h-4 w-4 text-sky-400 shrink-0" />
           <div className="min-w-0">
             <p className="text-xs font-semibold text-white truncate">
-              {storyboard.title}
+              {activeStoryboard.title}
             </p>
             <p className="text-[11px] text-slate-400 truncate">
-              {renderMode === "3d" ? "Physical 3D Explainer" : "2D Slide Lesson"} · {scenes.length} easy steps · Calm pace
+              {renderMode === "3d" ? "Physical 3D Explainer" : "2D Slide Lesson"} · {scenes.length} easy steps · {activeLanguage}
             </p>
           </div>
         </div>
         <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
+          {/* World Language Switcher inside 3D Video */}
+          <div
+            className="inline-flex items-center gap-1 rounded-md bg-slate-800 border border-slate-700 px-2 py-0.5"
+            title="Learn this exact 3D video lesson in any world language"
+          >
+            {isTranslatingLang ? (
+              <Loader2 className="h-3 w-3 text-sky-400 animate-spin shrink-0" />
+            ) : (
+              <Globe className="h-3 w-3 text-sky-400 shrink-0" />
+            )}
+            <select
+              aria-label="Choose 3D video explanation language"
+              value={selectedLangOption}
+              disabled={isTranslatingLang || isExporting}
+              onChange={(e) => {
+                const next = e.target.value;
+                setSelectedLangOption(next);
+                if (next !== "__custom__") {
+                  void handleSwitchVideoLanguage(next);
+                }
+              }}
+              className="bg-slate-800 text-[11px] font-semibold text-slate-100 focus:outline-none max-w-[145px] sm:max-w-[175px] py-0.5 cursor-pointer disabled:opacity-60"
+            >
+              {WORLD_TRANSLATION_LANGUAGES.map((lang) => (
+                <option key={lang.id} value={lang.id} className="bg-slate-900 text-white">
+                  {lang.label}
+                </option>
+              ))}
+              <option value="__custom__" className="bg-slate-900 text-white">
+                Other Language (Type Any)...
+              </option>
+            </select>
+          </div>
+
           <div className="inline-flex items-center rounded-md bg-slate-800 p-0.5">
             <button
               type="button"
@@ -1739,7 +1982,7 @@ export function StudyVideoPlayer({
           </div>
           <button
             type="button"
-            disabled={isExporting}
+            disabled={isExporting || isTranslatingLang}
             onClick={() => void handleDownloadWebm()}
             className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold bg-sky-600 hover:bg-sky-500 text-white disabled:opacity-60 transition-colors whitespace-nowrap shrink-0"
           >
@@ -1757,6 +2000,47 @@ export function StudyVideoPlayer({
           </button>
         </div>
       </div>
+
+      {/* Custom Any-World-Language Input Row or Translation Status */}
+      {(selectedLangOption === "__custom__" || isTranslatingLang || langError) && (
+        <div className="px-3.5 py-2 bg-slate-900/95 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+          {selectedLangOption === "__custom__" && (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (customLangInput.trim()) {
+                  void handleSwitchVideoLanguage(customLangInput.trim());
+                }
+              }}
+              className="flex items-center gap-1.5 flex-1 min-w-[200px]"
+            >
+              <input
+                type="text"
+                value={customLangInput}
+                onChange={(e) => setCustomLangInput(e.target.value)}
+                placeholder="Type any world language (e.g. Sambalpuri, Bhojpuri, Zulu, Irish, Kazakh)..."
+                className="flex-1 min-w-0 px-2.5 py-1 rounded bg-slate-800 border border-slate-700 text-slate-100 placeholder:text-slate-400 focus:outline-none focus:border-sky-500"
+              />
+              <button
+                type="submit"
+                disabled={isTranslatingLang || !customLangInput.trim()}
+                className="px-2.5 py-1 rounded bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white font-semibold whitespace-nowrap"
+              >
+                Apply Language
+              </button>
+            </form>
+          )}
+          {isTranslatingLang && (
+            <span className="inline-flex items-center gap-1.5 text-sky-300 font-medium">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              <span>Translating 3D lesson, subtitles &amp; voice…</span>
+            </span>
+          )}
+          {langError && (
+            <span className="text-amber-300 font-medium">{langError}</span>
+          )}
+        </div>
+      )}
 
       {/* 16:9 3D Animated Documentary Viewport */}
       <div className="relative bg-slate-950 cursor-pointer" onClick={handleTogglePlay}>
