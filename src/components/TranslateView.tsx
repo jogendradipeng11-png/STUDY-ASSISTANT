@@ -48,10 +48,12 @@ import {
 type SessionStatus = "idle" | "connecting" | "connected" | "error";
 type TransportMode = "live-ws" | "handsfree-https";
 type HandsFreePhase = "idle" | "listening" | "hearing" | "interpreting" | "speaking";
+type TurnMode = "auto" | "them" | "me";
 
 interface InterpreterEntry {
   id: string;
   speaker: "heard" | "interpreter";
+  speakerSide?: "me" | "them";
   text: string;
   secondaryText?: string;
   pronunciation?: string;
@@ -105,10 +107,11 @@ export function TranslateView({
   const [autoSpeak, setAutoSpeak] = useState(true);
   const [sameLanguageReplyMode, setSameLanguageReplyMode] = useState(false);
 
-  // Real-time live interpreter state (Gemini Live WebSocket + automatic Hands-Free HTTPS VAD fallback)
+  // Real-time live interpreter state (Gemini Live WebSocket + automatic Turbo Hands-Free HTTPS VAD fallback)
   const [status, setStatus] = useState<SessionStatus>("idle");
   const [transport, setTransport] = useState<TransportMode>("live-ws");
   const [handsFreePhase, setHandsFreePhase] = useState<HandsFreePhase>("idle");
+  const [turnMode, setTurnMode] = useState<TurnMode>("auto");
   const [isMuted, setIsMuted] = useState(false);
   const [isJarvisSpeaking, setIsJarvisSpeaking] = useState(false);
   const [audioLevel, setAudioLevel] = useState(0);
@@ -168,6 +171,7 @@ export function TranslateView({
   const otherLangRef = useRef(effectiveOtherLanguage);
   const sameLangRef = useRef(sameLanguageReplyMode || isSameLanguage);
   const lastDetectedOtherRef = useRef(lastDetectedOtherLang);
+  const turnModeRef = useRef<TurnMode>(turnMode);
   const entriesRef = useRef(entries);
 
   // Live transcript sealing ref so each speaker turn starts a clean card
@@ -194,6 +198,7 @@ export function TranslateView({
   otherLangRef.current = effectiveOtherLanguage;
   sameLangRef.current = sameLanguageReplyMode || isSameLanguage;
   lastDetectedOtherRef.current = lastDetectedOtherLang;
+  turnModeRef.current = turnMode;
   entriesRef.current = entries;
 
   useEffect(() => {
@@ -329,7 +334,8 @@ export function TranslateView({
       text: string,
       targetLanguage: string,
       preserveKeepAlive = false,
-      onComplete?: () => void
+      onComplete?: () => void,
+      inlineAudio?: { base64: string; mimeType?: string } | null
     ) => {
       let didFinish = false;
       const notifyComplete = () => {
@@ -359,10 +365,11 @@ export function TranslateView({
       const controller = new AbortController();
       ttsAbortRef.current = controller;
       let timedOut = false;
+      const timeoutMs = preserveKeepAlive ? 3600 : 12000;
       const timeoutId = window.setTimeout(() => {
         timedOut = true;
         controller.abort();
-      }, 15000);
+      }, timeoutMs);
 
       setLoadingAudioId(entryId);
       setIsJarvisSpeaking(true);
@@ -373,38 +380,44 @@ export function TranslateView({
         )?.bcp47 || "en-IN";
 
       try {
-        const res = await fetch("/api/tts", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          signal: controller.signal,
-          body: JSON.stringify({
-            text,
-            voiceName: profile.voiceName,
-            role: profile.role,
-            language: targetLanguage || myLangRef.current,
-            conversational: true,
-          }),
-        });
-        window.clearTimeout(timeoutId);
-        const data = (await res.json()) as {
-          audioBase64?: string;
-          mimeType?: string;
-          error?: string;
-        };
-        if (playbackTokenRef.current !== myToken) {
-          notifyComplete();
-          return;
-        }
-        if (!res.ok || !data.audioBase64) {
-          throw new Error(data.error || "Could not generate voice audio.");
+        let audioBase64 = inlineAudio?.base64 || "";
+        let audioMimeType = inlineAudio?.mimeType || "audio/wav";
+
+        if (!audioBase64) {
+          const res = await fetch("/api/tts", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            signal: controller.signal,
+            body: JSON.stringify({
+              text,
+              voiceName: profile.voiceName,
+              role: profile.role,
+              language: targetLanguage || myLangRef.current,
+              conversational: true,
+            }),
+          });
+          window.clearTimeout(timeoutId);
+          const data = (await res.json()) as {
+            audioBase64?: string;
+            mimeType?: string;
+            error?: string;
+          };
+          if (playbackTokenRef.current !== myToken) {
+            notifyComplete();
+            return;
+          }
+          if (!res.ok || !data.audioBase64) {
+            throw new Error(data.error || "Could not generate voice audio.");
+          }
+          audioBase64 = data.audioBase64;
+          audioMimeType = data.mimeType || "audio/wav";
+        } else {
+          window.clearTimeout(timeoutId);
         }
 
         const audio = getAudioEl();
         revokeActiveBlob();
-        const blobUrl = base64ToAudioBlobUrl(
-          data.audioBase64,
-          data.mimeType || "audio/wav"
-        );
+        const blobUrl = base64ToAudioBlobUrl(audioBase64, audioMimeType);
         activeBlobUrlRef.current = blobUrl;
 
         await playAudioBlobReliably(audio, blobUrl);
@@ -625,7 +638,7 @@ export function TranslateView({
     setStatus("idle");
   }, [cleanupHandsFreeVad, releaseWakeLock, stopUnaryPlayback]);
 
-  // Automatic Hands-Free HTTPS VAD Loop (zero stop-button clicking if WebSocket is unavailable)
+  // Automatic Turbo Hands-Free HTTPS VAD Loop (fast endpointing + single-shot audio translate + inline voice)
   const startHandsFreeVadClip = useCallback(() => {
     if (!handsFreeActiveRef.current) return;
     const stream = mediaStreamRef.current;
@@ -690,24 +703,24 @@ export function TranslateView({
       if (!handsFreeActiveRef.current) return;
 
       if (silentRecycle || (!heardSpeech && !vadForceSendRef.current)) {
-        scheduleNextClip(120);
+        scheduleNextClip(80);
         return;
       }
 
       const blob = new Blob(vadChunksRef.current, { type: mimeType });
-      if (blob.size < 450) {
-        scheduleNextClip(200);
+      if (blob.size < 400) {
+        scheduleNextClip(120);
         return;
       }
 
       setHandsFreePhase("interpreting");
       if (autoSpeakRef.current) {
-        startKeepAliveAudio("Jogi Jarvis is interpreting…");
+        startKeepAliveAudio("Jogi Jarvis is translating…");
       }
 
       try {
         const audioBase64 = await blobToBase64(blob);
-        const recent = entriesRef.current.slice(-6);
+        const recent = entriesRef.current.slice(-4);
         const recentContext: Array<{
           originalText: string;
           translatedText: string;
@@ -722,6 +735,13 @@ export function TranslateView({
           }
         }
 
+        const activeDirection =
+          turnModeRef.current === "them"
+            ? "them_to_me"
+            : turnModeRef.current === "me"
+              ? "me_to_them"
+              : "auto_conversation";
+
         const res = await fetch("/api/translate/conversation", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -731,9 +751,12 @@ export function TranslateView({
             myLanguage: myLangRef.current,
             otherLanguage: otherLangRef.current,
             lastOtherLanguage: lastDetectedOtherRef.current,
-            direction: "auto_conversation",
+            direction: activeDirection,
             sameLanguageAnswer: sameLangRef.current,
             recentContext,
+            fastMode: true,
+            includeAudio: autoSpeakRef.current,
+            voiceName: profile.voiceName,
           }),
         });
         const data = (await res.json()) as {
@@ -745,6 +768,8 @@ export function TranslateView({
           pronunciation?: string;
           speakerSide?: "me" | "them";
           suggestedReplies?: string[];
+          audioBase64?: string;
+          audioMimeType?: string;
           error?: string;
         };
 
@@ -756,17 +781,39 @@ export function TranslateView({
 
         if (data.empty || !data.translatedText) {
           stopUnaryPlayback();
-          scheduleNextClip(220);
+          scheduleNextClip(140);
           return;
         }
 
+        const resolvedSide: "me" | "them" =
+          data.speakerSide ||
+          (activeDirection === "me_to_them" ? "me" : "them");
+
+        // Lock the other person's language immediately so replies go back in their exact language
         if (
-          data.speakerSide === "them" &&
+          resolvedSide === "them" &&
           data.detectedLanguage &&
+          data.detectedLanguage.toLowerCase() !== "auto-detect" &&
           data.detectedLanguage.toLowerCase() !== myLangRef.current.toLowerCase()
         ) {
+          lastDetectedOtherRef.current = data.detectedLanguage;
           setLastDetectedOtherLang(data.detectedLanguage);
+        } else if (
+          resolvedSide === "me" &&
+          !lastDetectedOtherRef.current &&
+          data.targetLanguage &&
+          data.targetLanguage.toLowerCase() !== myLangRef.current.toLowerCase()
+        ) {
+          lastDetectedOtherRef.current = data.targetLanguage;
+          setLastDetectedOtherLang(data.targetLanguage);
         }
+
+        const detLang = data.detectedLanguage || (resolvedSide === "me" ? myLangRef.current : "Detected");
+        const tgtLang = data.targetLanguage || myLangRef.current;
+        const metaLabel =
+          resolvedSide === "them"
+            ? `Other Person (${detLang}) → Explained to You (${tgtLang})`
+            : `You (${detLang}) → Spoken to Them (${tgtLang})`;
 
         const nowTime = new Date().toLocaleTimeString([], {
           hour: "2-digit",
@@ -775,11 +822,12 @@ export function TranslateView({
         const newEntry: InterpreterEntry = {
           id: `tr-${Date.now()}`,
           speaker: "interpreter",
+          speakerSide: resolvedSide,
           text: data.translatedText,
           secondaryText: data.originalText,
           pronunciation: data.pronunciation || "",
-          metaLabel: `${data.detectedLanguage || "Detected"} → ${data.targetLanguage || myLangRef.current}`,
-          targetLanguage: data.targetLanguage || myLangRef.current,
+          metaLabel,
+          targetLanguage: tgtLang,
           suggestedReplies: Array.isArray(data.suggestedReplies)
             ? data.suggestedReplies
             : [],
@@ -787,8 +835,17 @@ export function TranslateView({
         };
         setEntries((prev) => [...prev, newEntry]);
 
+        const nowMs = Date.now();
+        if (nowMs - lastStudyAwardAtRef.current >= 30_000) {
+          lastStudyAwardAtRef.current = nowMs;
+          onStudySessionComplete?.(profile.id, "Live translation conversation");
+        }
+
         if (autoSpeakRef.current && newEntry.text) {
           setHandsFreePhase("speaking");
+          const inlineAudio = data.audioBase64
+            ? { base64: data.audioBase64, mimeType: data.audioMimeType || "audio/wav" }
+            : null;
           void speakEntryAudio(
             newEntry.id,
             newEntry.text,
@@ -796,13 +853,14 @@ export function TranslateView({
             true,
             () => {
               if (handsFreeActiveRef.current) {
-                scheduleNextClip(420);
+                scheduleNextClip(140);
               }
-            }
+            },
+            inlineAudio
           );
         } else {
           stopUnaryPlayback();
-          scheduleNextClip(350);
+          scheduleNextClip(160);
         }
       } catch (err) {
         stopUnaryPlayback();
@@ -811,18 +869,18 @@ export function TranslateView({
             ? err.message
             : "Live interpretation paused briefly."
         );
-        scheduleNextClip(900);
+        scheduleNextClip(650);
       }
     };
 
     try {
       recorder.start();
     } catch {
-      scheduleNextClip(500);
+      scheduleNextClip(350);
       return;
     }
 
-    // Monitor RMS speech energy via Web Audio AnalyserNode
+    // Fast 50ms RMS speech detector with 620ms silence endpointing for crisp face-to-face speed
     try {
       if (!vadCtxRef.current || vadCtxRef.current.state === "closed") {
         vadCtxRef.current = new AudioContext();
@@ -854,21 +912,21 @@ export function TranslateView({
           sum += buf[i] * buf[i];
         }
         const rms = Math.sqrt(sum / buf.length);
-        setAudioLevel((prev) => prev * 0.65 + Math.min(1, rms * 5.5) * 0.35);
+        setAudioLevel((prev) => prev * 0.55 + Math.min(1, rms * 6.0) * 0.45);
 
         const now = Date.now();
-        if (rms > 0.018) {
+        if (rms > 0.014) {
           voiceFrames += 1;
           lastSpeechAt = now;
-          if (voiceFrames >= 3 && !heardSpeech) {
+          if (voiceFrames >= 2 && !heardSpeech) {
             heardSpeech = true;
             setHandsFreePhase("hearing");
           }
         }
 
         if (
-          (heardSpeech && now - lastSpeechAt >= 1350) ||
-          (heardSpeech && now - clipStartedAt >= 18000)
+          (heardSpeech && now - lastSpeechAt >= 620) ||
+          (heardSpeech && now - clipStartedAt >= 15000)
         ) {
           if (vadRecorderRef.current.state === "recording") {
             vadRecorderRef.current.stop();
@@ -876,26 +934,86 @@ export function TranslateView({
           return;
         }
 
-        // Recycle quiet buffer every 10s so memory stays tiny
-        if (!heardSpeech && now - clipStartedAt >= 10000) {
+        // Recycle quiet buffer every 9s so memory stays tiny
+        if (!heardSpeech && now - clipStartedAt >= 9000) {
           silentRecycle = true;
           if (vadRecorderRef.current.state === "recording") {
             vadRecorderRef.current.stop();
           }
         }
-      }, 80);
+      }, 50);
     } catch {
-      // Fallback: 6-second auto turn if AudioContext fails
+      // Fallback: 5-second auto turn if AudioContext fails
       vadIntervalRef.current = window.setInterval(() => {
         if (vadRecorderRef.current?.state === "recording") {
           vadForceSendRef.current = true;
           vadRecorderRef.current.stop();
         }
-      }, 6000);
+      }, 5000);
     }
-  }, [speakEntryAudio, startKeepAliveAudio, stopSession, stopUnaryPlayback]);
+  }, [
+    onStudySessionComplete,
+    profile.id,
+    profile.voiceName,
+    speakEntryAudio,
+    startKeepAliveAudio,
+    stopSession,
+    stopUnaryPlayback,
+  ]);
 
-  // Start Real-Time Gemini Live Human Interpreter (with automatic Hands-Free HTTPS VAD fallback)
+  // Seamlessly switch to Turbo Hands-Free VAD without closing the microphone
+  const activateHandsFreeFallback = useCallback(
+    (notice?: string) => {
+      if (!mediaStreamRef.current) {
+        stopSession();
+        return;
+      }
+      if (rafRef.current !== null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      if (processorRef.current) {
+        processorRef.current.disconnect();
+        processorRef.current.onaudioprocess = null;
+        processorRef.current = null;
+      }
+      if (inputAudioCtxRef.current) {
+        void inputAudioCtxRef.current.close().catch(() => {});
+        inputAudioCtxRef.current = null;
+      }
+      if (playerRef.current) {
+        void playerRef.current.close();
+        playerRef.current = null;
+      }
+      if (wsRef.current) {
+        const oldWs = wsRef.current;
+        wsRef.current = null;
+        try {
+          oldWs.close();
+        } catch {
+          // ignore
+        }
+      }
+
+      setErrorMsg(null);
+      setTransport("handsfree-https");
+      setStatus("connected");
+      handsFreeActiveRef.current = true;
+      setInfoMsg(
+        notice ||
+          "Fast Hands-Free Interpreter active — listens to the other person, explains to you immediately, and translates your reply back in their exact language."
+      );
+      if (timerRef.current === null) {
+        timerRef.current = window.setInterval(() => {
+          setElapsedSeconds((s) => s + 1);
+        }, 1000);
+      }
+      startHandsFreeVadClip();
+    },
+    [startHandsFreeVadClip, stopSession]
+  );
+
+  // Start Real-Time Gemini Live Human Interpreter (with instant Turbo Hands-Free VAD auto-fallback)
   const startLiveInterpreter = useCallback(async () => {
     stopSession();
     setErrorMsg(null);
@@ -926,12 +1044,10 @@ export function TranslateView({
         if (lock) wakeLockRef.current = lock;
       });
 
-      await fetch("/api/health").catch(() => {});
-
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const wsUrl = `${protocol}//${window.location.host}/api/live`;
 
-      const openLiveWs = (attempt: number): Promise<WebSocket> =>
+      const openLiveWs = (): Promise<WebSocket> =>
         new Promise((resolve, reject) => {
           const socket = new WebSocket(wsUrl);
           let settled = false;
@@ -943,9 +1059,9 @@ export function TranslateView({
               } catch {
                 // ignore
               }
-              reject(new Error(`Timeout attempt ${attempt}`));
+              reject(new Error("WS connect timeout"));
             }
-          }, 7000);
+          }, 3500);
 
           socket.onopen = () => {
             if (!settled) {
@@ -958,39 +1074,21 @@ export function TranslateView({
             if (!settled) {
               settled = true;
               window.clearTimeout(timeoutId);
-              reject(new Error(`Error attempt ${attempt}`));
+              reject(new Error("WS connect error"));
             }
           };
         });
 
       let ws: WebSocket | null = null;
-      for (let attempt = 1; attempt <= 2; attempt += 1) {
-        try {
-          ws = await openLiveWs(attempt);
-          break;
-        } catch {
-          if (attempt < 2) {
-            await new Promise((r) => window.setTimeout(r, 500));
-          }
-        }
+      try {
+        ws = await openLiveWs();
+      } catch {
+        ws = null;
       }
 
-      // If WebSockets are blocked, seamlessly activate automatic Hands-Free HTTPS VAD loop (still zero stop clicks!)
+      // If WebSockets are unavailable, seamlessly activate Turbo Hands-Free VAD (zero clicks!)
       if (!ws) {
-        if (playerRef.current) {
-          void playerRef.current.close();
-          playerRef.current = null;
-        }
-        setTransport("handsfree-https");
-        setStatus("connected");
-        handsFreeActiveRef.current = true;
-        setInfoMsg(
-          "Hands-Free Auto Interpreter active — just speak naturally in any language; Jogi Jarvis listens, explains fast, and converts your reply back automatically."
-        );
-        timerRef.current = window.setInterval(() => {
-          setElapsedSeconds((s) => s + 1);
-        }, 1000);
-        startHandsFreeVadClip();
+        activateHandsFreeFallback();
         return;
       }
 
@@ -1004,7 +1102,10 @@ export function TranslateView({
           profile,
           voiceName: profile.voiceName,
           myLanguage: myLangRef.current,
-          otherLanguage: otherLangRef.current,
+          otherLanguage:
+            otherLangRef.current === "Auto-Detect" && lastDetectedOtherRef.current
+              ? lastDetectedOtherRef.current
+              : otherLangRef.current,
           sameLanguageReply: sameLangRef.current,
         })
       );
@@ -1020,6 +1121,19 @@ export function TranslateView({
 
           if (msg.type === "ready") {
             setStatus("connected");
+            if (turnModeRef.current !== "auto" && wsRef.current?.readyState === WebSocket.OPEN) {
+              wsRef.current.send(
+                JSON.stringify({
+                  type: "speaker_hint",
+                  side: turnModeRef.current,
+                  myLanguage: myLangRef.current,
+                  partnerLanguage:
+                    otherLangRef.current === "Auto-Detect"
+                      ? lastDetectedOtherRef.current || ""
+                      : otherLangRef.current,
+                })
+              );
+            }
             updateJarvisMediaSession({
               title: "Live Human Interpreter Active",
               artist: "Jogi Jarvis",
@@ -1033,7 +1147,8 @@ export function TranslateView({
             const inputCtx = new AudioContext({ sampleRate: 16000 });
             inputAudioCtxRef.current = inputCtx;
             const source = inputCtx.createMediaStreamSource(stream);
-            const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+            // 2048 samples @ 16kHz = 128ms chunks (2x faster streaming response)
+            const processor = inputCtx.createScriptProcessor(2048, 1, 1);
             processorRef.current = processor;
 
             processor.onaudioprocess = (e) => {
@@ -1106,20 +1221,12 @@ export function TranslateView({
           }
 
           if (msg.type === "error") {
-            setErrorMsg(
-              msg.message ||
-                "Live interpreter encountered a temporary connection issue."
-            );
-            // Automatically fall back to Hands-Free HTTPS VAD if Gemini Live errors out
+            // Automatically fall back to Turbo Hands-Free VAD instead of stopping the conversation!
             if (wsRef.current === ws) {
-              try {
-                ws.close();
-              } catch {
-                // ignore
-              }
-              wsRef.current = null;
+              activateHandsFreeFallback(
+                "Switched automatically to Fast Hands-Free Interpreter — keep speaking naturally without interruption."
+              );
             }
-            setStatus("error");
             return;
           }
 
@@ -1133,11 +1240,9 @@ export function TranslateView({
 
       ws.onerror = () => {
         if (wsRef.current === ws) {
-          setErrorMsg(
-            "Live interpreter connection interrupted. Tap Start Live Interpreter to reconnect."
+          activateHandsFreeFallback(
+            "Switched automatically to Fast Hands-Free Interpreter — keep speaking naturally."
           );
-          stopSession();
-          setStatus("error");
         }
       };
 
@@ -1153,7 +1258,69 @@ export function TranslateView({
       stopSession();
       setStatus("error");
     }
-  }, [appendLiveTranscript, profile, startHandsFreeVadClip, stopSession]);
+  }, [activateHandsFreeFallback, appendLiveTranscript, profile, stopSession]);
+
+  // Instant speaker-turn switch with zero-wait barge-in
+  const handleSelectTurnMode = useCallback(
+    (nextMode: TurnMode) => {
+      turnModeRef.current = nextMode;
+      setTurnMode(nextMode);
+      setErrorMsg(null);
+
+      // Interrupt any current speech immediately so the new speaker never waits
+      playerRef.current?.interrupt();
+      stopUnaryPlayback();
+      setIsJarvisSpeaking(false);
+
+      if (status === "idle" || status === "error") {
+        void startLiveInterpreter();
+        return;
+      }
+
+      if (
+        status === "connected" &&
+        transport === "live-ws" &&
+        wsRef.current &&
+        wsRef.current.readyState === WebSocket.OPEN
+      ) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: "speaker_hint",
+            side: nextMode,
+            myLanguage: myLangRef.current,
+            partnerLanguage:
+              otherLangRef.current === "Auto-Detect"
+                ? lastDetectedOtherRef.current || ""
+                : otherLangRef.current,
+          })
+        );
+        return;
+      }
+
+      if (status === "connected" && transport === "handsfree-https") {
+        if (
+          vadRecorderRef.current &&
+          vadRecorderRef.current.state === "recording" &&
+          handsFreePhase === "hearing"
+        ) {
+          vadForceSendRef.current = true;
+          vadRecorderRef.current.stop();
+        } else if (handsFreeActiveRef.current && handsFreePhase !== "interpreting") {
+          cleanupHandsFreeVad();
+          startHandsFreeVadClip();
+        }
+      }
+    },
+    [
+      cleanupHandsFreeVad,
+      handsFreePhase,
+      startHandsFreeVadClip,
+      startLiveInterpreter,
+      status,
+      stopUnaryPlayback,
+      transport,
+    ]
+  );
 
   // Clean up on unmount
   useEffect(() => {
@@ -1234,6 +1401,7 @@ export function TranslateView({
       let resolvedTargetLanguage = targetLang;
       let pronunciation = "";
       let suggestedReplies: string[] = [];
+      let inlineAudio: { base64: string; mimeType?: string } | null = null;
 
       if (!preferLocal) {
         try {
@@ -1247,6 +1415,9 @@ export function TranslateView({
               lastOtherLanguage: lastDetectedOtherLang,
               direction: "me_to_them",
               sameLanguageAnswer: sameLanguageReplyMode || isSameLanguage,
+              fastMode: true,
+              includeAudio: autoSpeakRef.current,
+              voiceName: profile.voiceName,
             }),
           });
           const data = (await res.json()) as {
@@ -1256,6 +1427,8 @@ export function TranslateView({
             translatedText?: string;
             pronunciation?: string;
             suggestedReplies?: string[];
+            audioBase64?: string;
+            audioMimeType?: string;
             error?: string;
           };
           if (res.ok && data.translatedText) {
@@ -1267,6 +1440,12 @@ export function TranslateView({
             suggestedReplies = Array.isArray(data.suggestedReplies)
               ? data.suggestedReplies
               : [];
+            if (data.audioBase64) {
+              inlineAudio = {
+                base64: data.audioBase64,
+                mimeType: data.audioMimeType || "audio/wav",
+              };
+            }
           }
         } catch {
           // Fall through to on-device Local LLM translation
@@ -1306,10 +1485,11 @@ export function TranslateView({
       const entry: InterpreterEntry = {
         id: `typed-${Date.now()}`,
         speaker: "interpreter",
+        speakerSide: "me",
         text: translatedText,
         secondaryText: originalText,
         pronunciation,
-        metaLabel: `${detectedLanguage} → ${resolvedTargetLanguage}`,
+        metaLabel: `You (${detectedLanguage}) → Spoken to Them (${resolvedTargetLanguage})`,
         targetLanguage: resolvedTargetLanguage,
         suggestedReplies,
         timestamp: nowTime,
@@ -1326,7 +1506,9 @@ export function TranslateView({
           entry.id,
           entry.text,
           entry.targetLanguage || effectiveOtherLanguage,
-          true
+          true,
+          undefined,
+          inlineAudio
         );
       } else {
         stopUnaryPlayback();
@@ -1355,26 +1537,44 @@ export function TranslateView({
   const ringScaleOuter = 1 + audioLevel * 0.25;
   const ringScaleMid = 1 + audioLevel * 0.14;
 
+  const activePartnerLabel = isOtherAuto
+    ? lastDetectedOtherLang || "Their Language"
+    : effectiveOtherLanguage;
+
   const liveStatusText =
     status === "connecting"
-      ? "Connecting Live Human Interpreter…"
+      ? "Connecting Fast Live Interpreter…"
       : status === "connected"
         ? transport === "handsfree-https"
           ? handsFreePhase === "hearing"
-            ? "Hearing voice — will explain automatically when they pause…"
+            ? turnMode === "me"
+              ? `Hearing you — translating to ${activePartnerLabel}…`
+              : turnMode === "them"
+                ? `Hearing them — explaining to you in ${effectiveMyLanguage}…`
+                : "Hearing speech — translating on pause…"
             : handsFreePhase === "interpreting"
-              ? `Interpreting into ${effectiveMyLanguage} / speaker's language…`
+              ? turnMode === "me"
+                ? `Translating your reply into ${activePartnerLabel}…`
+                : `Explaining fast into ${effectiveMyLanguage}…`
               : handsFreePhase === "speaking"
                 ? "Jarvis Interpreter is speaking…"
                 : isMuted
                   ? "Microphone muted"
-                  : `Auto-Listening (${isOtherAuto ? "Any Language" : effectiveOtherLanguage} ↔ ${effectiveMyLanguage})`
+                  : turnMode === "them"
+                    ? `Fast Listening to Them → Explain in ${effectiveMyLanguage}`
+                    : turnMode === "me"
+                      ? `Fast Listening to You → Speak in ${activePartnerLabel}`
+                      : `Fast Auto Two-Way (${activePartnerLabel} ↔ ${effectiveMyLanguage})`
           : isJarvisSpeaking
             ? "Jarvis Interpreter is speaking…"
             : isMuted
               ? "Microphone muted"
-              : `Live To-and-Fro Listening (${isOtherAuto ? "Any Language" : effectiveOtherLanguage} ↔ ${effectiveMyLanguage})`
-        : "Ready for instant to-and-fro human translation";
+              : turnMode === "them"
+                ? `Live Listening to Them → Explain in ${effectiveMyLanguage}`
+                : turnMode === "me"
+                  ? `Live Listening to You → Speak in ${activePartnerLabel}`
+                  : `Live Fast Two-Way (${activePartnerLabel} ↔ ${effectiveMyLanguage})`
+        : "Ready for instant face-to-face live translation";
 
   return (
     <div className="flex flex-col h-[calc(100vh-4rem)] max-w-5xl mx-auto w-full bg-[#F8FAFC]">
@@ -1541,17 +1741,37 @@ export function TranslateView({
           </div>
         </div>
 
-        {/* Same-Language Toggle & Detected Partner Language info */}
+        {/* Same-Language Toggle & Locked Partner Language Info */}
         <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
-          <p className="text-xs text-slate-500">
-            {isSameLanguage || sameLanguageReplyMode
-              ? `Same-Language Mode: Jarvis listens and replies directly in ${effectiveMyLanguage}.`
-              : isOtherAuto
-                ? lastDetectedOtherLang
-                  ? `Auto-Detect active · Last speaker language detected: ${lastDetectedOtherLang}`
-                  : `Auto-Detect active · Listens to any language, explains in ${effectiveMyLanguage}, and answers back in their language.`
-                : `To-and-Fro active · ${effectiveMyLanguage} ↔ ${effectiveOtherLanguage}`}
-          </p>
+          <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+            <span>
+              {isSameLanguage || sameLanguageReplyMode
+                ? `Same-Language Mode: Jarvis listens and replies directly in ${effectiveMyLanguage}.`
+                : isOtherAuto
+                  ? lastDetectedOtherLang
+                    ? `Auto-Detect locked to their language:`
+                    : `Auto-Detect active · Listens fast to any language, explains in ${effectiveMyLanguage}, and speaks your reply back in their exact language.`
+                  : `Two-Way active · ${effectiveMyLanguage} ↔ ${effectiveOtherLanguage}`}
+            </span>
+
+            {isOtherAuto && lastDetectedOtherLang && !sameLanguageReplyMode && (
+              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-teal-50 border border-teal-200 text-teal-800 font-semibold">
+                <span>{lastDetectedOtherLang}</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    lastDetectedOtherRef.current = "";
+                    setLastDetectedOtherLang("");
+                  }}
+                  title="Reset detected speaker language"
+                  aria-label="Reset detected speaker language"
+                  className="hover:text-teal-950"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </span>
+            )}
+          </div>
 
           {!isSameLanguage && (
             <button
@@ -1606,69 +1826,115 @@ export function TranslateView({
 
         {/* Active Live Interpreter Acoustic Header (stays cleanly visible when live) */}
         {(status === "connected" || status === "connecting") && (
-          <div className="bg-white border border-blue-200 rounded-2xl p-4 sm:p-5 flex flex-wrap items-center justify-between gap-4">
-            <div className="flex items-center gap-4 min-w-0">
-              <div className="relative h-14 w-14 flex items-center justify-center shrink-0">
-                <div
-                  style={{
-                    transform: `scale(${status === "connected" ? ringScaleOuter : 1})`,
-                    opacity: status === "connected" ? 0.22 + audioLevel * 0.45 : 0.12,
-                  }}
-                  className="absolute inset-0 rounded-full bg-blue-600 transition-transform duration-150 motion-reduce:transition-none"
-                />
-                <div
-                  style={{
-                    transform: `scale(${status === "connected" ? ringScaleMid : 1})`,
-                    opacity: status === "connected" ? 0.35 + audioLevel * 0.4 : 0.2,
-                  }}
-                  className="absolute inset-1.5 rounded-full bg-blue-700 transition-transform duration-150 motion-reduce:transition-none"
-                />
-                <div
-                  className={`relative h-10 w-10 rounded-full flex items-center justify-center ${
-                    isJarvisSpeaking
-                      ? "bg-blue-700 text-white"
-                      : isMuted
-                        ? "bg-slate-200 text-slate-600"
-                        : "bg-slate-900 text-white"
-                  }`}
-                >
-                  {status === "connecting" || handsFreePhase === "interpreting" ? (
-                    <Loader2 className="h-5 w-5 animate-spin text-white" />
-                  ) : isJarvisSpeaking ? (
-                    <Volume2 className="h-5 w-5" />
-                  ) : isMuted ? (
-                    <MicOff className="h-5 w-5" />
-                  ) : (
-                    <Mic className="h-5 w-5" />
-                  )}
+          <div className="bg-white border border-blue-200 rounded-2xl p-4 sm:p-5 space-y-3.5">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div className="flex items-center gap-4 min-w-0">
+                <div className="relative h-14 w-14 flex items-center justify-center shrink-0">
+                  <div
+                    style={{
+                      transform: `scale(${status === "connected" ? ringScaleOuter : 1})`,
+                      opacity: status === "connected" ? 0.22 + audioLevel * 0.45 : 0.12,
+                    }}
+                    className={`absolute inset-0 rounded-full transition-transform duration-100 motion-reduce:transition-none ${
+                      turnMode === "them" ? "bg-teal-600" : "bg-blue-600"
+                    }`}
+                  />
+                  <div
+                    style={{
+                      transform: `scale(${status === "connected" ? ringScaleMid : 1})`,
+                      opacity: status === "connected" ? 0.35 + audioLevel * 0.4 : 0.2,
+                    }}
+                    className={`absolute inset-1.5 rounded-full transition-transform duration-100 motion-reduce:transition-none ${
+                      turnMode === "them" ? "bg-teal-700" : "bg-blue-700"
+                    }`}
+                  />
+                  <div
+                    className={`relative h-10 w-10 rounded-full flex items-center justify-center ${
+                      isJarvisSpeaking
+                        ? "bg-blue-700 text-white"
+                        : isMuted
+                          ? "bg-slate-200 text-slate-600"
+                          : turnMode === "them"
+                            ? "bg-teal-700 text-white"
+                            : "bg-slate-900 text-white"
+                    }`}
+                  >
+                    {status === "connecting" || handsFreePhase === "interpreting" ? (
+                      <Loader2 className="h-5 w-5 animate-spin text-white" />
+                    ) : isJarvisSpeaking ? (
+                      <Volume2 className="h-5 w-5" />
+                    ) : isMuted ? (
+                      <MicOff className="h-5 w-5" />
+                    ) : (
+                      <Mic className="h-5 w-5" />
+                    )}
+                  </div>
+                </div>
+
+                <div className="min-w-0">
+                  <p className="text-sm sm:text-base font-semibold text-slate-950 truncate">
+                    {liveStatusText}
+                  </p>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Listens to the other person, explains fast to you in {effectiveMyLanguage}, and speaks your reply back in{" "}
+                    <strong className="text-slate-700">{activePartnerLabel}</strong>.
+                  </p>
                 </div>
               </div>
 
-              <div className="min-w-0">
-                <p className="text-sm sm:text-base font-semibold text-slate-950 truncate">
-                  {liveStatusText}
-                </p>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  No need to click anything — just let the other person speak, hear Jarvis explain in {effectiveMyLanguage}, and answer back naturally.
-                </p>
-              </div>
+              {transport === "handsfree-https" && handsFreePhase === "hearing" && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    vadForceSendRef.current = true;
+                    if (vadRecorderRef.current?.state === "recording") {
+                      vadRecorderRef.current.stop();
+                    }
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold min-h-[40px] whitespace-nowrap shrink-0"
+                >
+                  <Send className="h-3.5 w-3.5" />
+                  <span>Translate Now</span>
+                </button>
+              )}
             </div>
 
-            {transport === "handsfree-https" && handsFreePhase === "hearing" && (
+            {/* Instant Face-to-Face Turn Controls (zero-wait barge-in) */}
+            <div className="grid grid-cols-3 gap-2 pt-2 border-t border-slate-100">
               <button
                 type="button"
-                onClick={() => {
-                  vadForceSendRef.current = true;
-                  if (vadRecorderRef.current?.state === "recording") {
-                    vadRecorderRef.current.stop();
-                  }
-                }}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold min-h-[40px] whitespace-nowrap shrink-0"
+                onClick={() => handleSelectTurnMode("auto")}
+                className={`px-3 py-2.5 rounded-xl text-xs font-semibold border transition-colors min-h-[42px] text-center ${
+                  turnMode === "auto"
+                    ? "bg-slate-900 border-slate-900 text-white"
+                    : "bg-slate-50 hover:bg-slate-100 border-slate-200 text-slate-700"
+                }`}
               >
-                <Send className="h-3.5 w-3.5" />
-                <span>Translate Now</span>
+                Auto Two-Way
               </button>
-            )}
+              <button
+                type="button"
+                onClick={() => handleSelectTurnMode("them")}
+                className={`px-3 py-2.5 rounded-xl text-xs font-semibold border transition-colors min-h-[42px] text-center ${
+                  turnMode === "them"
+                    ? "bg-teal-700 border-teal-700 text-white"
+                    : "bg-teal-50/70 hover:bg-teal-50 border-teal-200 text-teal-900"
+                }`}
+              >
+                Listen to Them → {effectiveMyLanguage}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSelectTurnMode("me")}
+                className={`px-3 py-2.5 rounded-xl text-xs font-semibold border transition-colors min-h-[42px] text-center ${
+                  turnMode === "me"
+                    ? "bg-blue-700 border-blue-700 text-white"
+                    : "bg-blue-50/70 hover:bg-blue-50 border-blue-200 text-blue-900"
+                }`}
+              >
+                I&apos;m Speaking → {activePartnerLabel}
+              </button>
+            </div>
           </div>
         )}
 
@@ -1681,43 +1947,50 @@ export function TranslateView({
 
             <div className="space-y-2">
               <h2 className="font-display text-xl font-bold text-slate-950">
-                Instant To-and-Fro Human Translator
+                Fast Two-Way Live Conversation Translator
               </h2>
               <p className="text-sm text-slate-600 max-w-lg mx-auto leading-relaxed">
-                Tap <strong>Start Live Interpreter</strong> once — no record or stop clicks needed. Jogi Jarvis listens live in{" "}
-                <strong>{isOtherAuto ? "any world language" : effectiveOtherLanguage}</strong>, explains quickly to you in{" "}
-                <strong>{effectiveMyLanguage}</strong>, asks for your answer, and speaks your reply straight back to them in their language.
+                Tap <strong>Start Live Interpreter</strong> once. Jarvis listens fast to the other person in{" "}
+                <strong>{isOtherAuto ? "any language" : effectiveOtherLanguage}</strong>, explains straight to you in{" "}
+                <strong>{effectiveMyLanguage}</strong>, and when you reply, translates and speaks back in the exact same language they spoke.
               </p>
             </div>
 
-            <div className="flex justify-center">
+            <div className="flex flex-wrap justify-center gap-2.5">
               <button
                 type="button"
-                onClick={() => void startLiveInterpreter()}
+                onClick={() => handleSelectTurnMode("auto")}
                 className="inline-flex items-center gap-2.5 px-7 py-3.5 rounded-xl bg-blue-700 hover:bg-blue-800 text-white text-sm sm:text-base font-semibold transition-colors min-h-[52px]"
               >
                 <Mic className="h-5 w-5" />
-                <span>Start Live Interpreter (To &amp; Fro)</span>
+                <span>Start Fast Auto Interpreter</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSelectTurnMode("them")}
+                className="inline-flex items-center gap-2 px-5 py-3.5 rounded-xl bg-teal-50 hover:bg-teal-100 border border-teal-200 text-teal-900 text-sm font-semibold transition-colors min-h-[52px]"
+              >
+                <span>Listen to Them First</span>
               </button>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-left pt-2 border-t border-slate-100">
               <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/80 space-y-1">
-                <p className="text-xs font-bold text-blue-700">1. Listen Live</p>
+                <p className="text-xs font-bold text-teal-700">1. Fast Listen</p>
                 <p className="text-xs text-slate-600 leading-relaxed">
-                  Anyone speaks in any language — Jarvis hears them automatically without tapping stop.
+                  Hears the other person immediately and locks their exact language automatically.
                 </p>
               </div>
               <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/80 space-y-1">
-                <p className="text-xs font-bold text-teal-700">2. Explain Fast</p>
+                <p className="text-xs font-bold text-blue-700">2. Direct Explain</p>
                 <p className="text-xs text-slate-600 leading-relaxed">
-                  Jarvis explains clearly in {effectiveMyLanguage} and asks what you want to reply.
+                  Explains clearly to you in {effectiveMyLanguage} with zero filler or delay.
                 </p>
               </div>
               <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/80 space-y-1">
-                <p className="text-xs font-bold text-slate-900">3. Answer Them</p>
+                <p className="text-xs font-bold text-slate-900">3. Reply in Their Language</p>
                 <p className="text-xs text-slate-600 leading-relaxed">
-                  You answer in {effectiveMyLanguage} (or say &ldquo;tell them…&rdquo;) and Jarvis speaks to them in their language.
+                  Speak naturally in {effectiveMyLanguage} and Jarvis speaks back in the exact same language they used.
                 </p>
               </div>
             </div>
@@ -1745,6 +2018,7 @@ export function TranslateView({
         {/* Conversation Transcript Cards */}
         {entries.map((entry) => {
           const isInterpreter = entry.speaker === "interpreter";
+          const isOtherPersonTurn = entry.speakerSide === "them";
           const isSpeaking = speakingEntryId === entry.id;
           const isLoadingAudio = loadingAudioId === entry.id;
 
@@ -1752,13 +2026,19 @@ export function TranslateView({
             <div
               key={entry.id}
               className={`flex flex-col ${
-                isInterpreter ? "items-start" : "items-end"
+                isInterpreter && !isOtherPersonTurn
+                  ? "items-end"
+                  : isInterpreter
+                    ? "items-start"
+                    : "items-end"
               }`}
             >
               <div
                 className={`w-full max-w-2xl rounded-2xl border p-4 sm:p-5 space-y-2.5 ${
                   isInterpreter
-                    ? "bg-white border-blue-200"
+                    ? isOtherPersonTurn
+                      ? "bg-white border-teal-200"
+                      : "bg-white border-blue-200"
                     : "bg-slate-50 border-slate-200"
                 }`}
               >
@@ -1766,7 +2046,11 @@ export function TranslateView({
                   <div className="flex items-center gap-1.5 flex-wrap">
                     <span
                       className={`font-semibold ${
-                        isInterpreter ? "text-blue-700" : "text-slate-700"
+                        isInterpreter
+                          ? isOtherPersonTurn
+                            ? "text-teal-700"
+                            : "text-blue-700"
+                          : "text-slate-700"
                       }`}
                     >
                       {entry.metaLabel ||
@@ -1934,14 +2218,38 @@ export function TranslateView({
           </button>
         </form>
 
-        {/* Primary Live To-and-Fro Session Controls */}
-        <div className="flex items-center justify-center gap-3 flex-wrap">
+        {/* Primary Live Two-Way Session Controls */}
+        <div className="flex items-center justify-center gap-2 sm:gap-3 flex-wrap">
           {status === "connected" || status === "connecting" ? (
             <>
               <button
                 type="button"
+                onClick={() => handleSelectTurnMode("them")}
+                className={`inline-flex items-center justify-center gap-1.5 px-4 py-3 rounded-xl text-xs sm:text-sm font-semibold border transition-colors min-h-[48px] whitespace-nowrap ${
+                  turnMode === "them"
+                    ? "bg-teal-700 border-teal-700 text-white"
+                    : "bg-teal-50 hover:bg-teal-100 border-teal-200 text-teal-900"
+                }`}
+              >
+                <span>Listen to Them</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleSelectTurnMode("me")}
+                className={`inline-flex items-center justify-center gap-1.5 px-4 py-3 rounded-xl text-xs sm:text-sm font-semibold border transition-colors min-h-[48px] whitespace-nowrap ${
+                  turnMode === "me"
+                    ? "bg-blue-700 border-blue-700 text-white"
+                    : "bg-blue-50 hover:bg-blue-100 border-blue-200 text-blue-900"
+                }`}
+              >
+                <span>Reply → {activePartnerLabel}</span>
+              </button>
+
+              <button
+                type="button"
                 onClick={() => setIsMuted((m) => !m)}
-                className={`inline-flex items-center justify-center gap-2 px-5 py-3 rounded-xl text-sm font-semibold border transition-colors min-h-[48px] whitespace-nowrap ${
+                className={`inline-flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-xs sm:text-sm font-semibold border transition-colors min-h-[48px] whitespace-nowrap ${
                   isMuted
                     ? "bg-amber-50 border-amber-300 text-amber-900"
                     : "bg-slate-100 hover:bg-slate-200 border-slate-200 text-slate-900"
@@ -1952,28 +2260,28 @@ export function TranslateView({
                 ) : (
                   <Mic className="h-4 w-4" />
                 )}
-                <span>{isMuted ? "Unmute Mic" : "Mute Mic"}</span>
+                <span>{isMuted ? "Unmute" : "Mute"}</span>
               </button>
 
               <button
                 type="button"
                 onClick={stopSession}
-                className="inline-flex items-center justify-center gap-2 px-6 py-3 rounded-xl bg-red-600 hover:bg-red-700 text-white text-sm font-semibold transition-colors min-h-[48px] whitespace-nowrap"
+                className="inline-flex items-center justify-center gap-2 px-5 py-3 rounded-xl bg-red-600 hover:bg-red-700 text-white text-xs sm:text-sm font-semibold transition-colors min-h-[48px] whitespace-nowrap"
               >
                 <PhoneOff className="h-4 w-4" />
-                <span>End Live Interpreter</span>
+                <span>End</span>
               </button>
             </>
           ) : (
             <button
               type="button"
-              onClick={() => void startLiveInterpreter()}
+              onClick={() => handleSelectTurnMode("auto")}
               className="w-full sm:w-auto inline-flex items-center justify-center gap-2.5 px-8 py-3.5 rounded-xl bg-blue-700 hover:bg-blue-800 text-white text-sm sm:text-base font-semibold transition-colors min-h-[52px] whitespace-nowrap"
             >
               <Mic className="h-5 w-5" />
               <span>
-                Start Live To-and-Fro Interpreter ({effectiveMyLanguage} ↔{" "}
-                {isOtherAuto ? "Any Language" : effectiveOtherLanguage})
+                Start Fast Live Interpreter ({effectiveMyLanguage} ↔{" "}
+                {activePartnerLabel})
               </span>
             </button>
           )}

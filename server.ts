@@ -2003,7 +2003,7 @@ async function startServer() {
     }
   });
 
-  // 3c. Live Voice & Face-to-Face Human Interpreter Endpoint (Any Language / Any Country + Same-Language Reply Mode)
+  // 3c. Ultra-Fast Live Voice & Face-to-Face Human Interpreter Endpoint (Single-Shot Multimodal + Inline Fast TTS)
   app.post("/api/translate/conversation", async (req, res) => {
     try {
       const {
@@ -2016,6 +2016,9 @@ async function startServer() {
         direction = "auto_conversation",
         sameLanguageAnswer = false,
         recentContext = [],
+        fastMode = true,
+        includeAudio = false,
+        voiceName = "Kore",
       } = req.body as {
         audioBase64?: string;
         audioMimeType?: string;
@@ -2026,6 +2029,9 @@ async function startServer() {
         direction?: "me_to_them" | "them_to_me" | "auto_conversation" | "listen_any";
         sameLanguageAnswer?: boolean;
         recentContext?: Array<{ originalText: string; translatedText: string }>;
+        fastMode?: boolean;
+        includeAudio?: boolean;
+        voiceName?: string;
       };
 
       const cleanMyLang = (myLanguage || "English").trim() || "English";
@@ -2043,144 +2049,74 @@ async function startServer() {
         direction !== "listen_any" &&
         (Boolean(sameLanguageAnswer) || isSameLanguageSelected);
 
-      let spokenText = (text || "").trim();
-
-      // Step 1: Transcribe live voice audio accurately across ANY language/country
-      if (!spokenText && audioBase64) {
-        const ai = getAiClient();
-        const transcribeParts = [
-          {
-            inlineData: {
-              mimeType: audioMimeType,
-              data: audioBase64,
-            },
-          },
-          {
-            text: "Automatically detect the exact spoken language (any world language, regional Indian language, or dialect) and transcribe this audio faithfully in its natural native script without translating. Return ONLY the clean spoken transcript. If there is only silence, breathing, or background noise with no intelligible speech, return an empty string.",
-          },
-        ];
-
-        try {
-          const transcribeRes = await withRetry(
-            () =>
-              ai.models.generateContent({
-                model: "gemini-3.5-transcribe",
-                contents: { parts: transcribeParts },
-              }),
-            2
-          );
-          spokenText = (transcribeRes.text || "").trim();
-        } catch {
-          const { response: fallbackAudioRes } =
-            await generateGeminiTextWithFallback(
-              ai,
-              [{ role: "user", parts: transcribeParts }],
-              () => ({
-                systemInstruction:
-                  "You are an accurate multilingual speech transcriber. Output only the clean spoken words in their original language, or empty string if only noise.",
-              })
-            );
-          spokenText = (fallbackAudioRes.text || "").trim();
-        }
-      }
-
-      const cleanedNoiseCheck = spokenText
-        .replace(/^\[.*\]$/g, "")
-        .replace(/[.!?,…\s]+/g, "")
-        .trim();
-
-      if (!cleanedNoiseCheck) {
-        return res.json({ empty: true });
-      }
-
       const contextLines = Array.isArray(recentContext)
         ? recentContext
-            .slice(-5)
+            .slice(-4)
             .map(
               (c, i) =>
-                `Turn ${i + 1}: "${(c.originalText || "").slice(0, 160)}" -> "${(c.translatedText || "").slice(0, 160)}"`
+                `Turn ${i + 1}: "${(c.originalText || "").slice(0, 120)}" -> "${(c.translatedText || "").slice(0, 120)}"`
             )
             .join("\n")
         : "";
 
       const systemInstruction =
-        "You are Jogi Jarvis, an elite real-time human interpreter sitting right next to the user, supporting every country and language on Earth (including English, Odia, Hindi, Tamil, Telugu, Bengali, Marathi, Arabic, Spanish, French, German, Chinese, Japanese, Korean, Russian, Thai, Swahili, and all regional dialects). Work strictly like a fast, warm, intelligent human interpreter—never robotic or stiff.";
+        "You are Jogi Jarvis, an ultra-fast real-time face-to-face human interpreter supporting every world language and dialect. Be brisk, accurate, and natural — zero robotic preamble and zero filler questions so live conversations flow effortlessly.";
 
       let taskInstructions = "";
       if (useSameLangReply) {
         taskInstructions = [
-          `SAME-LANGUAGE CONVERSATION MODE: Both sides are speaking ${cleanMyLang}.`,
-          `1. Detect the spoken language (detectedLanguage).`,
-          `2. Set targetLanguage to "${cleanMyLang}".`,
-          `3. Write a warm, natural, helpful conversational reply in ${cleanMyLang} inside translatedText (2 to 3 concise spoken sentences ready to speak aloud).`,
-          `4. Set speakerSide to "${direction === "them_to_me" ? "them" : "me"}".`,
-          `5. Provide 2 short natural follow-up phrases in ${cleanMyLang} inside suggestedReplies.`,
-          `6. Leave pronunciation as "".`,
+          `SAME-LANGUAGE MODE (${cleanMyLang}):`,
+          `1. Detect spoken language (detectedLanguage). Set targetLanguage="${cleanMyLang}".`,
+          `2. Give a natural, brisk reply in ${cleanMyLang} inside translatedText (1-2 short sentences).`,
+          `3. Set speakerSide="${direction === "them_to_me" ? "them" : "me"}", pronunciation="".`,
+          `4. Provide 2 very short follow-up phrases in ${cleanMyLang} inside suggestedReplies.`,
         ].join("\n");
-      } else if (direction === "listen_any") {
+      } else if (direction === "listen_any" || direction === "them_to_me") {
         taskInstructions = [
-          `HUMAN INTERPRETER LISTEN & EXPLAIN MODE: Auto-detect whatever language was spoken and explain it naturally and clearly to the user in ${cleanMyLang}.`,
-          `1. Identify the exact spoken language in detectedLanguage.`,
-          `2. Set targetLanguage to "${cleanMyLang}".`,
-          `3. Explain what was just said/asked naturally and clearly in ${cleanMyLang} inside translatedText, then briefly ask in ${cleanMyLang} how the user wants to reply (e.g. "What would you like to reply?").`,
-          `4. Set speakerSide to "them".`,
-          `5. Provide 2 short reply options in ${cleanMyLang} inside suggestedReplies.`,
-          `6. Leave pronunciation as "".`,
+          `OTHER PERSON -> EXPLAIN TO USER MODE: Another person is speaking${effectivePartnerLang ? ` (likely ${effectivePartnerLang})` : " in any world language"} and the user understands ${cleanMyLang}.`,
+          `1. Identify their exact spoken language in detectedLanguage (e.g. "Spanish", "Hindi", "Odia", "Tamil", "Arabic").`,
+          `2. Set speakerSide="them" and targetLanguage="${cleanMyLang}".`,
+          `3. Put a crisp, clear, natural explanation of what they just said or asked in ${cleanMyLang} inside translatedText. Keep it direct and concise so the user understands immediately — DO NOT add filler like "What would you like to reply?" or "The person said".`,
+          `4. Provide 2 short natural reply options in ${cleanMyLang} inside suggestedReplies. Set pronunciation="".`,
         ].join("\n");
       } else if (direction === "me_to_them") {
         const destLang = effectivePartnerLang || "Hindi";
         taskInstructions = [
-          `HUMAN INTERPRETER (USER -> SPEAKER): The user is speaking in ${cleanMyLang} and wants you to speak directly to the other person in ${destLang} (or another language if the user explicitly named one like "tell them in Arabic").`,
-          `1. Identify the spoken language in detectedLanguage.`,
-          `2. Set targetLanguage to the language explicitly named by the user, or "${destLang}" if none named.`,
-          `3. Strip any meta-commands like "tell them", "answer them in their language", or "say to them", and speak the actual message politely, warmly, and directly to the other person in targetLanguage inside translatedText.`,
-          `4. Set speakerSide to "me".`,
-          `5. Provide 2 short follow-up phrases in ${cleanMyLang} inside suggestedReplies.`,
-          `6. If targetLanguage uses a non-Latin script, put an easy Latin pronunciation hint in pronunciation; otherwise "".`,
-        ].join("\n");
-      } else if (direction === "them_to_me") {
-        taskInstructions = [
-          `HUMAN INTERPRETER (SPEAKER -> USER): The other person is speaking in ${effectivePartnerLang || "another language"} and the user understands ${cleanMyLang}.`,
-          `1. Identify the exact spoken language in detectedLanguage.`,
-          `2. Set targetLanguage to "${cleanMyLang}".`,
-          `3. Explain clearly and naturally in ${cleanMyLang} what they just said or asked inside translatedText, and end with a brief natural prompt asking how the user wants to respond.`,
-          `4. Set speakerSide to "them".`,
-          `5. Provide 2 short helpful reply suggestions in ${cleanMyLang} inside suggestedReplies.`,
-          `6. Leave pronunciation as "".`,
+          `USER -> TRANSLATE TO OTHER PERSON MODE: The user is speaking in ${cleanMyLang} and needs you to translate directly for the other person in "${destLang}" (or another language ONLY if the user explicitly names one like "in Arabic").`,
+          `1. Set detectedLanguage="${cleanMyLang}" (or the language spoken), speakerSide="me".`,
+          `2. Set targetLanguage to the language explicitly named by the user, otherwise "${destLang}".`,
+          `3. Strip meta-commands like "tell them", "say to them", "answer them", and put the direct, natural, polite spoken translation in targetLanguage inside translatedText — ZERO extra commentary.`,
+          `4. If targetLanguage uses a non-Latin script, include a brief Latin pronunciation hint in pronunciation; otherwise "".`,
+          `5. Provide 2 very short follow-up phrases in ${cleanMyLang} inside suggestedReplies.`,
         ].join("\n");
       } else {
         const partnerHint = effectivePartnerLang
-          ? `The other speaker's language is currently "${effectivePartnerLang}".`
-          : `The other speaker's language is Auto-Detect (any world language other than ${cleanMyLang}).`;
+          ? `The other person's locked language is "${effectivePartnerLang}".`
+          : `The other person's language is Auto-Detect (any world language different from ${cleanMyLang}).`;
         taskInstructions = [
-          `LIVE TO-AND-FRO HUMAN INTERPRETER MODE: User's language is "${cleanMyLang}". ${partnerHint}`,
-          `1. Detect the exact spoken language in detectedLanguage.`,
-          `2. CASE A — The speaker spoke in ANY language DIFFERENT from ${cleanMyLang}:`,
-          `   - Set speakerSide = "them", targetLanguage = "${cleanMyLang}".`,
-          `   - Explain quickly, clearly, and naturally in ${cleanMyLang} what they just said or asked (like a human interpreter right beside the user), and briefly ask what the user wants to answer back (e.g. "How would you like to reply?").`,
-          `3. CASE B — The user spoke in ${cleanMyLang}:`,
-          `   - Check if they named a language (e.g. "answer in Arabic", "tell them in Spanish") OR want to reply to the other speaker (${effectivePartnerLang || "last detected speaker language"}).`,
-          `   - If a target language is named OR ${effectivePartnerLang ? `"${effectivePartnerLang}" is known` : "a partner language exists from recent conversation context"}: set speakerSide = "me", set targetLanguage to that partner/named language, strip meta-instructions like "tell them" or "answer in their language", and put the natural, polite direct response spoken to the other person inside translatedText.`,
-          `   - Otherwise (if nobody else has spoken yet and no target language was named): set speakerSide = "me", targetLanguage = "${cleanMyLang}", and answer warmly in ${cleanMyLang}.`,
-          `4. Provide 2 short natural reply suggestions in ${cleanMyLang} inside suggestedReplies.`,
-          `5. If targetLanguage uses a non-Latin script and differs from ${cleanMyLang}, include an easy Latin pronunciation guide in pronunciation; otherwise "".`,
+          `FAST TWO-WAY FACE-TO-FACE INTERPRETER MODE: User's language is "${cleanMyLang}". ${partnerHint}`,
+          `1. Identify the exact spoken language in detectedLanguage.`,
+          `2. CASE A — The speech is in ANY language DIFFERENT from ${cleanMyLang}:`,
+          `   - Set speakerSide="them", targetLanguage="${cleanMyLang}".`,
+          `   - Explain clearly and concisely in ${cleanMyLang} what they just said or asked inside translatedText (direct human explanation, NO robotic preamble and NO trailing "What would you like to reply?" filler).`,
+          `3. CASE B — The speech is in ${cleanMyLang} (the user is speaking):`,
+          `   - Set speakerSide="me".`,
+          `   - Set targetLanguage to the language explicitly named by the user OR "${effectivePartnerLang || "the exact language the other person spoke in recent context"}".`,
+          `   - Strip meta-commands like "tell them", "answer them", "say that", and put the direct, natural spoken translation in targetLanguage inside translatedText.`,
+          `   - Only if NO other person has spoken yet and NO target language was named: set targetLanguage="${cleanMyLang}" and give a 1-sentence confirmation in ${cleanMyLang} that you are listening for the other person.`,
+          `4. Provide 2 very short reply hints in ${cleanMyLang} inside suggestedReplies.`,
+          `5. If targetLanguage uses a non-Latin script and differs from ${cleanMyLang}, add a short Latin pronunciation hint; otherwise "".`,
         ].join("\n");
       }
 
-      const userPrompt = [
-        taskInstructions,
-        contextLines ? `\nRecent conversation context:\n${contextLines}` : "",
-        `\nSpoken input to process:\n"${spokenText}"`,
-      ]
-        .filter(Boolean)
-        .join("\n");
-
       const schemaHint =
-        '{"detectedLanguage":"string","targetLanguage":"string","translatedText":"string","pronunciation":"string","speakerSide":"me|them","suggestedReplies":["string","string"]}';
+        '{"empty":false,"originalText":"string","detectedLanguage":"string","targetLanguage":"string","translatedText":"string","pronunciation":"string","speakerSide":"me|them","suggestedReplies":["string","string"]}';
 
       const responseSchema = {
         type: Type.OBJECT,
         properties: {
+          empty: { type: Type.BOOLEAN },
+          originalText: { type: Type.STRING },
           detectedLanguage: { type: Type.STRING },
           targetLanguage: { type: Type.STRING },
           translatedText: { type: Type.STRING },
@@ -2200,6 +2136,8 @@ async function startServer() {
       };
 
       type TranslationResult = {
+        empty?: boolean;
+        originalText?: string;
         detectedLanguage?: string;
         targetLanguage?: string;
         translatedText?: string;
@@ -2208,38 +2146,172 @@ async function startServer() {
         suggestedReplies?: string[];
       };
 
-      let parsed: TranslationResult;
-      if (!hasGeminiKey() && hasAnyFallbackProvider()) {
-        parsed = await callFallbackPoolJson<TranslationResult>(
-          systemInstruction,
-          userPrompt,
-          schemaHint
-        );
-      } else {
+      let spokenText = (text || "").trim();
+      let parsed: TranslationResult | null = null;
+
+      // FAST PATH (1 single round-trip!): Audio -> Transcribe + Detect + Explain/Translate in ONE shot using gemini-3.1-flash-lite (zero-thinking MINIMAL)
+      if (!spokenText && audioBase64 && hasGeminiKey() && fastMode) {
         try {
           const ai = getAiClient();
-          const { response } = await generateGeminiTextWithFallback(
-            ai,
-            userPrompt,
-            (model) => ({
+          const oneShotPrompt = [
+            taskInstructions,
+            contextLines ? `\nRecent turns:\n${contextLines}` : "",
+            `\nListen to the attached audio clip:`,
+            `- If it is only silence, breathing, or background noise with no clear speech, return {"empty":true,"originalText":"","detectedLanguage":"","targetLanguage":"","translatedText":"","pronunciation":"","speakerSide":"them","suggestedReplies":[]}.`,
+            `- Otherwise, put the faithful original spoken transcript in its native script in originalText, and complete the JSON response immediately.`,
+          ]
+            .filter(Boolean)
+            .join("\n");
+
+          const oneShotRes = await ai.models.generateContent({
+            model: "gemini-3.1-flash-lite",
+            contents: {
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: audioMimeType,
+                    data: audioBase64,
+                  },
+                },
+                { text: oneShotPrompt },
+              ],
+            },
+            config: {
               systemInstruction,
-              ...(model === "gemini-4-hydrogen"
-                ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-                : {}),
+              thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
               responseMimeType: "application/json",
               responseSchema,
-            })
+            },
+          });
+
+          const candidate = parseJsonFromText<TranslationResult>(
+            oneShotRes.text || "{}"
           );
-          parsed = parseJsonFromText<TranslationResult>(response.text || "{}");
-        } catch (geminiErr) {
-          if (hasAnyFallbackProvider()) {
-            parsed = await callFallbackPoolJson<TranslationResult>(
-              systemInstruction,
-              userPrompt,
-              schemaHint
+          if (candidate?.empty) {
+            return res.json({ empty: true });
+          }
+          if (candidate?.translatedText && candidate.translatedText.trim()) {
+            parsed = candidate;
+            spokenText = (candidate.originalText || "").trim();
+          }
+        } catch (oneShotErr) {
+          console.warn(
+            "[Fast Translate One-Shot] Falling back to 2-step pipeline:",
+            oneShotErr instanceof Error ? oneShotErr.message : oneShotErr
+          );
+        }
+      }
+
+      // Standard fallback pipeline if text was provided or one-shot audio wasn't used
+      if (!parsed) {
+        if (!spokenText && audioBase64) {
+          const ai = getAiClient();
+          const transcribeParts = [
+            {
+              inlineData: {
+                mimeType: audioMimeType,
+                data: audioBase64,
+              },
+            },
+            {
+              text: "Automatically detect the exact spoken language (any world language or dialect) and transcribe this audio faithfully in its natural native script without translating. Return ONLY the clean spoken transcript. If there is only silence or background noise, return an empty string.",
+            },
+          ];
+
+          try {
+            const transcribeRes = await withRetry(
+              () =>
+                ai.models.generateContent({
+                  model: "gemini-3.5-transcribe",
+                  contents: { parts: transcribeParts },
+                }),
+              2
             );
-          } else {
-            throw geminiErr;
+            spokenText = (transcribeRes.text || "").trim();
+          } catch {
+            const { response: fallbackAudioRes } =
+              await generateGeminiTextWithFallback(
+                ai,
+                [{ role: "user", parts: transcribeParts }],
+                () => ({
+                  systemInstruction:
+                    "You are an accurate multilingual speech transcriber. Output only the clean spoken words in their original language, or empty string if only noise.",
+                })
+              );
+            spokenText = (fallbackAudioRes.text || "").trim();
+          }
+        }
+
+        const cleanedNoiseCheck = spokenText
+          .replace(/^\[.*\]$/g, "")
+          .replace(/[.!?,…\s]+/g, "")
+          .trim();
+
+        if (!cleanedNoiseCheck) {
+          return res.json({ empty: true });
+        }
+
+        const userPrompt = [
+          taskInstructions,
+          contextLines ? `\nRecent conversation context:\n${contextLines}` : "",
+          `\nSpoken input to process:\n"${spokenText}"`,
+        ]
+          .filter(Boolean)
+          .join("\n");
+
+        if (!hasGeminiKey() && hasAnyFallbackProvider()) {
+          parsed = await callFallbackPoolJson<TranslationResult>(
+            systemInstruction,
+            userPrompt,
+            schemaHint
+          );
+        } else {
+          try {
+            const ai = getAiClient();
+            if (fastMode) {
+              try {
+                const fastTextRes = await ai.models.generateContent({
+                  model: "gemini-3.1-flash-lite",
+                  contents: userPrompt,
+                  config: {
+                    systemInstruction,
+                    thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+                    responseMimeType: "application/json",
+                    responseSchema,
+                  },
+                });
+                parsed = parseJsonFromText<TranslationResult>(
+                  fastTextRes.text || "{}"
+                );
+              } catch {
+                // Fall through to standard Gemini fallback
+              }
+            }
+            if (!parsed?.translatedText) {
+              const { response } = await generateGeminiTextWithFallback(
+                ai,
+                userPrompt,
+                (model) => ({
+                  systemInstruction,
+                  ...(model === "gemini-4-hydrogen"
+                    ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                    : { thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL } }),
+                  responseMimeType: "application/json",
+                  responseSchema,
+                })
+              );
+              parsed = parseJsonFromText<TranslationResult>(response.text || "{}");
+            }
+          } catch (geminiErr) {
+            if (hasAnyFallbackProvider()) {
+              parsed = await callFallbackPoolJson<TranslationResult>(
+                systemInstruction,
+                userPrompt,
+                schemaHint
+              );
+            } else {
+              throw geminiErr;
+            }
           }
         }
       }
@@ -2247,13 +2319,73 @@ async function startServer() {
       const safeSide = parsed.speakerSide === "them" ? "them" : "me";
       const safeTarget =
         (parsed.targetLanguage || "").trim() ||
-        (safeSide === "me" ? cleanOtherLang : cleanMyLang);
+        (safeSide === "me" ? effectivePartnerLang || cleanOtherLang : cleanMyLang);
+      const finalTranslatedText = (parsed.translatedText || spokenText).trim();
+      const finalOriginalText = (spokenText || parsed.originalText || "").trim();
+
+      const cleanedOutNoise = finalOriginalText
+        .replace(/^\[.*\]$/g, "")
+        .replace(/[.!?,…\s]+/g, "")
+        .trim();
+      if (!cleanedOutNoise && !finalTranslatedText) {
+        return res.json({ empty: true });
+      }
+
+      // Optional inline fast TTS so the client plays speech IMMEDIATELY with zero extra network round-trip!
+      let inlineAudioBase64: string | undefined;
+      if (includeAudio && finalTranslatedText && hasGeminiKey()) {
+        try {
+          const ai = getAiClient();
+          const allowedVoices = new Set(["Puck", "Charon", "Kore", "Fenrir", "Zephyr"]);
+          const safeVoice = allowedVoices.has(voiceName) ? voiceName : "Kore";
+          const ttsSpeechText = stripMarkdownForSpeech(finalTranslatedText);
+          const ttsPromise = ai.models.generateContent({
+            model: "gemini-3.8-flash-lite-tts",
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    text: ttsSpeechText,
+                    speechMetadata: {
+                      style: `Crisp, warm, brisk live human interpreter speaking clearly in ${safeTarget} at natural conversational speed`,
+                    },
+                  },
+                ],
+              },
+            ],
+            config: {
+              responseModalities: ["AUDIO"],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: safeVoice },
+                },
+              },
+            },
+          });
+
+          const timeoutPromise = new Promise<null>((resolve) =>
+            setTimeout(() => resolve(null), 2800)
+          );
+          const ttsRes = await Promise.race([ttsPromise, timeoutPromise]);
+          const inlineData =
+            ttsRes?.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+          if (inlineData?.data) {
+            inlineAudioBase64 = masterTtsWavLoudness(
+              inlineData.data,
+              inlineData.mimeType
+            );
+          }
+        } catch {
+          // Non-fatal: client falls back immediately to fast browser TTS
+        }
+      }
 
       return res.json({
-        originalText: spokenText,
+        originalText: finalOriginalText,
         detectedLanguage: (parsed.detectedLanguage || cleanMyLang).trim(),
         targetLanguage: safeTarget,
-        translatedText: (parsed.translatedText || spokenText).trim(),
+        translatedText: finalTranslatedText,
         pronunciation: (parsed.pronunciation || "").trim(),
         speakerSide: safeSide,
         suggestedReplies: Array.isArray(parsed.suggestedReplies)
@@ -2262,6 +2394,9 @@ async function startServer() {
               .slice(0, 3)
           : [],
         modeUsed: useSameLangReply ? "same_language_reply" : "translate",
+        ...(inlineAudioBase64
+          ? { audioBase64: inlineAudioBase64, audioMimeType: "audio/wav" }
+          : {}),
       });
     } catch (err) {
       const formatted = formatApiError(err);
@@ -3685,19 +3820,18 @@ async function startServer() {
                   : otherLang;
 
               systemInstruction = [
-                `You are Jogi Jarvis, an ultra-fast, warm, real-time human interpreter helping the user have a smooth, live to-and-fro face-to-face conversation.`,
-                `The user's preferred language is ${myLang}. The other speaker's language is ${otherDesc}.`,
-                `FOLLOW THIS EXACT TO-AND-FRO HUMAN INTERPRETER WORKFLOW:`,
+                `You are Jogi Jarvis, an ultra-fast, zero-delay live face-to-face human interpreter.`,
+                `The user's language is ${myLang}. The other person's language is ${otherDesc}.`,
+                `STRICT INSTANT TWO-WAY RULES:`,
                 `1. WHEN THE OTHER PERSON SPEAKS (in ${otherLang.toLowerCase() === "auto-detect" ? `any language other than ${myLang}` : otherLang}):`,
-                `   - Immediately remember the exact language they spoke.`,
-                `   - Speak FAST, clearly, and naturally to the user in ${myLang}, explaining what the person just said or asked like a real human interpreter sitting right beside the user (concise and crystal clear, never stiff or robotic).`,
-                `   - End with a very short natural prompt in ${myLang} like "What would you like to reply?" so the user can immediately answer back.`,
-                `2. WHEN THE USER SPEAKS BACK (in ${myLang}):`,
-                `   - Convert their answer immediately and speak DIRECTLY to the other person in ${otherLang.toLowerCase() === "auto-detect" ? "the exact language the other person just spoke (or any language the user explicitly requests, like 'answer in Arabic' or 'tell them in Hindi')" : otherLang}.`,
-                `   - CRITICAL: If the user says meta-instructions like "tell them...", "answer them in their language...", "reply to them...", or "say that...", DO NOT translate those meta-words—speak the actual polite, natural human reply directly to the other person in their language!`,
-                `   - If the user asks you to answer the other person's question on their behalf in their language, give a polite, accurate answer directly in the other person's language.`,
-                `   - If nobody else has spoken yet and the user speaks in ${myLang} with Auto-Detect active (without naming a target language), reply briefly in ${myLang} letting them know you are listening and ready to interpret any voice, or ask which language they want to speak in.`,
-                `3. SPEED & NATURAL HUMAN TONE: Keep every interpretation brisk, clear, polite, and lifelike like a professional human interpreter. Never output markdown, asterisks, or brackets.`,
+                `   - Immediately lock and remember the EXACT language they just spoke.`,
+                `   - INSTANTLY explain clearly and naturally to the user in ${myLang} what they just said or asked.`,
+                `   - Be ultra-brisk and direct: DO NOT say "The person said..." and DO NOT add "What would you like to reply?" at the end — finish fast so the user can answer immediately.`,
+                `2. WHEN THE USER SPEAKS (in ${myLang}):`,
+                `   - INSTANTLY translate and speak DIRECTLY to the other person in ${otherLang.toLowerCase() === "auto-detect" ? "the EXACT SAME LANGUAGE the other person just spoke (or another language only if the user explicitly names one)" : otherLang}.`,
+                `   - Strip any meta-commands like "tell them...", "say to them...", or "answer them..." and speak the actual polite message directly in the other person's exact language.`,
+                `   - ZERO extra chatter, ZERO preamble, ZERO markdown.`,
+                `3. SPEED: Respond immediately in crisp, natural spoken sentences so a real face-to-face conversation feels effortless and fast.`,
               ].join(" ");
             }
           } else {
@@ -3836,9 +3970,27 @@ async function startServer() {
           const sameMode = Boolean(msg.sameLanguageReply);
           liveSession.sendRealtimeInput({
             text: sameMode
-              ? `[INTERPRETER SETTINGS UPDATED: Switch immediately to same-language conversation in ${myLang}. Reply briefly only if spoken to next; do not speak right now.]`
-              : `[INTERPRETER SETTINGS UPDATED: User's language is now ${myLang}, other speaker's language is now ${otherLang}. Apply immediately on the next spoken turn; stay quiet until someone speaks.]`,
+              ? `[INTERPRETER SETTINGS UPDATED: Switch immediately to same-language conversation in ${myLang}. Stay quiet until someone speaks.]`
+              : `[INTERPRETER SETTINGS UPDATED: User's language is now ${myLang}, other person's language is now ${otherLang}. Apply immediately on the next spoken turn; stay quiet until someone speaks.]`,
           });
+          return;
+        }
+
+        if (msg.type === "speaker_hint" && liveSession) {
+          const hint = msg as unknown as {
+            side?: "them" | "me" | "auto";
+            myLanguage?: string;
+            partnerLanguage?: string;
+          };
+          const myLang = (hint.myLanguage || "English").trim() || "English";
+          const partner = (hint.partnerLanguage || "their exact spoken language").trim();
+          const instruction =
+            hint.side === "them"
+              ? `[NEXT SPEAKER IS THE OTHER PERSON: Listen to them, remember their exact language, and immediately explain what they say to the user in ${myLang} with zero filler. Stay silent until they speak.]`
+              : hint.side === "me"
+                ? `[NEXT SPEAKER IS THE USER (${myLang}): Immediately translate what the user says directly into ${partner} for the other person with zero filler. Stay silent until the user speaks.]`
+                : `[AUTO TWO-WAY MODE: Automatically detect who speaks — explain other person in ${myLang}, translate user into ${partner}. Stay silent until someone speaks.]`;
+          liveSession.sendRealtimeInput({ text: instruction });
           return;
         }
 
