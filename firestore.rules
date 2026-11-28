@@ -37,6 +37,14 @@ service cloud.firestore {
       return !(key in data) || (data[key] is string && data[key].size() <= maxLen);
     }
 
+    function isOptionalBoundedNumber(data, key, minVal, maxVal) {
+      return !(key in data) || (data[key] is number && data[key] >= minVal && data[key] <= maxVal);
+    }
+
+    function isOptionalBool(data, key) {
+      return !(key in data) || (data[key] is bool);
+    }
+
     function hasValidParentAccount(userId) {
       return exists(/databases/$(database)/documents/users/$(userId))
         && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
@@ -63,7 +71,8 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'ownerId', 'id', 'name', 'relation', 'role', 'grade', 'learningGoal',
           'voiceName', 'preferredLanguage', 'avatarUrl', 'initials',
-          'accentColor', 'createdAt', 'updatedAt'
+          'accentColor', 'studyPoints', 'studySessionsCount', 'completedNotesCount',
+          'lastStudiedAt', 'createdAt', 'updatedAt'
         ])
         && isValidId(data.ownerId)
         && data.ownerId == request.auth.uid
@@ -80,6 +89,10 @@ service cloud.firestore {
         && isOptionalString(data, 'avatarUrl', 180000)
         && data.initials is string && data.initials.size() >= 1 && data.initials.size() <= 4
         && data.accentColor is string && data.accentColor.size() >= 1 && data.accentColor.size() <= 32
+        && isOptionalBoundedNumber(data, 'studyPoints', 0, 1000000)
+        && isOptionalBoundedNumber(data, 'studySessionsCount', 0, 100000)
+        && isOptionalBoundedNumber(data, 'completedNotesCount', 0, 100000)
+        && isOptionalString(data, 'lastStudiedAt', 64)
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -93,7 +106,8 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'ownerId', 'id', 'profileId', 'profileName', 'title', 'subject',
           'summary', 'keyPoints', 'definitions', 'practiceQuestions',
-          'teacherTip', 'sourceMode', 'createdAt', 'updatedAt'
+          'teacherTip', 'sourceMode', 'completed', 'completedAt',
+          'createdAt', 'updatedAt'
         ])
         && isValidId(data.ownerId)
         && data.ownerId == request.auth.uid
@@ -113,6 +127,8 @@ service cloud.firestore {
         && (data.practiceQuestions.size() == 0 || data.practiceQuestions[0] is map)
         && data.teacherTip is string && data.teacherTip.size() <= 1000
         && data.sourceMode in ['chat', 'voice', 'topic']
+        && isOptionalBool(data, 'completed')
+        && isOptionalString(data, 'completedAt', 64)
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -193,7 +209,8 @@ service cloud.firestore {
           && incoming().diff(existing()).affectedKeys().hasOnly([
             'name', 'relation', 'role', 'grade', 'learningGoal',
             'voiceName', 'preferredLanguage', 'avatarUrl', 'initials',
-            'accentColor', 'updatedAt'
+            'accentColor', 'studyPoints', 'studySessionsCount',
+            'completedNotesCount', 'lastStudiedAt', 'updatedAt'
           ])
           && hasValidParentAccount(userId);
         allow delete: if isVerifiedOwner(userId)
@@ -224,7 +241,7 @@ service cloud.firestore {
           && incoming().diff(existing()).affectedKeys().hasOnly([
             'profileId', 'profileName', 'title', 'subject', 'summary',
             'keyPoints', 'definitions', 'practiceQuestions', 'teacherTip',
-            'sourceMode', 'updatedAt'
+            'sourceMode', 'completed', 'completedAt', 'updatedAt'
           ])
           && hasValidParentAccount(userId);
         allow delete: if isVerifiedOwner(userId)

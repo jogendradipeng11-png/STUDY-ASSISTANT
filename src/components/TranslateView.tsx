@@ -63,6 +63,7 @@ interface InterpreterEntry {
 
 interface TranslateViewProps {
   profile: FamilyProfile;
+  onStudySessionComplete?: (profileId: string, reason?: string) => void;
 }
 
 const STORAGE_MY_LANG = "jogi_jarvis_translate_from_v2";
@@ -75,7 +76,10 @@ const QUICK_PHRASES = [
   "Please speak slowly, my live interpreter is translating for us.",
 ];
 
-export function TranslateView({ profile }: TranslateViewProps) {
+export function TranslateView({
+  profile,
+  onStudySessionComplete,
+}: TranslateViewProps) {
   const defaultMyLang =
     profile.preferredLanguage && profile.preferredLanguage !== "Auto-Detect"
       ? profile.preferredLanguage
@@ -118,6 +122,7 @@ export function TranslateView({ profile }: TranslateViewProps) {
   const [infoMsg, setInfoMsg] = useState<string | null>(null);
 
   const [speakingEntryId, setSpeakingEntryId] = useState<string | null>(null);
+  const lastStudyAwardAtRef = useRef<number>(0);
   const [loadingAudioId, setLoadingAudioId] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [fullscreenEntry, setFullscreenEntry] =
@@ -1310,6 +1315,11 @@ export function TranslateView({ profile }: TranslateViewProps) {
         timestamp: nowTime,
       };
       setEntries((prev) => [...prev, entry]);
+      const nowMs = Date.now();
+      if (nowMs - lastStudyAwardAtRef.current >= 30_000) {
+        lastStudyAwardAtRef.current = nowMs;
+        onStudySessionComplete?.(profile.id, "Language practice session");
+      }
 
       if (autoSpeakRef.current) {
         void speakEntryAudio(

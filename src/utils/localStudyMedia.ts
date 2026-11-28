@@ -968,52 +968,52 @@ function buildFallbackVideoStoryboard(
   if (known && !rawLlmText) {
     const scenes: StudyVideoScene[] = [
       {
-        heading: `Welcome to ${known.title}`,
-        narration: known.summary,
+        heading: `What Is ${known.title}?`,
+        narration: `Let us learn ${known.title} slowly and simply. ${known.summary}`,
         keyFact: known.caption,
         visualAccent: pickVisualAccent(known.title, 0),
-        bulletPoints: [known.caption, "Step-by-step visual guide", "Easy revision takeaways"],
-        durationSec: 6,
+        bulletPoints: [known.caption, "Look calmly at the 3D physical model", "One simple idea at a time"],
+        durationSec: 10,
       },
       {
-        heading: "Key Parts & Concepts",
-        narration: known.nodes
+        heading: "Look at the Main Parts",
+        narration: `Look closely at the labels on the 3D model. ${known.nodes
           .slice(0, 2)
-          .map((n) => `${n.label}: ${n.detail}`)
-          .join(" "),
+          .map((n) => `${n.label} means ${n.detail.toLowerCase()}.`)
+          .join(" ")}`,
         keyFact: known.nodes[0] ? `${known.nodes[0].label}: ${known.nodes[0].detail}` : known.title,
         visualAccent: pickVisualAccent(known.title, 1),
         bulletPoints: known.nodes.slice(0, 3).map((n) => `${n.label}: ${n.detail}`),
-        durationSec: 7,
+        durationSec: 10,
       },
       {
-        heading: "How It Works Step-by-Step",
-        narration: known.nodes
+        heading: "How It Works Step by Step",
+        narration: `Now let us follow how it happens in order. ${known.nodes
           .slice(2)
-          .map((n) => `${n.label}: ${n.detail}`)
-          .join(" "),
+          .map((n) => `${n.label}: ${n.detail}.`)
+          .join(" ")}`,
         keyFact: known.nodes[2] ? `${known.nodes[2].label}: ${known.nodes[2].detail}` : known.caption,
         visualAccent: pickVisualAccent(known.title, 2),
-        bulletPoints: known.nodes.slice(0, 4).map((n) => n.label),
-        durationSec: 7,
+        bulletPoints: known.nodes.slice(0, 3).map((n, i) => `${i + 1}. ${n.label}`),
+        durationSec: 10,
       },
       {
-        heading: "Key Formula & Real-Life Example",
-        narration: `${known.formulaOrFact}. For example, ${known.realLifeExample}`,
+        heading: "Real-Life Example",
+        narration: `Here is an easy real-life example to help it click. ${known.realLifeExample}. Also remember: ${known.formulaOrFact}.`,
         keyFact: known.formulaOrFact,
         visualAccent: pickVisualAccent(known.title, 3),
-        bulletPoints: [known.formulaOrFact, known.realLifeExample],
-        durationSec: 7,
+        bulletPoints: [known.realLifeExample, known.formulaOrFact],
+        durationSec: 10,
       },
       {
-        heading: "Quick Revision Recap",
-        narration: `To remember ${known.title}, focus on its main stages: ${known.nodes
+        heading: "Easy Way to Remember",
+        narration: `Great job! To remember ${known.title} easily, just recall these simple parts in order: ${known.nodes
           .map((n) => n.label)
           .join(", ")}.`,
-        keyFact: `Master ${known.title} in 4 clear steps`,
+        keyFact: `Remember ${known.title} in ${known.nodes.length} easy steps`,
         visualAccent: pickVisualAccent(known.title, 4),
         bulletPoints: known.nodes.slice(0, 3).map((n) => `${n.label} — ${n.detail}`),
-        durationSec: 6,
+        durationSec: 10,
       },
     ];
     return {
@@ -1026,7 +1026,7 @@ function buildFallbackVideoStoryboard(
     };
   }
 
-  // If Local LLM produced free-text paragraphs/bullets, turn them into 5 crisp scenes
+  // If Local LLM produced free-text paragraphs/bullets, turn them into 5 calm, easy classroom steps
   const sentences = (rawLlmText || "")
     .replace(/\*\*/g, "")
     .split(/(?<=[.!?।])\s+|\n+/)
@@ -1035,75 +1035,75 @@ function buildFallbackVideoStoryboard(
 
   const s0 =
     sentences[0] ||
-    `Let's explore ${title} clearly in five short animated steps.`;
+    `Let us understand ${title} calmly in five easy steps, looking closely at the 3D physical model.`;
   const s1 =
     sentences[1] ||
-    `First, understand the core idea behind ${title} and why it matters.`;
+    `First, look at the main parts of ${title} and notice how each part has one simple job.`;
   const s2 =
     sentences[2] ||
-    `Next, look at the key parts and how they connect together step by step.`;
+    `Next, watch how each part works together slowly, one step after the other.`;
   const s3 =
     sentences[3] ||
-    `Seeing ${title} in real-life examples makes it much easier to remember.`;
+    `Thinking about a familiar everyday example of ${title} makes it very easy to understand.`;
   const s4 =
     sentences[4] ||
-    `Review the key points above and test yourself by explaining ${title} in your own words.`;
+    `To remember ${title}, pause and explain the main idea in your own simple words.`;
 
   const scenes: StudyVideoScene[] = [
     {
-      heading: `Introduction: ${title}`,
+      heading: `What Is ${title}?`,
       narration: s0,
-      keyFact: s0.slice(0, 86),
+      keyFact: s0.slice(0, 84),
       visualAccent: pickVisualAccent(title, 0),
-      bulletPoints: [s0.slice(0, 72), `Topic: ${title}`, "5-scene animated explainer"],
-      durationSec: 6,
+      bulletPoints: [s0.slice(0, 68), `Topic: ${title}`, "Simple 5-step lesson"],
+      durationSec: 10,
     },
     {
-      heading: "Core Concept & Structure",
+      heading: "Look at the Main Parts",
       narration: s1,
-      keyFact: s1.slice(0, 86),
+      keyFact: s1.slice(0, 84),
       visualAccent: pickVisualAccent(title, 1),
       bulletPoints: [
-        s1.slice(0, 76),
-        (sentences[5] || `Main parts of ${title}`).slice(0, 76),
+        s1.slice(0, 72),
+        (sentences[5] || `Main physical parts of ${title}`).slice(0, 72),
       ],
-      durationSec: 7,
+      durationSec: 10,
     },
     {
-      heading: "Step-by-Step Process",
+      heading: "How It Works Step by Step",
       narration: s2,
-      keyFact: s2.slice(0, 86),
+      keyFact: s2.slice(0, 84),
       visualAccent: pickVisualAccent(title, 2),
       bulletPoints: [
-        s2.slice(0, 76),
-        (sentences[6] || "Follow each stage in order").slice(0, 76),
+        s2.slice(0, 72),
+        (sentences[6] || "Follow each simple step in order").slice(0, 72),
       ],
-      durationSec: 7,
+      durationSec: 10,
     },
     {
-      heading: "Key Rule & Example",
+      heading: "Real-Life Example",
       narration: s3,
-      keyFact: s3.slice(0, 86),
+      keyFact: s3.slice(0, 84),
       visualAccent: pickVisualAccent(title, 3),
       bulletPoints: [
-        s3.slice(0, 76),
-        (sentences[7] || `Everyday example of ${title}`).slice(0, 76),
+        s3.slice(0, 72),
+        (sentences[7] || `Everyday example of ${title}`).slice(0, 72),
       ],
-      durationSec: 7,
+      durationSec: 10,
     },
     {
-      heading: "Quick Revision Summary",
+      heading: "Easy Way to Remember",
       narration: s4,
-      keyFact: s4.slice(0, 86),
+      keyFact: s4.slice(0, 84),
       visualAccent: pickVisualAccent(title, 4),
-      bulletPoints: [s0.slice(0, 72), s2.slice(0, 72), s4.slice(0, 72)],
-      durationSec: 6,
+      bulletPoints: [s0.slice(0, 68), s2.slice(0, 68), s4.slice(0, 68)],
+      durationSec: 10,
     },
   ];
 
   return {
     title,
-    subtitle: `On-device animated study explainer for ${title}`,
+    subtitle: `Calm 5-step physical 3D lesson for ${title}`,
     subject,
     themeColor: palette.accent,
     language: language || "English",
@@ -1139,13 +1139,14 @@ export async function generateLocalStudyVideo(options: {
       const raw = await generateLocalLlmPrompt({
         modelKey: runnableModelKey,
         systemPrompt: [
-          "You write 5-scene animated educational explainer video storyboards.",
+          "You are a warm, patient classroom teacher writing slow, simple 5-step educational video lessons for students using plain everyday words.",
+          "Steps: 1) What Is It (simple analogy), 2) Main Physical Parts, 3) How It Works Step by Step (First, Then, Finally), 4) Real-Life Example, 5) Easy Way to Remember.",
           langRule,
-          'Return ONLY valid JSON: {"title":"...","subtitle":"...","scenes":[{"heading":"...","narration":"2 short spoken sentences","keyFact":"1 crisp takeaway","bulletPoints":["point 1","point 2","point 3"],"visualAccent":"sun|atom|globe|wave|chart|book|leaf|rocket|circuit|heart","durationSec":7}]}. Provide exactly 5 scenes.',
+          'Return ONLY valid JSON: {"title":"...","subtitle":"...","scenes":[{"heading":"...","narration":"2 simple calm spoken sentences","keyFact":"1 easy takeaway","bulletPoints":["short point 1","short point 2"],"visualAccent":"sun|atom|globe|wave|chart|book|leaf|rocket|circuit|heart","durationSec":10}]}. Provide exactly 5 scenes.',
         ].join(" "),
-        userPrompt: `Create a 5-scene study video storyboard about: ${options.prompt}${options.subject ? ` (Subject: ${options.subject})` : ""}`,
-        maxTokens: 900,
-        temperature: 0.35,
+        userPrompt: `Create a calm, simple 5-step study video lesson about: ${options.prompt}${options.subject ? ` (Subject: ${options.subject})` : ""}`,
+        maxTokens: 960,
+        temperature: 0.3,
         onProgress: options.onProgress,
       });
 
@@ -1185,15 +1186,15 @@ export async function generateLocalStudyVideo(options: {
               ? sc.bullets
               : [];
           const cleanedBullets = rawBullets
-            .map((b) => String(b).trim().slice(0, 90))
+            .map((b) => String(b).trim().slice(0, 82))
             .filter(Boolean)
             .slice(0, 3);
-          const heading = String(sc?.heading || `Scene ${i + 1}`)
+          const heading = String(sc?.heading || `Step ${i + 1}`)
             .trim()
             .slice(0, 64);
           const narration = String(sc?.narration || heading || cleanTopic)
             .trim()
-            .slice(0, 260);
+            .slice(0, 280);
           const visualAccent = validAccents.has(
             sc?.visualAccent as StudyVideoScene["visualAccent"]
           )
@@ -1207,14 +1208,14 @@ export async function generateLocalStudyVideo(options: {
               .slice(0, 92),
             visualAccent,
             bulletPoints: cleanedBullets.length > 0 ? cleanedBullets : [heading],
-            durationSec: Math.max(5, Math.min(10, Number(sc?.durationSec) || 7)),
+            durationSec: Math.max(8, Math.min(12, Number(sc?.durationSec) || 10)),
           };
         });
         const palette = pickPalette(cleanTopic);
         storyboard = {
           title: String(parsed.title || cleanTopic).trim().slice(0, 68),
           subtitle: String(
-            parsed.subtitle || `Animated study explainer for ${cleanTopic}`
+            parsed.subtitle || `Calm 5-step physical 3D lesson for ${cleanTopic}`
           )
             .trim()
             .slice(0, 110),

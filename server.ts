@@ -3272,24 +3272,29 @@ async function startServer() {
       const activeLang = language || profile?.preferredLanguage || "Auto-Detect";
       const langRule = buildLanguageGuidance(activeLang);
       const videoSystem =
-        "You are Jogi Jarvis, an engaging 3D cinematic video director and AI teacher. Design crisp 5-scene 3D animated explainer videos with realistic PBR 3D stage direction, warm narration, and memorable takeaways.";
+        "You are Jogi Jarvis, a warm, patient classroom teacher creating slow, easy-to-understand 5-step physical 3D explainer videos for students. Always use plain everyday words, short clear sentences, and real-world analogies so even a beginner understands effortlessly.";
       const videoPrompt = [
-        `Design a 5-scene 3D real animated explainer video about: "${cleanPrompt}".`,
+        `Design a slow, simple, easy-to-understand 5-step physical 3D explainer video about: "${cleanPrompt}".`,
         subject && subject !== "All Subjects" ? `Subject: ${subject}.` : "",
         profile?.grade ? `Student level: ${profile.grade}.` : "",
-        "Requirements:",
-        "- Create exactly 5 clear sequential scenes (Intro -> Core Mechanism -> Key Example -> Real-World Connection -> Quick Recap).",
-        "- For each scene, provide: heading (short, <= 6 words), narration (warm spoken teacher voiceover, 16-24 words), keyFact (1 crisp formula/takeaway <= 90 chars), bulletPoints (2-3 short scannable points), visualAccent (one of: sun, atom, globe, wave, chart, book, leaf, rocket, circuit, heart), durationSec (5 to 7).",
-        "- Choose a vibrant hex themeColor (e.g. #2563EB, #059669, #7C3AED, #EA580C, #0284C7).",
-        "- Design a matching 3D PBR hero stage in scene3d (archetype: solar, atom, dna, heart, plant, watercycle, rocket, circuit, earth, volcano, wave, architecture, or custom with 6-10 composite customParts; environment: studio, space, outdoor, lab, or sunset).",
-        "- Also include a short 2-sentence written summary in replyText and a clean 2-4 word English searchTopic for related study video links.",
+        "Teaching Method (STRICT — follow this exact 5-step classroom flow):",
+        "1. Step 1 (What Is It?): Explain what the topic is in simple everyday words using a friendly analogy ('Think of it like...' or 'Imagine...').",
+        "2. Step 2 (Look at the Main Parts): Point clearly to the 2-3 main physical parts the student sees on the 3D model and explain what each part does.",
+        "3. Step 3 (How It Works Step by Step): Explain the action slowly in order using 'First... Then... Finally...'.",
+        "4. Step 4 (Real-Life Example): Give one familiar example from daily life that makes the concept click.",
+        "5. Step 5 (Easy Way to Remember): Give one simple memory trick or takeaway sentence.",
+        "Formatting Requirements:",
+        "- For each of the 5 scenes, provide: heading (short, <= 6 words), narration (calm spoken teacher explanation in plain everyday language, 18-28 words, no jargon without explaining it), keyFact (1 simple takeaway <= 85 chars), bulletPoints (2-3 very short plain-language points <= 60 chars each), visualAccent (one of: sun, atom, globe, wave, chart, book, leaf, rocket, circuit, heart), durationSec (9 to 11).",
+        "- Choose a clean hex themeColor (e.g. #2563EB, #059669, #0284C7, #EA580C, #7C3AED).",
+        "- Design a realistic physical 3D model in scene3d (archetype: solar, atom, dna, heart, plant, watercycle, rocket, circuit, earth, volcano, wave, architecture, or custom with 6-10 physical customParts; environment: studio, space, outdoor, lab, or sunset).",
+        "- Also include a friendly 2-sentence written summary in replyText and a clean 2-4 word English searchTopic for related study video links.",
         langRule,
       ]
         .filter(Boolean)
         .join("\n");
 
       const schemaHint =
-        '{"title":"string","subtitle":"string","themeColor":"#2563EB","replyText":"string","searchTopic":"string","scene3d":{"archetype":"solar|atom|dna|heart|plant|watercycle|rocket|circuit|earth|volcano|wave|architecture|custom","environment":"studio|space|outdoor|lab|sunset","primaryColor":"#2563EB","accentColor":"#38BDF8"},"scenes":[{"heading":"string","narration":"string","keyFact":"string","visualAccent":"atom","bulletPoints":["string"],"durationSec":6}]}';
+        '{"title":"string","subtitle":"string","themeColor":"#2563EB","replyText":"string","searchTopic":"string","scene3d":{"archetype":"solar|atom|dna|heart|plant|watercycle|rocket|circuit|earth|volcano|wave|architecture|custom","environment":"studio|space|outdoor|lab|sunset","primaryColor":"#2563EB","accentColor":"#38BDF8"},"scenes":[{"heading":"string","narration":"string","keyFact":"string","visualAccent":"atom","bulletPoints":["string"],"durationSec":10}]}';
 
       const videoSchema = {
         type: Type.OBJECT,
@@ -3433,8 +3438,8 @@ async function startServer() {
       const normalizedScenes = (Array.isArray(generated.scenes) ? generated.scenes : [])
         .slice(0, 6)
         .map((sc, idx) => ({
-          heading: String(sc?.heading || `Part ${idx + 1}`).slice(0, 80),
-          narration: String(sc?.narration || "").slice(0, 240),
+          heading: String(sc?.heading || `Step ${idx + 1}`).slice(0, 80),
+          narration: String(sc?.narration || "").slice(0, 280),
           keyFact: String(sc?.keyFact || "").slice(0, 120),
           visualAccent: (allowedAccents.has(String(sc?.visualAccent || ""))
             ? String(sc?.visualAccent)
@@ -3452,7 +3457,7 @@ async function startServer() {
           bulletPoints: Array.isArray(sc?.bulletPoints)
             ? sc.bulletPoints.slice(0, 3).map((b) => String(b).slice(0, 110))
             : [],
-          durationSec: Math.max(4, Math.min(9, Number(sc?.durationSec) || 6)),
+          durationSec: Math.max(8, Math.min(12, Number(sc?.durationSec) || 10)),
         }));
 
       const resolvedTitle = String(generated.title || cleanPrompt).slice(0, 90);
@@ -3473,10 +3478,10 @@ async function startServer() {
       return res.json({
         reply:
           String(generated.replyText || "").trim() ||
-          `I created a ${normalizedScenes.length}-scene 3D real animated explainer video for **${cleanPrompt}**. Press **Play 3D Video** to watch with voice narration or click **Download 3D Video (.webm)** to save it.`,
+          `I created a calm ${normalizedScenes.length}-step physical 3D lesson for **${cleanPrompt}**. Press **Play Lesson** to watch at an easy student pace, or turn on **Step-by-Step** to pause after every step.`,
         storyboard: {
           title: resolvedTitle,
-          subtitle: String(generated.subtitle || "3D Real Cinema Study Video").slice(
+          subtitle: String(generated.subtitle || "Physical 3D Step-by-Step Lesson").slice(
             0,
             120
           ),

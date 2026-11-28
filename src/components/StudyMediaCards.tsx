@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Box,
+  ChevronLeft,
+  ChevronRight,
   Download,
   ExternalLink,
   Film,
@@ -11,6 +13,7 @@ import {
   Pause,
   Play,
   RotateCcw,
+  StepForward,
   Sun,
   Volume2,
   VolumeX,
@@ -29,6 +32,7 @@ import {
   Study3DViewportEngine,
   type CameraPreset,
   type LightingPreset,
+  type Study3DProjectedLabel,
 } from "../utils/study3dEngine";
 
 function slugifyFilename(text: string, fallback: string): string {
@@ -853,7 +857,9 @@ function drawStudyVideoFrame(
   sceneIndex: number,
   sceneProgress: number,
   globalTimeSec: number,
-  webgl3dCanvas?: HTMLCanvasElement | null
+  webgl3dCanvas?: HTMLCanvasElement | null,
+  projectedLabels?: Study3DProjectedLabel[],
+  waitingForNextStep = false
 ) {
   const W = ctx.canvas.width;
   const H = ctx.canvas.height;
@@ -867,20 +873,22 @@ function drawStudyVideoFrame(
   ctx.scale(scale, scale);
   const vW = 960;
   const vH = 540;
+  const has3d = Boolean(
+    webgl3dCanvas && webgl3dCanvas.width > 0 && webgl3dCanvas.height > 0
+  );
 
-  if (webgl3dCanvas && webgl3dCanvas.width > 0 && webgl3dCanvas.height > 0) {
-    // 1. Live Real 3D WebGL PBR Cinema Viewport
+  if (has3d && webgl3dCanvas) {
+    // 1. Bright, unobstructed Real 3D Physical PBR Documentary Viewport
     ctx.drawImage(webgl3dCanvas, 0, 0, vW, vH);
 
-    // Subtle left-to-right cinema scrim so typography reads razor-sharp while 3D hero shines on right
-    const scrim = ctx.createLinearGradient(0, 0, vW * 0.72, 0);
-    scrim.addColorStop(0, "rgba(2, 6, 23, 0.86)");
-    scrim.addColorStop(0.58, "rgba(2, 6, 23, 0.56)");
-    scrim.addColorStop(1, "rgba(2, 6, 23, 0.04)");
-    ctx.fillStyle = scrim;
-    ctx.fillRect(0, 0, vW, vH);
+    // Very subtle top & bottom edge vignettes ONLY — keep the right 64% physical 3D subject crystal clear!
+    const topVignette = ctx.createLinearGradient(0, 0, 0, 68);
+    topVignette.addColorStop(0, "rgba(2, 6, 23, 0.52)");
+    topVignette.addColorStop(1, "rgba(2, 6, 23, 0)");
+    ctx.fillStyle = topVignette;
+    ctx.fillRect(0, 0, vW, 68);
   } else {
-    // Fallback 2D Slides Mode: Deep navy academic gradient backdrop
+    // Fallback 2D Slides Mode: Clean academic slate gradient backdrop
     const bg = ctx.createLinearGradient(0, 0, vW, vH);
     bg.addColorStop(0, "#0F172A");
     bg.addColorStop(0.6, "#1E293B");
@@ -890,7 +898,7 @@ function drawStudyVideoFrame(
 
     ctx.strokeStyle = "rgba(148, 163, 184, 0.08)";
     ctx.lineWidth = 1;
-    const offset = (globalTimeSec * 12) % 48;
+    const offset = (globalTimeSec * 6) % 48;
     for (let x = -48 + offset; x < vW; x += 48) {
       ctx.beginPath();
       ctx.moveTo(x, 0);
@@ -905,116 +913,232 @@ function drawStudyVideoFrame(
     }
   }
 
-  // 3. Top header bar
-  ctx.fillStyle = "rgba(2, 6, 23, 0.72)";
-  ctx.fillRect(0, 0, vW, 58);
+  // 2. Top compact documentary header bar
+  ctx.fillStyle = "rgba(15, 23, 42, 0.84)";
+  ctx.fillRect(0, 0, vW, 48);
   ctx.fillStyle = accent;
-  ctx.fillRect(0, 56, vW, 2);
+  ctx.fillRect(0, 46, vW, 2);
 
   ctx.fillStyle = "#F8FAFC";
-  ctx.font = "700 19px Inter, system-ui, -apple-system, sans-serif";
-  ctx.fillText(storyboard.title.slice(0, 48), 28, 36);
+  ctx.font = "700 17px Inter, system-ui, -apple-system, sans-serif";
+  ctx.fillText(storyboard.title.slice(0, 52), 20, 30);
 
-  const badgeText = webgl3dCanvas
-    ? `3D CINEMA · Scene ${sceneIndex + 1} / ${scenes.length}`
-    : `Scene ${sceneIndex + 1} / ${scenes.length}`;
+  const stepBadgeText = `Step ${sceneIndex + 1} of ${scenes.length}`;
   ctx.font = "600 12px Inter, system-ui, sans-serif";
-  const badgeW = ctx.measureText(badgeText).width + 24;
-  ctx.fillStyle = `${accent}38`;
-  drawRoundedRect(ctx, vW - badgeW - 24, 15, badgeW, 28, 14);
+  const badgeW = ctx.measureText(stepBadgeText).width + 22;
+  ctx.fillStyle = "rgba(30, 41, 59, 0.95)";
+  drawRoundedRect(ctx, vW - badgeW - 18, 11, badgeW, 26, 6);
   ctx.fill();
   ctx.strokeStyle = accent;
   ctx.lineWidth = 1.2;
   ctx.stroke();
-  ctx.fillStyle = "#E2E8F0";
-  ctx.fillText(badgeText, vW - badgeW - 12, 33);
+  ctx.fillStyle = "#F8FAFC";
+  ctx.fillText(stepBadgeText, vW - badgeW - 7, 28);
 
-  // 4. Left content column with smooth fade-in transition
-  const fadeIn = Math.min(1, sceneProgress * 4.5);
-  const slideX = (1 - fadeIn) * 18;
-  const colMaxW = webgl3dCanvas ? 450 : 540;
+  // 3. Projected 3D Physical Part Callout Pins over the right 3D zone (x >= 365)
+  if (has3d && projectedLabels && projectedLabels.length > 0) {
+    const usedBoxes: Array<{ x: number; y: number; w: number; h: number }> = [];
+    ctx.font = "600 12px Inter, system-ui, sans-serif";
+
+    for (const item of projectedLabels) {
+      if (!item.visible) continue;
+      // Only annotate physical points visible in the unobstructed right 3D stage
+      if (item.x < 355 || item.x > vW - 22 || item.y < 64 || item.y > 416) continue;
+
+      const labelText = item.label.slice(0, 30);
+      const textW = ctx.measureText(labelText).width;
+      const boxW = textW + 18;
+      const boxH = 24;
+
+      // Offset label neatly away from the pin point
+      let bx = item.x + 18;
+      if (bx + boxW > vW - 14) {
+        bx = item.x - boxW - 18;
+      }
+      bx = Math.max(366, Math.min(vW - boxW - 14, bx));
+      let by = Math.max(60, Math.min(396, item.y - 28));
+
+      // Simple vertical de-confliction so labels never overlap
+      for (const prev of usedBoxes) {
+        if (
+          bx < prev.x + prev.w + 6 &&
+          bx + boxW + 6 > prev.x &&
+          Math.abs(by - prev.y) < boxH + 6
+        ) {
+          by = Math.min(396, prev.y + boxH + 8);
+        }
+      }
+      usedBoxes.push({ x: bx, y: by, w: boxW, h: boxH });
+
+      ctx.save();
+      ctx.globalAlpha = item.highlight ? 0.96 : 0.72;
+
+      // Crisp leader line from 3D physical anchor point to tag
+      const attachX = bx > item.x ? bx : bx + boxW;
+      const attachY = by + boxH / 2;
+      ctx.strokeStyle = item.highlight ? accent : "#E2E8F0";
+      ctx.lineWidth = item.highlight ? 1.8 : 1.2;
+      ctx.beginPath();
+      ctx.moveTo(item.x, item.y);
+      ctx.lineTo(attachX, attachY);
+      ctx.stroke();
+
+      // Physical anchor dot on the 3D object
+      ctx.fillStyle = "#FFFFFF";
+      ctx.beginPath();
+      ctx.arc(item.x, item.y, item.highlight ? 4.5 : 3.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = item.highlight ? accent : "#0F172A";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Crisp slate label tag
+      ctx.fillStyle = "rgba(15, 23, 42, 0.88)";
+      drawRoundedRect(ctx, bx, by, boxW, boxH, 5);
+      ctx.fill();
+      ctx.strokeStyle = item.highlight ? accent : "rgba(148, 163, 184, 0.55)";
+      ctx.lineWidth = item.highlight ? 1.4 : 1;
+      ctx.stroke();
+
+      ctx.fillStyle = "#F8FAFC";
+      ctx.fillText(labelText, bx + 9, by + 16);
+      ctx.restore();
+    }
+  }
+
+  // 4. Compact Left Classroom Teaching Card (leaves right ~64% completely bright for the 3D model!)
+  const fadeIn = Math.min(1, sceneProgress * 4.0);
+  const slideX = (1 - fadeIn) * 10;
+  const cardX = 16;
+  const cardY = 60;
+  const cardW = has3d ? 326 : 520;
+  const cardH = 362;
 
   ctx.save();
   ctx.globalAlpha = fadeIn;
 
+  // Crisp translucent teaching card
+  ctx.fillStyle = has3d ? "rgba(15, 23, 42, 0.84)" : "rgba(15, 23, 42, 0.72)";
+  drawRoundedRect(ctx, cardX + slideX, cardY, cardW, cardH, 10);
+  ctx.fill();
+  ctx.strokeStyle = "rgba(148, 163, 184, 0.25)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Accent vertical left bar
+  ctx.fillStyle = accent;
+  drawRoundedRect(ctx, cardX + slideX, cardY + 12, 4, cardH - 24, 2);
+  ctx.fill();
+
+  const innerX = cardX + 18 + slideX;
+  const innerW = cardW - 32;
+
+  // Step tag
+  ctx.fillStyle = "#93C5FD";
+  ctx.font = "700 11px Inter, system-ui, sans-serif";
+  ctx.fillText(`STEP ${sceneIndex + 1} · EASY EXPLANATION`, innerX, cardY + 26);
+
   // Scene Heading
   ctx.fillStyle = "#FFFFFF";
-  ctx.font = "700 28px Inter, system-ui, -apple-system, sans-serif";
-  const headingLines = wrapCanvasLines(ctx, scene.heading, colMaxW, 2);
+  ctx.font = "700 20px Inter, system-ui, -apple-system, sans-serif";
+  const headingLines = wrapCanvasLines(ctx, scene.heading, innerW, 2);
   headingLines.forEach((line, idx) => {
-    ctx.fillText(line, 32 + slideX, 112 + idx * 36);
+    ctx.fillText(line, innerX, cardY + 54 + idx * 25);
   });
 
-  // Bullet Points (staggered reveal)
-  const bulletStartY = 118 + headingLines.length * 36 + 12;
-  ctx.font = "500 17px Inter, system-ui, -apple-system, sans-serif";
+  // Simple Student Bullet Points (revealed gently one by one)
+  const bulletStartY = cardY + 66 + headingLines.length * 25;
+  ctx.font = "500 14px Inter, system-ui, -apple-system, sans-serif";
   const bullets = (scene.bulletPoints || []).slice(0, 3);
+  let cursorY = bulletStartY;
   bullets.forEach((pt, idx) => {
-    const bulletAlpha = Math.min(1, Math.max(0, (sceneProgress - idx * 0.14) * 5));
+    const bulletAlpha = Math.min(1, Math.max(0, (sceneProgress - idx * 0.16) * 4.5));
     ctx.save();
     ctx.globalAlpha = fadeIn * bulletAlpha;
-    const by = bulletStartY + idx * 44;
     ctx.fillStyle = accent;
     ctx.beginPath();
-    ctx.arc(42 + slideX, by - 6, 4.5, 0, Math.PI * 2);
+    ctx.arc(innerX + 5, cursorY - 5, 3.5, 0, Math.PI * 2);
     ctx.fill();
 
     ctx.fillStyle = "#E2E8F0";
-    const wrapped = wrapCanvasLines(ctx, pt, colMaxW - 30, 2);
+    const wrapped = wrapCanvasLines(ctx, pt, innerW - 18, 2);
     wrapped.forEach((line, lIdx) => {
-      ctx.fillText(line, 56 + slideX, by + lIdx * 20);
+      ctx.fillText(line, innerX + 16, cursorY + lIdx * 18);
     });
+    cursorY += wrapped.length * 18 + 14;
     ctx.restore();
   });
 
-  // Highlighted Key Fact Card
+  // Highlighted Easy Takeaway Card anchored cleanly inside bottom of teaching panel
   if (scene.keyFact) {
-    const cardY = 342;
-    ctx.fillStyle = "rgba(15, 23, 42, 0.88)";
-    drawRoundedRect(ctx, 32 + slideX, cardY, colMaxW, 74, 12);
+    const factBoxH = 74;
+    const factBoxY = cardY + cardH - factBoxH - 14;
+    ctx.fillStyle = "rgba(2, 6, 23, 0.72)";
+    drawRoundedRect(ctx, innerX, factBoxY, innerW, factBoxH, 8);
     ctx.fill();
     ctx.strokeStyle = accent;
-    ctx.lineWidth = 1.6;
+    ctx.lineWidth = 1.2;
     ctx.stroke();
 
     ctx.fillStyle = "#93C5FD";
-    ctx.font = "700 11px Inter, system-ui, sans-serif";
-    ctx.fillText("KEY TAKEAWAY", 48 + slideX, cardY + 22);
+    ctx.font = "700 10px Inter, system-ui, sans-serif";
+    ctx.fillText("EASY TO REMEMBER", innerX + 12, factBoxY + 18);
 
     ctx.fillStyle = "#F8FAFC";
-    ctx.font = "600 15px Inter, system-ui, sans-serif";
-    const factLines = wrapCanvasLines(ctx, scene.keyFact, colMaxW - 32, 2);
+    ctx.font = "600 13px Inter, system-ui, sans-serif";
+    const factLines = wrapCanvasLines(ctx, scene.keyFact, innerW - 24, 2);
     factLines.forEach((line, idx) => {
-      ctx.fillText(line, 48 + slideX, cardY + 43 + idx * 19);
+      ctx.fillText(line, innerX + 12, factBoxY + 38 + idx * 17);
     });
   }
 
   ctx.restore();
 
   // 5. Right animated vector visual ONLY in 2D Slides mode
-  if (!webgl3dCanvas) {
-    drawSceneVisualAccent(ctx, scene.visualAccent, 770, 240, globalTimeSec, accent);
+  if (!has3d) {
+    drawSceneVisualAccent(ctx, scene.visualAccent, 745, 235, globalTimeSec * 0.55, accent);
   }
 
-  // 6. Bottom subtitle / teacher narration bar
-  ctx.fillStyle = "rgba(2, 6, 23, 0.84)";
-  ctx.fillRect(0, vH - 92, vW, 92);
+  // 6. Generous Bottom Teacher Subtitle Bar (up to 3 full readable lines — zero cut-offs!)
+  const subBarH = 104;
+  ctx.fillStyle = "rgba(2, 6, 23, 0.90)";
+  ctx.fillRect(0, vH - subBarH, vW, subBarH);
+  ctx.fillStyle = "rgba(148, 163, 184, 0.2)";
+  ctx.fillRect(0, vH - subBarH, vW, 1);
 
-  ctx.fillStyle = "#F1F5F9";
-  ctx.font = "500 17px Inter, system-ui, -apple-system, sans-serif";
-  const subLines = wrapCanvasLines(ctx, scene.narration, vW - 72, 2);
+  ctx.fillStyle = "#F8FAFC";
+  ctx.font = "500 16px Inter, system-ui, -apple-system, sans-serif";
+  const subLines = wrapCanvasLines(ctx, scene.narration, vW - 64, 3);
+  const startSubY =
+    subLines.length === 1
+      ? vH - 50
+      : subLines.length === 2
+        ? vH - 64
+        : vH - 76;
   subLines.forEach((line, idx) => {
     const textW = ctx.measureText(line).width;
-    ctx.fillText(line, (vW - textW) / 2, vH - 52 + idx * 24);
+    ctx.fillText(line, (vW - textW) / 2, startSubY + idx * 23);
   });
+
+  // Gentle Step-by-Step waiting prompt when auto-paused at end of a step
+  if (waitingForNextStep && sceneIndex + 1 < scenes.length) {
+    const hintText = "Step finished · Click Next Step →";
+    ctx.font = "600 12px Inter, system-ui, sans-serif";
+    const hw = ctx.measureText(hintText).width + 20;
+    ctx.fillStyle = accent;
+    drawRoundedRect(ctx, vW - hw - 16, vH - subBarH - 34, hw, 26, 6);
+    ctx.fill();
+    ctx.fillStyle = "#FFFFFF";
+    ctx.fillText(hintText, vW - hw - 6, vH - subBarH - 17);
+  }
 
   // 7. Overall timeline progress bar
   const totalProgress =
     (sceneIndex + Math.min(1, sceneProgress)) / Math.max(1, scenes.length);
   ctx.fillStyle = "rgba(148, 163, 184, 0.25)";
-  ctx.fillRect(0, vH - 6, vW, 6);
+  ctx.fillRect(0, vH - 5, vW, 5);
   ctx.fillStyle = accent;
-  ctx.fillRect(0, vH - 6, vW * totalProgress, 6);
+  ctx.fillRect(0, vH - 5, vW * totalProgress, 5);
 
   ctx.restore();
 }
@@ -1030,12 +1154,17 @@ export function StudyVideoPlayer({
   const engine3dRef = useRef<Study3DViewportEngine | null>(null);
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
   const ttsCacheRef = useRef<Map<number, string>>(new Map());
+  const ttsPrefetchingRef = useRef<Set<number>>(new Set());
   const narrationRunIdRef = useRef(0);
 
   const [renderMode, setRenderMode] = useState<"3d" | "2d">("3d");
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [sceneIndex, setSceneIndex] = useState(0);
+  // Default to calm 0.85x teacher pace so students can absorb every step comfortably
+  const [playbackSpeed, setPlaybackSpeed] = useState<0.75 | 0.85 | 1.0>(0.85);
+  const [stepByStep, setStepByStep] = useState(false);
+  const [waitingForNextStep, setWaitingForNextStep] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [exportPercent, setExportPercent] = useState(0);
 
@@ -1047,9 +1176,18 @@ export function StudyVideoPlayer({
   isMutedRef.current = isMuted;
   const sceneIndexRef = useRef(sceneIndex);
   sceneIndexRef.current = sceneIndex;
+  const playbackSpeedRef = useRef(playbackSpeed);
+  playbackSpeedRef.current = playbackSpeed;
+  const stepByStepRef = useRef(stepByStep);
+  stepByStepRef.current = stepByStep;
+  const waitingForNextStepRef = useRef(waitingForNextStep);
+  waitingForNextStepRef.current = waitingForNextStep;
+
   const sceneElapsedRef = useRef(0);
   const globalTimeRef = useRef(0);
   const spokenSceneRef = useRef<number>(-1);
+  const narrationStateRef = useRef<"idle" | "loading" | "speaking" | "done">("idle");
+  const narrationDoneAtRef = useRef<number>(0);
 
   const scenes = storyboard.scenes || [];
 
@@ -1064,7 +1202,7 @@ export function StudyVideoPlayer({
     [storyboard.scene3d, storyboard.title, storyboard.subject, storyboard.themeColor]
   );
 
-  // Initialize dedicated offscreen 3D WebGL Cinema engine for the video player
+  // Initialize dedicated offscreen 3D WebGL Physical Studio engine for the video player
   useEffect(() => {
     let engine: Study3DViewportEngine | null = null;
     try {
@@ -1086,14 +1224,28 @@ export function StudyVideoPlayer({
 
   // Clear TTS audio cache when storyboard changes
   useEffect(() => {
-    const cache = ttsCacheRef.current;
-    cache.clear();
+    ttsCacheRef.current.clear();
+    ttsPrefetchingRef.current.clear();
   }, [storyboard]);
+
+  // Update active HTML5 audio speed immediately when student changes pace
+  useEffect(() => {
+    if (ttsAudioRef.current) {
+      try {
+        ttsAudioRef.current.playbackRate = playbackSpeed;
+      } catch {
+        // ignore
+      }
+    }
+  }, [playbackSpeed]);
 
   const stopNarration = useCallback(() => {
     narrationRunIdRef.current += 1;
+    narrationStateRef.current = "idle";
     if (ttsAudioRef.current) {
       try {
+        ttsAudioRef.current.onended = null;
+        ttsAudioRef.current.onerror = null;
         ttsAudioRef.current.pause();
         ttsAudioRef.current.src = "";
       } catch {
@@ -1110,18 +1262,78 @@ export function StudyVideoPlayer({
     }
   }, []);
 
+  const prefetchSceneTts = useCallback(
+    (idx: number) => {
+      if (typeof navigator !== "undefined" && !navigator.onLine) return;
+      const target = scenes[idx];
+      if (!target?.narration) return;
+      if (ttsCacheRef.current.has(idx) || ttsPrefetchingRef.current.has(idx)) return;
+      ttsPrefetchingRef.current.add(idx);
+      void fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: target.narration,
+          voiceName: "Kore",
+          role: "student",
+          language: storyboard.language || "Auto-Detect",
+        }),
+      })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data: { audioBase64?: string } | null) => {
+          if (data?.audioBase64) {
+            ttsCacheRef.current.set(idx, data.audioBase64);
+          }
+        })
+        .catch(() => {
+          // silent background prefetch failure
+        })
+        .finally(() => {
+          ttsPrefetchingRef.current.delete(idx);
+        });
+    },
+    [scenes, storyboard.language]
+  );
+
   const speakBrowserNarration = useCallback(
-    (narration: string) => {
-      if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    (narration: string, runId: number) => {
+      if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+        if (narrationRunIdRef.current === runId) {
+          narrationStateRef.current = "done";
+          narrationDoneAtRef.current = globalTimeRef.current;
+        }
+        return;
+      }
       try {
         window.speechSynthesis.cancel();
         const utter = new SpeechSynthesisUtterance(narration);
         utter.lang = getSpeechLangCode(storyboard.language);
         utter.volume = 1.0;
-        utter.rate = 0.98;
+        utter.rate = playbackSpeedRef.current;
+        utter.onstart = () => {
+          if (narrationRunIdRef.current === runId) {
+            narrationStateRef.current = "speaking";
+          }
+        };
+        utter.onend = () => {
+          if (narrationRunIdRef.current === runId) {
+            narrationStateRef.current = "done";
+            narrationDoneAtRef.current = globalTimeRef.current;
+          }
+        };
+        utter.onerror = () => {
+          if (narrationRunIdRef.current === runId) {
+            narrationStateRef.current = "done";
+            narrationDoneAtRef.current = globalTimeRef.current;
+          }
+        };
+        narrationStateRef.current = "speaking";
         window.speechSynthesis.speak(utter);
       } catch {
-        // ignore speech synthesis errors
+        if (narrationRunIdRef.current === runId) {
+          narrationStateRef.current = "done";
+          narrationDoneAtRef.current = globalTimeRef.current;
+        }
       }
     },
     [storyboard.language]
@@ -1129,16 +1341,30 @@ export function StudyVideoPlayer({
 
   const speakSceneNarration = useCallback(
     (idx: number) => {
-      if (isMutedRef.current) return;
+      if (isMutedRef.current) {
+        narrationStateRef.current = "done";
+        narrationDoneAtRef.current = globalTimeRef.current;
+        return;
+      }
       const scene = scenes[idx];
-      if (!scene?.narration) return;
+      if (!scene?.narration) {
+        narrationStateRef.current = "done";
+        narrationDoneAtRef.current = globalTimeRef.current;
+        return;
+      }
 
       stopNarration();
       const myRun = narrationRunIdRef.current;
+      narrationStateRef.current = "loading";
 
-      // Offline immediate loud browser speech
+      // Quietly prefetch the next teaching step so transitions feel calm and instant
+      if (idx + 1 < scenes.length) {
+        prefetchSceneTts(idx + 1);
+      }
+
+      // Offline immediate calm browser speech
       if (typeof navigator !== "undefined" && !navigator.onLine) {
-        speakBrowserNarration(scene.narration);
+        speakBrowserNarration(scene.narration, myRun);
         return;
       }
 
@@ -1147,10 +1373,23 @@ export function StudyVideoPlayer({
         const audio = new Audio(`data:audio/wav;base64,${b64}`);
         audio.muted = false;
         audio.volume = 1.0;
+        audio.playbackRate = playbackSpeedRef.current;
+        audio.onended = () => {
+          if (narrationRunIdRef.current === myRun) {
+            narrationStateRef.current = "done";
+            narrationDoneAtRef.current = globalTimeRef.current;
+          }
+        };
+        audio.onerror = () => {
+          if (narrationRunIdRef.current === myRun && !isMutedRef.current) {
+            speakBrowserNarration(scene.narration, myRun);
+          }
+        };
         ttsAudioRef.current = audio;
+        narrationStateRef.current = "speaking";
         audio.play().catch(() => {
           if (narrationRunIdRef.current === myRun && !isMutedRef.current) {
-            speakBrowserNarration(scene.narration);
+            speakBrowserNarration(scene.narration, myRun);
           }
         });
       };
@@ -1161,7 +1400,7 @@ export function StudyVideoPlayer({
         return;
       }
 
-      // Fetch loud broadcast-mastered voice from /api/tts with fast fallback to browser TTS
+      // Fetch clear broadcast-mastered voice from /api/tts with fallback to browser speech
       void fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1180,14 +1419,14 @@ export function StudyVideoPlayer({
         })
         .catch(() => {
           if (narrationRunIdRef.current === myRun && !isMutedRef.current) {
-            speakBrowserNarration(scene.narration);
+            speakBrowserNarration(scene.narration, myRun);
           }
         });
     },
-    [scenes, storyboard.language, stopNarration, speakBrowserNarration]
+    [scenes, storyboard.language, stopNarration, speakBrowserNarration, prefetchSceneTts]
   );
 
-  // Main 3D Cinema + 2D composite animation loop
+  // Main 3D Documentary + Audio-Synced Student Pacing Loop
   useEffect(() => {
     let rafId = 0;
     let timerId = 0;
@@ -1201,10 +1440,15 @@ export function StudyVideoPlayer({
       lastTs = now;
       globalTimeRef.current += dt;
 
-      if (isPlayingRef.current && scenes.length > 0) {
+      const speed = playbackSpeedRef.current;
+
+      if (isPlayingRef.current && scenes.length > 0 && !waitingForNextStepRef.current) {
         const currentIdx = sceneIndexRef.current;
         const currentScene = scenes[currentIdx];
-        const dur = Math.max(4, Math.min(10, currentScene?.durationSec || 6));
+        const baseDur = Math.max(8, Math.min(13, currentScene?.durationSec || 9.5));
+        const minDisplaySec = baseDur / speed;
+        const wordCount = (currentScene?.narration || "").split(/\s+/).filter(Boolean).length;
+        const safetyMaxSec = Math.max(18, wordCount * 0.8 + 8) / speed;
 
         if (spokenSceneRef.current !== currentIdx) {
           spokenSceneRef.current = currentIdx;
@@ -1212,13 +1456,36 @@ export function StudyVideoPlayer({
         }
 
         sceneElapsedRef.current += dt;
-        if (sceneElapsedRef.current >= dur) {
+
+        // Audio-synced advancement: NEVER cut off narration mid-sentence!
+        let readyToAdvance = false;
+        if (isMutedRef.current) {
+          readyToAdvance = sceneElapsedRef.current >= minDisplaySec;
+        } else if (narrationStateRef.current === "done") {
+          // Wait a calm comprehension pause after the voice finishes speaking
+          const pauseAfterVoice = 2.2 / speed;
+          const timeSinceVoiceDone = globalTimeRef.current - narrationDoneAtRef.current;
+          readyToAdvance =
+            timeSinceVoiceDone >= pauseAfterVoice &&
+            sceneElapsedRef.current >= minDisplaySec * 0.65;
+        } else if (sceneElapsedRef.current >= safetyMaxSec) {
+          // Safety net if a browser speech engine never fires onend
+          readyToAdvance = true;
+        }
+
+        if (readyToAdvance) {
           if (currentIdx + 1 < scenes.length) {
-            sceneElapsedRef.current = 0;
-            sceneIndexRef.current = currentIdx + 1;
-            setSceneIndex(currentIdx + 1);
+            if (stepByStepRef.current) {
+              waitingForNextStepRef.current = true;
+              setWaitingForNextStep(true);
+            } else {
+              sceneElapsedRef.current = 0;
+              narrationStateRef.current = "idle";
+              sceneIndexRef.current = currentIdx + 1;
+              setSceneIndex(currentIdx + 1);
+            }
           } else {
-            sceneElapsedRef.current = dur;
+            sceneElapsedRef.current = minDisplaySec;
             isPlayingRef.current = false;
             setIsPlaying(false);
           }
@@ -1229,19 +1496,23 @@ export function StudyVideoPlayer({
       const ctx = canvas?.getContext("2d");
       if (ctx && scenes.length > 0) {
         const idx = sceneIndexRef.current;
-        const dur = Math.max(4, Math.min(10, scenes[idx]?.durationSec || 6));
+        const baseDur = Math.max(8, Math.min(13, scenes[idx]?.durationSec || 9.5));
+        const displayDur = baseDur / speed;
         const progress = isPlayingRef.current
-          ? Math.min(1, sceneElapsedRef.current / dur)
-          : Math.max(0.55, Math.min(1, sceneElapsedRef.current / dur));
+          ? Math.min(1, sceneElapsedRef.current / displayDur)
+          : Math.max(0.65, Math.min(1, sceneElapsedRef.current / displayDur));
 
         let webglCanvas: HTMLCanvasElement | null = null;
+        let projectedLabels: Study3DProjectedLabel[] | undefined;
         if (renderModeRef.current === "3d" && engine3dRef.current) {
           engine3dRef.current.renderCinematicFrame(
             globalTimeRef.current,
             idx,
-            progress
+            progress,
+            dt
           );
           webglCanvas = engine3dRef.current.domElement;
+          projectedLabels = engine3dRef.current.getProjectedLabels(960, 540, idx);
         }
 
         drawStudyVideoFrame(
@@ -1250,7 +1521,9 @@ export function StudyVideoPlayer({
           idx,
           progress,
           globalTimeRef.current,
-          webglCanvas
+          webglCanvas,
+          projectedLabels,
+          waitingForNextStepRef.current
         );
       }
 
@@ -1270,32 +1543,50 @@ export function StudyVideoPlayer({
     };
   }, [scenes, storyboard, speakSceneNarration, stopNarration]);
 
+  const handleJumpScene = useCallback(
+    (idx: number, autoStart = false) => {
+      const clamped = Math.max(0, Math.min(scenes.length - 1, idx));
+      sceneIndexRef.current = clamped;
+      sceneElapsedRef.current = 0;
+      spokenSceneRef.current = -1;
+      narrationStateRef.current = "idle";
+      waitingForNextStepRef.current = false;
+      setWaitingForNextStep(false);
+      setSceneIndex(clamped);
+      if (isPlayingRef.current || autoStart) {
+        isPlayingRef.current = true;
+        setIsPlaying(true);
+        spokenSceneRef.current = clamped;
+        speakSceneNarration(clamped);
+      } else {
+        stopNarration();
+      }
+    },
+    [scenes.length, speakSceneNarration, stopNarration]
+  );
+
   const handleTogglePlay = () => {
+    if (waitingForNextStepRef.current && sceneIndexRef.current + 1 < scenes.length) {
+      handleJumpScene(sceneIndexRef.current + 1, true);
+      return;
+    }
     if (isPlaying) {
       setIsPlaying(false);
       stopNarration();
       return;
     }
     const lastIdx = scenes.length - 1;
-    const lastDur = Math.max(4, Math.min(10, scenes[lastIdx]?.durationSec || 6));
-    if (sceneIndexRef.current >= lastIdx && sceneElapsedRef.current >= lastDur - 0.1) {
+    const lastDur = Math.max(8, Math.min(13, scenes[lastIdx]?.durationSec || 9.5)) / playbackSpeed;
+    if (sceneIndexRef.current >= lastIdx && sceneElapsedRef.current >= lastDur - 0.15) {
       sceneIndexRef.current = 0;
       sceneElapsedRef.current = 0;
       setSceneIndex(0);
     }
+    waitingForNextStepRef.current = false;
+    setWaitingForNextStep(false);
     spokenSceneRef.current = -1;
+    narrationStateRef.current = "idle";
     setIsPlaying(true);
-  };
-
-  const handleJumpScene = (idx: number) => {
-    sceneIndexRef.current = idx;
-    sceneElapsedRef.current = 0;
-    spokenSceneRef.current = -1;
-    setSceneIndex(idx);
-    if (isPlaying) {
-      speakSceneNarration(idx);
-      spokenSceneRef.current = idx;
-    }
   };
 
   const handleDownloadWebm = async () => {
@@ -1337,7 +1628,7 @@ export function StudyVideoPlayer({
       const stream = canvas.captureStream(30);
       const recorder = new MediaRecorder(stream, {
         mimeType,
-        videoBitsPerSecond: 3_600_000,
+        videoBitsPerSecond: 3_800_000,
       });
       const chunks: Blob[] = [];
       recorder.ondataavailable = (ev) => {
@@ -1350,13 +1641,17 @@ export function StudyVideoPlayer({
 
       recorder.start();
 
-      const secPerScene = 4.0;
+      // Calm student-friendly reading pace per exported scene (~8s per step)
+      const secPerScene = Math.round((8.0 / playbackSpeedRef.current) * 10) / 10;
       const totalDuration = scenes.length * secPerScene;
       const startTime = performance.now();
+      let prevElapsed = 0;
 
       await new Promise<void>((resolve) => {
         const renderStep = () => {
           const elapsed = (performance.now() - startTime) / 1000;
+          const stepDt = Math.max(0.016, Math.min(0.1, elapsed - prevElapsed));
+          prevElapsed = elapsed;
           if (elapsed >= totalDuration) {
             setExportPercent(100);
             resolve();
@@ -1364,8 +1659,10 @@ export function StudyVideoPlayer({
           }
           const idx = Math.min(scenes.length - 1, Math.floor(elapsed / secPerScene));
           const progress = (elapsed - idx * secPerScene) / secPerScene;
+          let projectedLabels: Study3DProjectedLabel[] | undefined;
           if (export3dEngine) {
-            export3dEngine.renderCinematicFrame(elapsed, idx, progress);
+            export3dEngine.renderCinematicFrame(elapsed, idx, progress, stepDt);
+            projectedLabels = export3dEngine.getProjectedLabels(960, 540, idx);
           }
           drawStudyVideoFrame(
             ctx,
@@ -1373,7 +1670,9 @@ export function StudyVideoPlayer({
             idx,
             progress,
             elapsed,
-            export3dEngine?.domElement || null
+            export3dEngine?.domElement || null,
+            projectedLabels,
+            false
           );
           setExportPercent(Math.min(99, Math.round((elapsed / totalDuration) * 100)));
           window.requestAnimationFrame(renderStep);
@@ -1386,7 +1685,7 @@ export function StudyVideoPlayer({
       const url = URL.createObjectURL(videoBlob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${slugifyFilename(storyboard.title, "3d-real-video")}-3d.webm`;
+      a.download = `${slugifyFilename(storyboard.title, "3d-study-video")}-3d.webm`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 2000);
     } finally {
@@ -1407,7 +1706,7 @@ export function StudyVideoPlayer({
               {storyboard.title}
             </p>
             <p className="text-[11px] text-slate-400 truncate">
-              {renderMode === "3d" ? "3D Real Cinema Video" : "2D Slide Video"} · {scenes.length} narrated scenes
+              {renderMode === "3d" ? "Physical 3D Explainer" : "2D Slide Lesson"} · {scenes.length} easy steps · Calm pace
             </p>
           </div>
         </div>
@@ -1423,7 +1722,7 @@ export function StudyVideoPlayer({
               }`}
             >
               <Box className="h-3 w-3" />
-              <span>3D Cinema</span>
+              <span>3D Physical</span>
             </button>
             <button
               type="button"
@@ -1447,7 +1746,7 @@ export function StudyVideoPlayer({
             {isExporting ? (
               <>
                 <Loader2 className="h-3 w-3 animate-spin" />
-                <span>Rendering 3D {exportPercent}%…</span>
+                <span>Saving 3D {exportPercent}%…</span>
               </>
             ) : (
               <>
@@ -1459,7 +1758,7 @@ export function StudyVideoPlayer({
         </div>
       </div>
 
-      {/* 16:9 3D Animated Video Viewport */}
+      {/* 16:9 3D Animated Documentary Viewport */}
       <div className="relative bg-slate-950 cursor-pointer" onClick={handleTogglePlay}>
         <canvas
           ref={canvasRef}
@@ -1468,7 +1767,7 @@ export function StudyVideoPlayer({
           className="w-full aspect-video block"
         />
         {!isPlaying && !isExporting && (
-          <div className="absolute inset-0 flex items-center justify-center bg-slate-950/25 transition-colors hover:bg-slate-950/15">
+          <div className="absolute inset-0 flex items-center justify-center bg-slate-950/20 transition-colors hover:bg-slate-950/10">
             <span className="h-14 w-14 rounded-full bg-blue-600/95 text-white flex items-center justify-center shadow-lg">
               <Play className="h-6 w-6 fill-white ml-0.5" />
             </span>
@@ -1476,15 +1775,20 @@ export function StudyVideoPlayer({
         )}
       </div>
 
-      {/* Playback & Chapter Controls */}
-      <div className="px-3.5 py-2.5 bg-slate-900 border-t border-slate-800 flex flex-wrap items-center justify-between gap-2.5">
-        <div className="flex items-center gap-1.5">
+      {/* Student Pace, Step-by-Step & Chapter Controls */}
+      <div className="px-3.5 py-2.5 bg-slate-900 border-t border-slate-800 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5 flex-wrap">
           <button
             type="button"
             onClick={handleTogglePlay}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white transition-colors"
           >
-            {isPlaying ? (
+            {waitingForNextStep && sceneIndex + 1 < scenes.length ? (
+              <>
+                <ChevronRight className="h-3.5 w-3.5" />
+                <span>Next Step</span>
+              </>
+            ) : isPlaying ? (
               <>
                 <Pause className="h-3.5 w-3.5" />
                 <span>Pause</span>
@@ -1492,15 +1796,38 @@ export function StudyVideoPlayer({
             ) : (
               <>
                 <Play className="h-3.5 w-3.5 fill-white" />
-                <span>Play 3D Video</span>
+                <span>Play Lesson</span>
               </>
             )}
           </button>
 
           <button
             type="button"
+            disabled={sceneIndex <= 0}
+            onClick={() => handleJumpScene(sceneIndex - 1)}
+            aria-label="Previous step"
+            title="Previous step"
+            className="h-8 w-8 inline-flex items-center justify-center rounded-md bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 transition-colors"
+          >
+            <ChevronLeft className="h-4 w-4" />
+          </button>
+
+          <button
+            type="button"
+            disabled={sceneIndex >= scenes.length - 1}
+            onClick={() => handleJumpScene(sceneIndex + 1, isPlaying)}
+            aria-label="Next step"
+            title="Next step"
+            className="h-8 w-8 inline-flex items-center justify-center rounded-md bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 transition-colors"
+          >
+            <ChevronRight className="h-4 w-4" />
+          </button>
+
+          <button
+            type="button"
             onClick={() => handleJumpScene(0)}
-            aria-label="Restart video"
+            aria-label="Restart lesson"
+            title="Restart from Step 1"
             className="h-8 w-8 inline-flex items-center justify-center rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 transition-colors"
           >
             <RotateCcw className="h-3.5 w-3.5" />
@@ -1513,7 +1840,8 @@ export function StudyVideoPlayer({
               setIsMuted(nextMuted);
               if (nextMuted) stopNarration();
             }}
-            aria-label={isMuted ? "Unmute narration" : "Mute narration"}
+            aria-label={isMuted ? "Unmute teacher voice" : "Mute teacher voice"}
+            title={isMuted ? "Unmute teacher voice" : "Mute teacher voice"}
             className="h-8 w-8 inline-flex items-center justify-center rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 transition-colors"
           >
             {isMuted ? (
@@ -1521,6 +1849,45 @@ export function StudyVideoPlayer({
             ) : (
               <Volume2 className="h-3.5 w-3.5 text-sky-400" />
             )}
+          </button>
+
+          {/* Calm Pace Speed Selector */}
+          <div className="inline-flex items-center rounded-md bg-slate-800 p-0.5 ml-0.5" title="Voice & lesson pace">
+            {([0.75, 0.85, 1.0] as const).map((spd) => (
+              <button
+                key={spd}
+                type="button"
+                onClick={() => setPlaybackSpeed(spd)}
+                className={`px-1.5 py-1 rounded text-[11px] font-semibold transition-colors ${
+                  playbackSpeed === spd
+                    ? "bg-sky-500 text-slate-950"
+                    : "text-slate-300 hover:text-white"
+                }`}
+              >
+                {spd === 0.75 ? "0.75× Slow" : spd === 0.85 ? "0.85×" : "1.0×"}
+              </button>
+            ))}
+          </div>
+
+          {/* Step-by-Step Auto-Pause Mode */}
+          <button
+            type="button"
+            onClick={() => {
+              const next = !stepByStep;
+              setStepByStep(next);
+              if (!next && waitingForNextStepRef.current && sceneIndexRef.current + 1 < scenes.length) {
+                handleJumpScene(sceneIndexRef.current + 1, true);
+              }
+            }}
+            title="Auto-pause after each step so you can learn at your own pace"
+            className={`inline-flex items-center gap-1 px-2 py-1.5 rounded-md text-[11px] font-semibold transition-colors ${
+              stepByStep
+                ? "bg-amber-500/20 text-amber-300 border border-amber-500/50"
+                : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+            }`}
+          >
+            <StepForward className="h-3.5 w-3.5" />
+            <span>Step-by-Step</span>
           </button>
         </div>
 
@@ -1531,7 +1898,7 @@ export function StudyVideoPlayer({
               key={`${sc.heading}-${idx}`}
               type="button"
               onClick={() => handleJumpScene(idx)}
-              title={sc.heading}
+              title={`Step ${idx + 1}: ${sc.heading}`}
               className={`px-2 py-1 rounded text-[11px] font-semibold transition-colors whitespace-nowrap ${
                 idx === sceneIndex
                   ? "bg-sky-500 text-slate-950"

@@ -41,6 +41,8 @@ interface StudyNotesViewProps {
   onAddNote: (note: StudyNote) => void;
   onUpdateNote: (note: StudyNote) => void;
   onDeleteNote: (id: string) => void;
+  onToggleNoteCompleted: (id: string) => void;
+  onPracticeCorrect?: (profileId: string, noteId: string, questionIndex: number) => void;
   onOpenInReader?: (text: string, language?: string) => void;
 }
 
@@ -59,6 +61,8 @@ export function StudyNotesView({
   onAddNote,
   onUpdateNote,
   onDeleteNote,
+  onToggleNoteCompleted,
+  onPracticeCorrect,
   onOpenInReader,
 }: StudyNotesViewProps) {
   const [searchQuery, setSearchQuery] = useState("");
@@ -383,6 +387,9 @@ export function StudyNotesView({
         throw new Error(data.error || "Could not check answer.");
       }
       setQuizFeedback((prev) => ({ ...prev, [key]: data }));
+      if (data.isCorrect) {
+        onPracticeCorrect?.(note.profileId, note.id, idx);
+      }
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Answer check failed.");
     } finally {
@@ -701,17 +708,33 @@ export function StudyNotesView({
                     isSelected ? "bg-blue-50/70" : "hover:bg-slate-50"
                   }`}
                 >
-                  <p
-                    className={`text-sm font-semibold leading-snug line-clamp-2 ${
-                      isSelected ? "text-blue-950" : "text-slate-900"
-                    }`}
-                  >
-                    {note.title}
-                  </p>
+                  <div className="flex items-start justify-between gap-2">
+                    <p
+                      className={`text-sm font-semibold leading-snug line-clamp-2 ${
+                        isSelected ? "text-blue-950" : "text-slate-900"
+                      }`}
+                    >
+                      {note.title}
+                    </p>
+                    {note.completed && (
+                      <CheckCircle2
+                        aria-label="Completed study note"
+                        className="h-4 w-4 text-emerald-600 shrink-0 mt-0.5"
+                      />
+                    )}
+                  </div>
                   <div className="mt-1.5 flex items-center gap-1.5 text-xs text-slate-500 truncate">
                     <span>{note.subject}</span>
                     <span aria-hidden="true">·</span>
                     <span className="truncate">{note.profileName}</span>
+                    {note.completed && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="text-emerald-700 font-medium shrink-0">
+                          Completed
+                        </span>
+                      </>
+                    )}
                     <span aria-hidden="true">·</span>
                     <span className="tabular-nums shrink-0">
                       {formatShortDate(note.createdAt)}
@@ -780,6 +803,28 @@ export function StudyNotesView({
                 </div>
 
                 <div className="no-print flex items-center gap-1.5 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={() => onToggleNoteCompleted(activeNote.id)}
+                    title={
+                      activeNote.completed
+                        ? "Completed! Click to mark as in-progress"
+                        : "Mark this study note as completed to earn +25 Study Points"
+                    }
+                    className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition-colors whitespace-nowrap ${
+                      activeNote.completed
+                        ? "bg-emerald-600 hover:bg-emerald-700 text-white"
+                        : "bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200"
+                    }`}
+                  >
+                    <CheckCircle2 className="h-3.5 w-3.5" />
+                    <span>
+                      {activeNote.completed
+                        ? "Completed"
+                        : "Mark Complete (+25 pts)"}
+                    </span>
+                  </button>
+
                   <button
                     type="button"
                     disabled={isLoadingAudio}

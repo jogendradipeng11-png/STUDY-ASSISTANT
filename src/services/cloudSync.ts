@@ -22,6 +22,7 @@ import type {
   StudyNote,
   VoiceName,
 } from "../types";
+import { clampNonNegativeInt, STUDY_BOUNDS } from "../utils/studyPoints";
 
 const ALLOWED_VOICES = new Set<VoiceName>([
   "Zephyr",
@@ -81,6 +82,21 @@ function buildProfilePayload(uid: string, profile: FamilyProfile) {
     typeof profile.avatarUrl === "string"
       ? profile.avatarUrl.slice(0, 180000)
       : "";
+  payload.studyPoints = clampNonNegativeInt(
+    profile.studyPoints ?? 0,
+    STUDY_BOUNDS.MAX_POINTS
+  );
+  payload.studySessionsCount = clampNonNegativeInt(
+    profile.studySessionsCount ?? 0,
+    STUDY_BOUNDS.MAX_SESSIONS
+  );
+  payload.completedNotesCount = clampNonNegativeInt(
+    profile.completedNotesCount ?? 0,
+    STUDY_BOUNDS.MAX_COMPLETED_NOTES
+  );
+  if (typeof profile.lastStudiedAt === "string" && profile.lastStudiedAt.trim()) {
+    payload.lastStudiedAt = clampStr(profile.lastStudiedAt, 64);
+  }
 
   return { safeId, payload };
 }
@@ -114,7 +130,7 @@ function buildNotePayload(uid: string, note: StudyNote) {
       answer: clampStr(q?.answer, 800),
     }));
 
-  const payload = {
+  const payload: Record<string, unknown> = {
     ownerId: uid,
     id: safeId,
     profileId: safeProfileId,
@@ -127,6 +143,11 @@ function buildNotePayload(uid: string, note: StudyNote) {
     practiceQuestions,
     teacherTip: clampStr(note.teacherTip, 1000),
     sourceMode,
+    completed: Boolean(note.completed),
+    completedAt:
+      note.completed && typeof note.completedAt === "string"
+        ? clampStr(note.completedAt, 64)
+        : "",
   };
 
   return { safeId, payload };
@@ -274,6 +295,12 @@ export async function saveCloudProfile(
       if ("preferredLanguage" in payload)
         updateFields.preferredLanguage = payload.preferredLanguage;
       if ("avatarUrl" in payload) updateFields.avatarUrl = payload.avatarUrl;
+      updateFields.studyPoints = payload.studyPoints;
+      updateFields.studySessionsCount = payload.studySessionsCount;
+      updateFields.completedNotesCount = payload.completedNotesCount;
+      if ("lastStudiedAt" in payload) {
+        updateFields.lastStudiedAt = payload.lastStudiedAt;
+      }
       await updateDoc(ref, updateFields);
     }
   } catch (err) {
@@ -322,6 +349,8 @@ export async function saveCloudNote(
         practiceQuestions: payload.practiceQuestions,
         teacherTip: payload.teacherTip,
         sourceMode: payload.sourceMode,
+        completed: payload.completed,
+        completedAt: payload.completedAt,
         updatedAt: serverTimestamp(),
       });
     }
@@ -509,6 +538,22 @@ export function subscribeToFamilyCloud(
                 : undefined,
             initials: String(data.initials || "FM"),
             accentColor: String(data.accentColor || "#1D4ED8"),
+            studyPoints: clampNonNegativeInt(
+              data.studyPoints,
+              STUDY_BOUNDS.MAX_POINTS
+            ),
+            studySessionsCount: clampNonNegativeInt(
+              data.studySessionsCount,
+              STUDY_BOUNDS.MAX_SESSIONS
+            ),
+            completedNotesCount: clampNonNegativeInt(
+              data.completedNotesCount,
+              STUDY_BOUNDS.MAX_COMPLETED_NOTES
+            ),
+            lastStudiedAt:
+              typeof data.lastStudiedAt === "string" && data.lastStudiedAt
+                ? data.lastStudiedAt
+                : undefined,
           };
         });
         // Keep parent profile first for consistent order
@@ -571,6 +616,11 @@ export function subscribeToFamilyCloud(
               data.sourceMode === "voice" || data.sourceMode === "topic"
                 ? data.sourceMode
                 : "chat",
+            completed: Boolean(data.completed),
+            completedAt:
+              typeof data.completedAt === "string" && data.completedAt
+                ? data.completedAt
+                : undefined,
           };
         });
         list.sort(

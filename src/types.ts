@@ -16,6 +16,10 @@ export interface FamilyProfile {
   avatarUrl?: string;
   initials: string;
   accentColor: string;
+  studyPoints?: number;
+  studySessionsCount?: number;
+  completedNotesCount?: number;
+  lastStudiedAt?: string;
 }
 
 export interface GroundingSource {
@@ -100,6 +104,7 @@ export interface Study3DPartSpec {
   emissive?: string;
   opacity?: number;
   animate?: "spin" | "orbit" | "pulse" | "float" | "none";
+  name?: string;
 }
 
 export interface Study3DSceneBlueprint {
@@ -196,6 +201,8 @@ export interface StudyNote {
   createdAt: string;
   updatedAt: string;
   sourceMode: "chat" | "voice" | "topic";
+  completed?: boolean;
+  completedAt?: string;
 }
 
 export interface LiveTranscriptItem {

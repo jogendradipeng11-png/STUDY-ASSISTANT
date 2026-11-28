@@ -39,6 +39,7 @@ interface LiveVoiceViewProps {
   onChangeLanguage: (language: string) => void;
   onSaveNote: (note: StudyNote) => void;
   onOpenNote: (noteId: string) => void;
+  onStudySessionComplete?: (profileId: string, reason?: string) => void;
 }
 
 type LiveStatus = "idle" | "connecting" | "connected" | "error";
@@ -87,6 +88,7 @@ export function LiveVoiceView({
   onChangeLanguage,
   onSaveNote,
   onOpenNote,
+  onStudySessionComplete,
 }: LiveVoiceViewProps) {
   const activeLanguage = profile.preferredLanguage || "Auto-Detect";
   const [status, setStatus] = useState<LiveStatus>("idle");
@@ -118,6 +120,7 @@ export function LiveVoiceView({
   const [isPlayingRevision, setIsPlayingRevision] = useState(false);
   const [savedNote, setSavedNote] = useState<StudyNote | null>(null);
   const savedNoteSignatureRef = useRef("");
+  const sessionPointsAwardedRef = useRef(false);
 
   // Refs to avoid stale closures inside audio/WebSocket callbacks
   const wsRef = useRef<WebSocket | null>(null);
@@ -636,6 +639,7 @@ export function LiveVoiceView({
 
           if (msg.type === "ready") {
             setStatus("connected");
+            sessionPointsAwardedRef.current = false;
 
             // Start 16kHz PCM microphone streaming once Gemini Live session is ready
             const inputCtx = new AudioContext({ sampleRate: 16000 });
@@ -707,6 +711,10 @@ export function LiveVoiceView({
 
           if (msg.type === "outputTranscript" && msg.text) {
             appendTranscriptChunk("jarvis", msg.text);
+            if (!sessionPointsAwardedRef.current) {
+              sessionPointsAwardedRef.current = true;
+              onStudySessionComplete?.(profile.id, "Live Voice study session");
+            }
             return;
           }
 

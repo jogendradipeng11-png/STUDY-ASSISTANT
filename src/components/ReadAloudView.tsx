@@ -36,6 +36,7 @@ interface ReadAloudViewProps {
   onChangeLanguage: (language: string) => void;
   onSaveNote: (note: StudyNote) => void;
   onOpenNote: (noteId: string) => void;
+  onStudySessionComplete?: (profileId: string, reason?: string) => void;
 }
 
 type ReadingMode = "exact" | "translate" | "explain";
@@ -116,6 +117,7 @@ export function ReadAloudView({
   onChangeLanguage,
   onSaveNote,
   onOpenNote,
+  onStudySessionComplete,
 }: ReadAloudViewProps) {
   const [sourceText, setSourceText] = useState(initialText);
   const [preparedText, setPreparedText] = useState("");
@@ -363,9 +365,16 @@ export function ReadAloudView({
         setIsPlaying(false);
         setIsPaused(false);
         setActiveSentenceIdx(null);
+        onStudySessionComplete?.(profile.id, "Read Aloud study session");
       }
     },
-    [fetchSentenceAudio, speakWithBrowserFallback, stopReading]
+    [
+      fetchSentenceAudio,
+      onStudySessionComplete,
+      profile.id,
+      speakWithBrowserFallback,
+      stopReading,
+    ]
   );
 
   const handleStartReading = useCallback(

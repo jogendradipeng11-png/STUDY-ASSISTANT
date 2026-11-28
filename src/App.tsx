@@ -33,8 +33,15 @@ import {
   saveNotes,
   saveProfiles,
 } from "./utils/storage";
+import {
+  applyStudyActivityToProfile,
+  STUDY_POINTS,
+} from "./utils/studyPoints";
 import { TopBar } from "./components/TopBar";
-import { ProfileSidebar } from "./components/ProfileSidebar";
+import {
+  ProfileSidebar,
+  type RecentPointsAward,
+} from "./components/ProfileSidebar";
 import { AssistantView } from "./components/AssistantView";
 import { LiveVoiceView } from "./components/LiveVoiceView";
 import { StudyNotesView } from "./components/StudyNotesView";
@@ -125,9 +132,26 @@ export default function App() {
     "idle" | "syncing" | "synced" | "error"
   >("idle");
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [recentPointsAward, setRecentPointsAward] =
+    useState<RecentPointsAward | null>(null);
 
   const cloudUidRef = useRef<string | null>(null);
   const chatSyncTimersRef = useRef<Record<string, number>>({});
+  const recentAwardTimerRef = useRef<number | null>(null);
+  const awardedAssistantMsgIdsRef = useRef<Set<string> | null>(null);
+  const awardedQuizKeysRef = useRef<Set<string>>(new Set());
+
+  if (awardedAssistantMsgIdsRef.current === null) {
+    const initialIds = new Set<string>();
+    for (const msgs of Object.values(chatsByProfile)) {
+      for (const m of msgs) {
+        if (m.role === "assistant" && m.id) {
+          initialIds.add(m.id);
+        }
+      }
+    }
+    awardedAssistantMsgIdsRef.current = initialIds;
+  }
   const latestLocalStateRef = useRef({
     profiles,
     notes,
@@ -203,6 +227,15 @@ export default function App() {
             );
           },
           onChats: (cloudChats) => {
+            if (awardedAssistantMsgIdsRef.current) {
+              for (const msgs of Object.values(cloudChats)) {
+                for (const m of msgs) {
+                  if (m.role === "assistant" && m.id) {
+                    awardedAssistantMsgIdsRef.current.add(m.id);
+                  }
+                }
+              }
+            }
             setChatsByProfile((prev) => ({ ...prev, ...cloudChats }));
           },
           onAlarms: (cloudAlarms) => {
@@ -362,8 +395,133 @@ export default function App() {
     return counts;
   }, [notes]);
 
+  const completedNotesCountByProfile = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const n of notes) {
+      if (n.completed) {
+        counts[n.profileId] = (counts[n.profileId] || 0) + 1;
+      }
+    }
+    return counts;
+  }, [notes]);
+
+  const awardProfileStudyActivity = useCallback(
+    (
+      profileId: string,
+      opts: {
+        pointsDelta: number;
+        sessionsDelta?: number;
+        completedNotesDelta?: number;
+        reason?: string;
+      }
+    ) => {
+      if (
+        opts.pointsDelta === 0 &&
+        !opts.sessionsDelta &&
+        !opts.completedNotesDelta
+      ) {
+        return;
+      }
+
+      const currentProfile = latestLocalStateRef.current.profiles.find(
+        (p) => p.id === profileId
+      );
+      if (!currentProfile) return;
+
+      const updatedTarget = applyStudyActivityToProfile(currentProfile, {
+        pointsDelta: opts.pointsDelta,
+        sessionsDelta: opts.sessionsDelta,
+        completedNotesDelta: opts.completedNotesDelta,
+        touchTimestamp: opts.pointsDelta > 0,
+      });
+
+      latestLocalStateRef.current = {
+        ...latestLocalStateRef.current,
+        profiles: latestLocalStateRef.current.profiles.map((p) =>
+          p.id === profileId ? updatedTarget : p
+        ),
+      };
+
+      setProfiles((prev) =>
+        prev.map((p) =>
+          p.id === profileId
+            ? applyStudyActivityToProfile(p, {
+                pointsDelta: opts.pointsDelta,
+                sessionsDelta: opts.sessionsDelta,
+                completedNotesDelta: opts.completedNotesDelta,
+                touchTimestamp: opts.pointsDelta > 0,
+              })
+            : p
+        )
+      );
+
+      if (opts.reason) {
+        if (recentAwardTimerRef.current) {
+          window.clearTimeout(recentAwardTimerRef.current);
+        }
+        setRecentPointsAward({
+          profileId,
+          delta: opts.pointsDelta,
+          reason: opts.reason,
+          id: Date.now(),
+        });
+        recentAwardTimerRef.current = window.setTimeout(() => {
+          setRecentPointsAward(null);
+        }, 4200);
+      }
+
+      const uid = cloudUidRef.current;
+      if (uid) {
+        void saveCloudProfile(uid, updatedTarget).catch(() => {});
+      }
+    },
+    []
+  );
+
+  const handleRecordStudySession = useCallback(
+    (profileId: string, reason = "Active study session") => {
+      awardProfileStudyActivity(profileId, {
+        pointsDelta: STUDY_POINTS.ACTIVE_SESSION,
+        sessionsDelta: 1,
+        reason,
+      });
+    },
+    [awardProfileStudyActivity]
+  );
+
+  const handlePracticeCorrect = useCallback(
+    (profileId: string, noteId: string, questionIndex: number) => {
+      const key = `${noteId}:${questionIndex}`;
+      if (awardedQuizKeysRef.current.has(key)) return;
+      awardedQuizKeysRef.current.add(key);
+      awardProfileStudyActivity(profileId, {
+        pointsDelta: STUDY_POINTS.QUIZ_CORRECT,
+        reason: "Correct self-check answer",
+      });
+    },
+    [awardProfileStudyActivity]
+  );
+
   const handleUpdateMessages = (profileId: string, updated: ChatMessage[]) => {
     setChatsByProfile((prev) => ({ ...prev, [profileId]: updated }));
+
+    // Award active study session points once for each new Assistant Desk reply
+    const awardedSet = awardedAssistantMsgIdsRef.current;
+    if (awardedSet && updated.length > 0) {
+      const lastMsg = updated[updated.length - 1];
+      if (
+        lastMsg.role === "assistant" &&
+        lastMsg.id &&
+        !awardedSet.has(lastMsg.id) &&
+        (lastMsg.content.trim().length >= 8 ||
+          Boolean(lastMsg.studyDiagram) ||
+          Boolean(lastMsg.studyVideo))
+      ) {
+        awardedSet.add(lastMsg.id);
+        handleRecordStudySession(profileId, "Active study session");
+      }
+    }
+
     const uid = cloudUidRef.current;
     if (uid) {
       const prevTimer = chatSyncTimersRef.current[profileId];
@@ -376,6 +534,10 @@ export default function App() {
 
   const handleAddNote = (note: StudyNote) => {
     setNotes((prev) => [note, ...prev]);
+    awardProfileStudyActivity(note.profileId, {
+      pointsDelta: STUDY_POINTS.NOTE_CREATED,
+      reason: "Saved study note",
+    });
     const uid = cloudUidRef.current;
     if (uid) {
       void saveCloudNote(uid, note).catch((err) => {
@@ -395,6 +557,47 @@ export default function App() {
       });
     }
   };
+
+  const handleToggleNoteCompleted = useCallback(
+    (noteId: string) => {
+      const target = latestLocalStateRef.current.notes.find(
+        (n) => n.id === noteId
+      );
+      if (!target) return;
+
+      const nextCompleted = !target.completed;
+      const now = new Date().toISOString();
+      const updatedNote: StudyNote = {
+        ...target,
+        completed: nextCompleted,
+        completedAt: nextCompleted ? now : undefined,
+        updatedAt: now,
+      };
+
+      setNotes((prev) =>
+        prev.map((n) => (n.id === noteId ? updatedNote : n))
+      );
+
+      awardProfileStudyActivity(target.profileId, {
+        pointsDelta: nextCompleted
+          ? STUDY_POINTS.NOTE_COMPLETED
+          : -STUDY_POINTS.NOTE_COMPLETED,
+        completedNotesDelta: nextCompleted ? 1 : -1,
+        reason: nextCompleted ? "Completed study note" : "Note marked in-progress",
+      });
+
+      const uid = cloudUidRef.current;
+      if (uid) {
+        void saveCloudNote(uid, updatedNote).catch((err) => {
+          setSyncStatus("error");
+          setSyncError(
+            err instanceof Error ? err.message : "Note completion sync error."
+          );
+        });
+      }
+    },
+    [awardProfileStudyActivity]
+  );
 
   const handleDeleteNote = (id: string) => {
     setNotes((prev) => {
@@ -571,7 +774,9 @@ export default function App() {
           autoNoteEnabled={autoNoteEnabled}
           onToggleAutoNote={() => setAutoNoteEnabled((v) => !v)}
           notesCountByProfile={notesCountByProfile}
+          completedNotesCountByProfile={completedNotesCountByProfile}
           totalNotesCount={notes.length}
+          recentPointsAward={recentPointsAward}
           activeTab={activeTab}
           onSelectTab={setActiveTab}
           mobileOpen={mobileMenuOpen}
@@ -611,11 +816,15 @@ export default function App() {
               }
               onSaveNote={handleAddNote}
               onOpenNote={handleOpenNote}
+              onStudySessionComplete={handleRecordStudySession}
             />
           )}
 
           {activeTab === "translate" && (
-            <TranslateView profile={activeProfile} />
+            <TranslateView
+              profile={activeProfile}
+              onStudySessionComplete={handleRecordStudySession}
+            />
           )}
 
           {activeTab === "read" && (
@@ -630,6 +839,7 @@ export default function App() {
               }
               onSaveNote={handleAddNote}
               onOpenNote={handleOpenNote}
+              onStudySessionComplete={handleRecordStudySession}
             />
           )}
 
@@ -643,6 +853,8 @@ export default function App() {
               onAddNote={handleAddNote}
               onUpdateNote={handleUpdateNote}
               onDeleteNote={handleDeleteNote}
+              onToggleNoteCompleted={handleToggleNoteCompleted}
+              onPracticeCorrect={handlePracticeCorrect}
               onOpenInReader={(text, lang) =>
                 handleOpenInReader(text, lang, true)
               }
